@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type Plotly from "plotly.js-dist-min";
-import { api, download, fmt, toCsv, type CsvTable, type Project, type Run, type StatsFile } from "./api";
+import { api, download, fmt, toCsv, type CsvTable, type Project, type Run, type RunSeriesFile,
+         type StatsFile } from "./api";
 import Plot from "./Plot";
 
 type Mode = "series" | "bars" | "scatter";
@@ -36,81 +37,198 @@ const movingAvg = (t: number[], v: (number | null)[], win: number) => {
   return out;
 };
 
+// One stacked subplot per panel, all sharing the time axis. src is "stats"
+// (case Stats .txt) or "run:<run name>" (per-case time_s CSVs of a run).
+type Panel = { key: number; src: string; file: string; cols: string[]; win: number; logY: boolean };
+type SeriesMap = Record<string, { t: number[]; v: (number | null)[] }>;
+
+const PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                 "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"];
+const DASHES = ["solid", "dash", "dot", "dashdot", "longdash"] as const;
+const DEFAULT_PANEL: Panel = { key: 1, src: "stats", file: "Fluid.txt",
+                               cols: ["Mean Velocity [m/s]"], win: 0, logY: false };
+const dataKey = (p: Panel, col: string) => `${p.src}|${p.file}|${col}`;
+
+function loadPanels(pid: string): Panel[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(`mstar_post.plots.${pid}`) ?? "");
+    if (Array.isArray(v) && v.length && v.every((p) => typeof p.src === "string" && Array.isArray(p.cols)))
+      return v as Panel[];
+  } catch { /* none saved */ }
+  return [DEFAULT_PANEL];
+}
+
 function SeriesPlot({ project }: { project: Project }) {
   const cases = project.cases.filter((c) => c.included);
-  const [files, setFiles] = useState<StatsFile[]>([]);
-  const [file, setFile] = useState("Fluid.txt");
-  const [col, setCol] = useState("Mean Velocity [m/s]");
-  const [win, setWin] = useState(0);
+  const [panels, setPanels] = useState<Panel[]>(() => loadPanels(project.id));
+  const [statsFiles, setStatsFiles] = useState<StatsFile[]>([]);
+  const [runs, setRuns] = useState<Run[]>([]);
+  const [runFiles, setRunFiles] = useState<Record<string, RunSeriesFile[]>>({});
   const [tss, setTss] = useState<number | "">("");
-  const [data, setData] = useState<Record<string, { t: number[]; v: (number | null)[] }>>({});
+  const [cache, setCache] = useState<Record<string, SeriesMap>>({});
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    setPanels(loadPanels(project.id));
+    setCache({});
     const c = cases.find((x) => x.id === project.ref_case) ?? cases[0];
-    if (c) api.stats(c.path).then(setFiles).catch((e) => setError(e.message));
+    if (c) api.stats(c.path).then(setStatsFiles).catch((e) => setError(e.message));
+    api.runs(project.id).then((rs) => {
+      const ss = rs.filter((r) => r.task === "stats_summary");
+      setRuns(ss);
+      ss.forEach((r) => api.runTimeseries(project.id, r.name)
+        .then((fs) => setRunFiles((m) => ({ ...m, [r.name]: fs }))).catch(() => undefined));
+    }).catch((e) => setError(e.message));
   }, [project.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const columns = files.find((f) => f.file === file)?.columns ?? [];
   useEffect(() => {
-    if (columns.length && !columns.includes(col)) setCol(columns[0]);
-  }, [file, files]); // eslint-disable-line react-hooks/exhaustive-deps
+    localStorage.setItem(`mstar_post.plots.${project.id}`, JSON.stringify(panels));
+  }, [panels, project.id]);
+
+  const filesOf = (src: string): { file: string; columns: string[] }[] =>
+    src === "stats" ? statsFiles : runFiles[src.slice(4)] ?? [];
 
   useEffect(() => {
-    if (!col) return;
-    setError(null);
-    setData({});
-    cases.forEach((c) => api.series(c.path, file, [col])
-      .then((s) => setData((d) => ({ ...d, [c.id]: { t: s.t, v: s.columns[col] } })))
-      .catch((e) => setError(`${c.id}: ${e.message}`)));
-  }, [file, col, project]); // eslint-disable-line react-hooks/exhaustive-deps
+    for (const p of panels) for (const col of p.cols) {
+      const k = dataKey(p, col);
+      if (cache[k]) continue;
+      setCache((m) => ({ ...m, [k]: {} }));
+      const put = (id: string, t: number[], v: (number | null)[]) =>
+        setCache((m) => ({ ...m, [k]: { ...m[k], [id]: { t, v } } }));
+      if (p.src === "stats") {
+        cases.forEach((c) => api.series(c.path, p.file, [col])
+          .then((s) => put(c.id, s.t, s.columns[col]))
+          .catch((e) => setError(`${c.id}: ${e.message}`)));
+      } else {
+        api.runSeries(project.id, p.src.slice(4), p.file, [col]).then((res) => {
+          for (const [id, s] of Object.entries(res)) if (s.columns[col]) put(id, s.t, s.columns[col]);
+        }).catch((e) => setError(`${p.file}: ${e.message}`));
+      }
+    }
+  }, [panels]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const stats = useMemo(() => {
-    if (tss === "") return {};
-    return Object.fromEntries(Object.entries(data).map(([id, s]) => {
-      const v = s.v.filter((x, i): x is number => x !== null && s.t[i] >= tss);
-      const m = v.reduce((a, b) => a + b, 0) / (v.length || 1);
-      const sd = Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / Math.max(1, v.length - 1));
-      return [id, { mean: m, std: sd, n: v.length }];
-    }));
-  }, [data, tss]);
+  const update = (key: number, patch: Partial<Panel>) =>
+    setPanels((ps) => ps.map((p) => (p.key === key ? { ...p, ...patch } : p)));
+  const move = (i: number, d: number) => setPanels((ps) => {
+    const q = [...ps];
+    [q[i], q[i + d]] = [q[i + d], q[i]];
+    return q;
+  });
+  const addPanel = () => setPanels((ps) => [...ps, { ...(ps[ps.length - 1] ?? DEFAULT_PANEL),
+    key: Math.max(0, ...ps.map((p) => p.key)) + 1 }]);
 
-  const traces: Plotly.Data[] = cases.filter((c) => data[c.id]).map((c) => ({
-    type: "scattergl", mode: "lines", name: c.id,
-    x: data[c.id].t, y: movingAvg(data[c.id].t, data[c.id].v, win),
-    line: { width: c.id === project.ref_case ? 2.5 : 1.3 },
-  }));
+  const caseColor = (id: string) => PALETTE[Math.max(0, cases.findIndex((c) => c.id === id)) % PALETTE.length];
+  const n = panels.length;
+  const gap = n > 1 ? 0.06 / Math.max(1, n - 1) + 0.02 : 0;
+  const yName = (i: number) => (i ? `y${i + 1}` : "y");
+  const traces: Plotly.Data[] = [];
+  const layout: Record<string, unknown> = {};
+  const seen = new Set<string>();
+  panels.forEach((p, i) => {
+    const top = 1 - i / n, bottom = 1 - (i + 1) / n;
+    layout[i ? `yaxis${i + 1}` : "yaxis"] = {
+      domain: [bottom + (i < n - 1 ? gap / 2 : 0), top - (i ? gap / 2 : 0)],
+      type: p.logY ? "log" : "linear",
+      title: { text: p.cols.length === 1 ? p.cols[0]
+        : p.cols.map((c, j) => `${c} (${DASHES[j % DASHES.length]})`).join("<br>"), font: { size: 11 } },
+    };
+    p.cols.forEach((col, j) => {
+      const d = cache[dataKey(p, col)] ?? {};
+      cases.filter((c) => d[c.id]).forEach((c) => {
+        traces.push({
+          type: "scattergl", mode: "lines", name: c.id, legendgroup: c.id,
+          showlegend: !seen.has(c.id), yaxis: yName(i),
+          x: d[c.id].t, y: movingAvg(d[c.id].t, d[c.id].v, p.win),
+          hovertemplate: `${c.id}<br>${col}: %{y:.5g}<br>t = %{x:.4g} s<extra></extra>`,
+          line: { width: c.id === project.ref_case ? 2.5 : 1.3, color: caseColor(c.id),
+                  dash: DASHES[j % DASHES.length] },
+        });
+        seen.add(c.id);
+      });
+    });
+  });
   const shapes: Partial<Plotly.Shape>[] = tss === "" ? [] : [{
     type: "line", x0: tss, x1: tss, yref: "paper", y0: 0, y1: 1, line: { dash: "dash", color: "green" },
   }];
 
-  const exportCsv = () => download(`${file.replace(/\W+/g, "_")}_${col.replace(/\W+/g, "_")}.csv`,
-    toCsv(["case", "time_s", col], Object.entries(data).flatMap(([id, s]) =>
-      s.t.map((t, i) => [id, t, s.v[i]]))));
+  const stats = useMemo(() => {
+    if (tss === "") return [];
+    return panels.flatMap((p) => p.cols.flatMap((col) =>
+      Object.entries(cache[dataKey(p, col)] ?? {}).map(([id, s]) => {
+        const v = s.v.filter((x, i): x is number => x !== null && s.t[i] >= tss);
+        const m = v.reduce((a, b) => a + b, 0) / (v.length || 1);
+        const sd = Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / Math.max(1, v.length - 1));
+        return { key: `${p.key}|${col}|${id}`, col, id, mean: m, std: sd, n: v.length };
+      })));
+  }, [cache, panels, tss]);
+
+  const exportCsv = () => download("time_series.csv",
+    toCsv(["case", "file", "column", "time_s", "value"], panels.flatMap((p) => p.cols.flatMap((col) =>
+      Object.entries(cache[dataKey(p, col)] ?? {}).flatMap(([id, s]) =>
+        s.t.map((t, i) => [id, p.file, col, t, s.v[i]]))))));
 
   return (
     <>
+      <div className="panels">
+        {panels.map((p, i) => {
+          const files = filesOf(p.src);
+          const columns = files.find((f) => f.file === p.file)?.columns ?? [];
+          return (
+            <div key={p.key} className="row panel-row">
+              <b>{i + 1}</b>
+              <label>Source <select value={p.src} onChange={(e) => {
+                const src = e.target.value;
+                const f = filesOf(src)[0];
+                update(p.key, { src, file: f?.file ?? "", cols: f ? [f.columns[0]] : [] });
+              }}>
+                <option value="stats">Stats files</option>
+                {runs.filter((r) => runFiles[r.name]?.length).map((r) => (
+                  <option key={r.name} value={`run:${r.name}`}>run: {r.label ?? r.name} ({r.name.slice(0, 15)})</option>))}
+              </select></label>
+              <label>File <select value={p.file} onChange={(e) => {
+                const f = files.find((x) => x.file === e.target.value);
+                update(p.key, { file: e.target.value, cols: f ? [f.columns[0]] : [] });
+              }}>
+                {!files.some((f) => f.file === p.file) && <option value={p.file}>{p.file || "-"}</option>}
+                {files.map((f) => <option key={f.file}>{f.file}</option>)}
+              </select></label>
+              <span className="chips">
+                {p.cols.map((c) => (
+                  <span key={c} className="chip">{c}
+                    <button title="remove" onClick={() => update(p.key, { cols: p.cols.filter((x) => x !== c) })}>&times;</button>
+                  </span>))}
+              </span>
+              <select value="" onChange={(e) => e.target.value && update(p.key, { cols: [...p.cols, e.target.value] })}>
+                <option value="">+ variable</option>
+                {columns.filter((c) => !p.cols.includes(c)).map((c) => <option key={c}>{c}</option>)}
+              </select>
+              <label>Avg [s] <input type="number" step="any" className="short" value={p.win || ""} placeholder="off"
+                                    onChange={(e) => update(p.key, { win: Number(e.target.value) })} /></label>
+              <label><input type="checkbox" checked={p.logY} onChange={(e) => update(p.key, { logY: e.target.checked })} /> log y</label>
+              <button disabled={i === 0} onClick={() => move(i, -1)} title="move up">&uarr;</button>
+              <button disabled={i === n - 1} onClick={() => move(i, 1)} title="move down">&darr;</button>
+              <button disabled={n === 1} onClick={() => setPanels(panels.filter((x) => x.key !== p.key))} title="remove panel">&times;</button>
+            </div>
+          );
+        })}
+      </div>
       <div className="row">
-        <label>Stats file <select value={file} onChange={(e) => setFile(e.target.value)}>
-          {files.map((f) => <option key={f.file}>{f.file}</option>)}</select></label>
-        <label>Variable <select value={col} onChange={(e) => setCol(e.target.value)}>
-          {columns.map((c) => <option key={c}>{c}</option>)}</select></label>
-        <label>Moving avg [s] <input type="number" step="any" value={win || ""} placeholder="off"
-                                     onChange={(e) => setWin(Number(e.target.value))} /></label>
+        <button onClick={addPanel}>+ Add panel</button>
         <label>Steady from [s] <input type="number" step="any" value={tss}
                                       onChange={(e) => setTss(e.target.value === "" ? "" : Number(e.target.value))} /></label>
         <button onClick={exportCsv}>Export CSV</button>
+        {!runs.some((r) => runFiles[r.name]?.length) && <span className="muted">Run "M-Star Stats summary" with dispersion/uniformity for metric time series.</span>}
       </div>
       {error && <div className="error">{error}</div>}
-      <Plot data={traces} exportName={col} height={520} layout={{
-        xaxis: { title: { text: "Time [s]" } }, yaxis: { title: { text: col } }, shapes,
-        legend: { orientation: "h", y: -0.18 },
+      <Plot data={traces} exportName="time_series" height={Math.max(360, 250 * n + 90)} layout={{
+        ...layout, xaxis: { title: { text: "Time [s]" }, anchor: yName(n - 1) as Plotly.AxisName }, shapes,
+        legend: { orientation: "h", y: 1.0, yanchor: "bottom" }, margin: { t: 50, r: 20, b: 50, l: 80 },
       }} />
       {tss !== "" && (
         <table className="grid narrow">
-          <thead><tr><th>case</th><th>mean (t &ge; {tss} s)</th><th>std</th><th>CoV</th><th>n</th></tr></thead>
-          <tbody>{Object.entries(stats).map(([id, s]) => (
-            <tr key={id}><td className="mono">{id}</td><td className="num">{fmt(s.mean)}</td>
+          <thead><tr><th>variable</th><th>case</th><th>mean (t &ge; {tss} s)</th><th>std</th><th>CoV</th><th>n</th></tr></thead>
+          <tbody>{stats.map((s) => (
+            <tr key={s.key}><td>{s.col}</td><td className="mono">{s.id}</td><td className="num">{fmt(s.mean)}</td>
               <td className="num">{fmt(s.std)}</td><td className="num">{fmt(s.std / Math.abs(s.mean))}</td>
               <td className="num">{s.n}</td></tr>))}</tbody>
         </table>

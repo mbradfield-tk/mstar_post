@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import time
@@ -16,6 +17,7 @@ import uuid
 from pathlib import Path
 
 from app import config
+from app.paths import under
 
 _COLS = ("id", "project", "task", "label", "status", "commands", "run_dir",
          "created_at", "started_at", "finished_at", "returncode", "pid", "step",
@@ -73,6 +75,23 @@ def _pid_alive(pid: int | None) -> bool:
     except OSError:
         return False
     return stat.rsplit(")", 1)[-1].split()[0] != "Z"
+
+
+def _clear_run_dir(j: dict, recreate: bool) -> Path:
+    """Delete a job's run folder (only inside the projects folder); with
+    recreate, make it and the commands' working folders again."""
+    run = Path(j["run_dir"]).resolve()
+    base = config.PROJECTS_DIR.resolve()
+    if run == base or not under(run, base):
+        raise ValueError(f"run folder {run} is not inside {base}")
+    shutil.rmtree(run, ignore_errors=True)
+    if recreate:
+        run.mkdir(parents=True)
+        for cmd in j["commands"]:
+            cwd = cmd.get("cwd")
+            if cwd and under(Path(cwd).resolve(), run):
+                Path(cwd).mkdir(parents=True, exist_ok=True)
+    return run
 
 
 class JobManager:
@@ -141,6 +160,40 @@ class JobManager:
 
     def ws_remove(self, ws) -> None:
         self._sockets.discard(ws)
+
+    async def delete(self, jid: str) -> None:
+        """Remove a finished job and its run folder."""
+        j = self._idle(jid)
+        _clear_run_dir(j, recreate=False)
+        with _conn() as c:
+            c.execute("DELETE FROM jobs WHERE id=?", (jid,))
+        for ws in list(self._sockets):
+            try:
+                await ws.send_json({"type": "job_deleted", "id": jid, "project": j["project"]})
+            except Exception:
+                self._sockets.discard(ws)
+
+    async def rerun(self, jid: str) -> dict:
+        """Delete a finished job's outputs and queue its commands again."""
+        j = self._idle(jid)
+        run = _clear_run_dir(j, recreate=True)
+        (run / "job.json").write_text(json.dumps(
+            {"id": jid, "task": j["task"], "label": j["label"], "params": j["params"],
+             "commands": j["commands"]}, indent=2))
+        _update(jid, status="queued", created_at=time.time(), started_at=None,
+                finished_at=None, returncode=None, pid=None, step=0, error=None)
+        await self._broadcast(jid)
+        await self._dispatch()
+        return get_job(jid)
+
+    @staticmethod
+    def _idle(jid: str) -> dict:
+        j = get_job(jid)
+        if j is None:
+            raise KeyError(jid)
+        if j["status"] in ("queued", "running"):
+            raise RuntimeError("job is still active; cancel it first")
+        return j
 
     # -- internals ---------------------------------------------------------
 

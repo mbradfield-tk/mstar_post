@@ -55,6 +55,22 @@ def series(path: str, file: str, columns: list[str] = Query(...),
         raise HTTPException(422, str(e))
 
 
+def _plane_response(p: dict, h: int, w: int) -> Response:
+    hdr = {"X-Height": str(h), "X-Width": str(w),
+           "X-Axis": str(p["axis"]), "X-Index": str(p["index"]),
+           "X-Count": str(p["count"]), "X-Pos": repr(p["pos"]),
+           "X-U-Axis": str(p["u_axis"]), "X-V-Axis": str(p["v_axis"]),
+           "X-U0": repr(p["u0"]), "X-V0": repr(p["v0"]),
+           "X-Du": repr(p["du"]), "X-Dv": repr(p["dv"]),
+           "X-Vmin": repr(p["vmin"]), "X-Vmax": repr(p["vmax"]),
+           "X-P01": repr(p["p01"]), "X-P99": repr(p["p99"]),
+           "X-Unit": p["unit"].encode("ascii", "replace").decode(),
+           "X-Time": repr(p["time"]) if p["time"] is not None else "",
+           "Access-Control-Expose-Headers": "*"}
+    return Response(np.ascontiguousarray(p["data"], "<f4").tobytes(),
+                    media_type="application/octet-stream", headers=hdr)
+
+
 @router.get("/plane")
 def plane(path: str, file: str, array: str, comp: str = "mag",
           axis: int | None = None, pos: float | None = None, mask: bool = True):
@@ -66,20 +82,32 @@ def plane(path: str, file: str, array: str, comp: str = "mag",
         raise HTTPException(404, f"no array '{array}' in {f.name}")
     except ValueError as e:
         raise HTTPException(422, str(e))
-    d = p["data"]
-    hdr = {"X-Height": str(d.shape[0]), "X-Width": str(d.shape[1]),
-           "X-Axis": str(p["axis"]), "X-Index": str(p["index"]),
-           "X-Count": str(p["count"]), "X-Pos": repr(p["pos"]),
-           "X-U-Axis": str(p["u_axis"]), "X-V-Axis": str(p["v_axis"]),
-           "X-U0": repr(p["u0"]), "X-V0": repr(p["v0"]),
-           "X-Du": repr(p["du"]), "X-Dv": repr(p["dv"]),
-           "X-Vmin": repr(p["vmin"]), "X-Vmax": repr(p["vmax"]),
-           "X-P01": repr(p["p01"]), "X-P99": repr(p["p99"]),
-           "X-Unit": p["unit"].encode("ascii", "replace").decode(),
-           "X-Time": repr(p["time"]) if p["time"] is not None else "",
-           "Access-Control-Expose-Headers": "*"}
-    return Response(np.ascontiguousarray(d, "<f4").tobytes(),
-                    media_type="application/octet-stream", headers=hdr)
+    return _plane_response(p, *p["data"].shape)
+
+
+@router.get("/plane_vec")
+def plane_vec(path: str, file: str, array: str, axis: int | None = None,
+              pos: float | None = None, mask: bool = True):
+    """In-plane vector components: float32 u plane then v plane (each rows = v),
+    statistics of the in-plane speed in the headers."""
+    f = _vtk_file(_case(path), file)
+    try:
+        p = vtkio.extract_vector_plane(f, array, axis, pos, mask)
+    except KeyError:
+        raise HTTPException(404, f"no array '{array}' in {f.name}")
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return _plane_response(p, *p["data"].shape[1:])
+
+
+@router.get("/fluid_center")
+def fluid_center(path: str, file: str) -> dict:
+    """Bounds and center of the fluid-filled cells of a volume .vti."""
+    f = _vtk_file(_case(path), file)
+    try:
+        return vtkio.fluid_bounds(f)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
 
 
 @router.get("/line")
@@ -116,6 +144,22 @@ def iso(path: str, file: str, array: str, level: float, comp: str = "mag",
     except KeyError:
         raise HTTPException(404, f"no array '{array}' in {f.name}")
     return FileResponse(out, media_type="model/stl")
+
+
+@router.get("/streamlines")
+def streamlines(path: str, file: str, array: str, axis: int | None = None,
+                pos: float | None = None, n_seeds: int = 20, max_steps: int = 2000,
+                stride: int = 1):
+    """3D streamlines seeded on a plane (binary, see vtkio.streamlines)."""
+    f = _vtk_file(_case(path), file)
+    try:
+        out = vtkio.streamlines(f, array, axis, pos, max(2, min(n_seeds, 60)),
+                                max(10, min(max_steps, 20000)), max(1, min(stride, 8)))
+    except KeyError:
+        raise HTTPException(404, f"no array '{array}' in {f.name}")
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return FileResponse(out, media_type="application/octet-stream")
 
 
 @router.get("/cmap/{name}")

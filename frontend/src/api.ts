@@ -48,6 +48,8 @@ export type Inventory = {
   case: string; kinds: OutputKind[]; geometry: { name: string; file: string }[];
 };
 export type StatsFile = { file: string; columns: string[] };
+export type RunSeriesFile = { file: string; columns: string[]; cases: string[] };
+export type Series = { t: number[]; columns: Record<string, (number | null)[]> };
 export type CsvTable = { columns: string[]; rows: (string | number | null)[][]; truncated: boolean };
 
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
@@ -97,6 +99,11 @@ export const api = {
   run: (id: string, task: string, params: Record<string, unknown>, cases?: string[]) =>
     req<Job>(`/api/projects/${id}/run`, json("POST", { task, params, cases })),
   csv: (id: string, path: string) => req<CsvTable>(`/api/projects/${id}/csv?${qs({ path })}`),
+  runTimeseries: (id: string, run: string) =>
+    req<RunSeriesFile[]>(`/api/projects/${id}/runs/${encodeURIComponent(run)}/timeseries`),
+  runSeries: (id: string, run: string, file: string, columns: string[]) =>
+    req<Record<string, Series>>(
+      `/api/projects/${id}/runs/${encodeURIComponent(run)}/series?${qs({ file, columns })}`),
   fileUrl: (id: string, path: string, download = false) =>
     `/api/projects/${id}/file?${qs({ path, download })}`,
   zipUrl: (id: string, path: string) => `/api/projects/${id}/zip?${qs({ path })}`,
@@ -104,6 +111,8 @@ export const api = {
   tasks: () => req<TaskDef[]>("/api/tasks"),
   jobs: (project?: string) => req<Job[]>(`/api/jobs?${qs({ project })}`),
   cancelJob: (jid: string) => req<Job>(`/api/jobs/${jid}/cancel`, { method: "POST" }),
+  rerunJob: (jid: string) => req<Job>(`/api/jobs/${jid}/rerun`, { method: "POST" }),
+  deleteJob: (jid: string) => req<{ deleted: string }>(`/api/jobs/${jid}`, { method: "DELETE" }),
   jobLog: (jid: string, offset: number) =>
     req<{ offset: number; size: number; text: string }>(`/api/jobs/${jid}/log?${qs({ offset })}`),
 
@@ -119,6 +128,14 @@ export const api = {
   planeUrl: (path: string, file: string, array: string, comp: string,
              axis: number | null, pos: number | null, mask = true) =>
     `/api/case/plane?${qs({ path, file, array, comp, axis, pos, mask })}`,
+  planeVecUrl: (path: string, file: string, array: string, axis: number | null, pos: number | null,
+                mask = true) => `/api/case/plane_vec?${qs({ path, file, array, axis, pos, mask })}`,
+  streamlinesUrl: (path: string, file: string, array: string, axis: number, pos: number | null,
+                   n_seeds: number, stride = 1) =>
+    `/api/case/streamlines?${qs({ path, file, array, axis, pos, n_seeds, stride })}`,
+  fluidCenter: (path: string, file: string) =>
+    req<{ lo: number[]; hi: number[]; center: number[]; source: string }>(
+      `/api/case/fluid_center?${qs({ path, file })}`),
   surfaceUrl: (path: string, file: string, max_tris = 400000) =>
     `/api/case/surface?${qs({ path, file, max_tris })}`,
   isoUrl: (path: string, file: string, array: string, comp: string, level: number, stride = 1) =>

@@ -17,6 +17,7 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
 }) {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [log, setLog] = useState("");
+  const [error, setError] = useState<string | null>(null);
   const offset = useRef(0);
   const pre = useRef<HTMLPreElement>(null);
   const job = jobs.find((j) => j.id === selected);
@@ -27,6 +28,7 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
     const ws = new WebSocket(`${proto}://${location.host}/api/jobs/ws`);
     ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
+      if (m.type === "job_deleted") { setJobs((js) => js.filter((j) => j.id !== m.id)); return; }
       if (m.type !== "job" || m.job.project !== project) return;
       setJobs((js) => {
         const i = js.findIndex((j) => j.id === m.job.id);
@@ -39,8 +41,26 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
 
   useEffect(() => {
     setLog("");
+    setError(null);
     offset.current = 0;
   }, [selected]);
+
+  const rerun = async (j: Job) => {
+    if (!confirm(`Delete the results of "${j.label}" and run it again with the same settings?`)) return;
+    try {
+      const nj = await api.rerunJob(j.id);
+      setLog("");
+      offset.current = 0;
+      setJobs((js) => [nj, ...js.filter((x) => x.id !== j.id)]);
+    } catch (e) { setError((e as Error).message); }
+  };
+  const remove = async (j: Job) => {
+    if (!confirm(`Delete "${j.label}" and all its results?\n${j.run_dir}`)) return;
+    try {
+      await api.deleteJob(j.id);
+      setJobs((js) => js.filter((x) => x.id !== j.id));
+    } catch (e) { setError((e as Error).message); }
+  };
 
   const active = job?.status === "running" || job?.status === "queued";
   useEffect(() => {
@@ -81,7 +101,10 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
               <h2 className="grow">{job.label} <span className={`status ${job.status}`}>{job.status}</span></h2>
               {active && <button onClick={() => api.cancelJob(job.id)}>Cancel</button>}
               {job.status === "done" && <button className="primary" onClick={onOpenResults}>Open results</button>}
+              {!active && <button onClick={() => rerun(job)} title="delete the results and run again with the same settings">Re-run</button>}
+              {!active && <button className="danger" onClick={() => remove(job)} title="delete the job and all its results">Delete</button>}
             </div>
+            {error && <div className="error">{error}</div>}
             <div className="small muted">
               step {Math.min(job.step + 1, job.commands.length)} of {job.commands.length}
               {job.error && <span className="error"> | {job.error}</span>}

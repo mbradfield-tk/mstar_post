@@ -9,7 +9,7 @@ import time
 import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -214,6 +214,71 @@ def delete_run(pid: str, name: str) -> dict:
         raise HTTPException(409, "run is still active")
     shutil.rmtree(r)
     return {"deleted": name}
+
+
+# ------------------------------------------------------------------ run time series
+
+# time_s-first CSVs with several rows per time (profiles, per-drop lists)
+_NOT_SERIES = {"holdup_profile.csv", "vof_dsd.csv"}
+
+
+def _case_dirs(p: dict, run: Path) -> dict[str, Path]:
+    """Per-case output folder of a run (the run folder itself for a single case)."""
+    if p["single"]:
+        return {p["cases"][0]["id"]: run} if p["cases"] else {}
+    return {c["id"]: run / c["id"] for c in p["cases"] if (run / c["id"]).is_dir()}
+
+
+def _header(f: Path) -> list[str]:
+    with open(f, newline="") as fh:
+        return next(csv.reader(fh), [])
+
+
+@router.get("/{pid}/runs/{name}/timeseries")
+def run_timeseries(pid: str, name: str) -> list[dict]:
+    """Per-case CSVs of a run whose first column is time_s, with their columns
+    and the cases that have them."""
+    p = load(pid)
+    run = safe_child(_dir(pid) / "runs", name)
+    files: dict[str, dict] = {}
+    for cid, d in _case_dirs(p, run).items():
+        for f in sorted(d.glob("*.csv")):
+            hdr = _header(f) if f.name not in _NOT_SERIES else []
+            if not hdr or hdr[0] != "time_s":
+                continue
+            e = files.setdefault(f.name, {"file": f.name, "columns": [], "cases": []})
+            e["cases"].append(cid)
+            e["columns"] += [c for c in hdr[1:] if c not in e["columns"]]
+    return sorted(files.values(), key=lambda e: e["file"])
+
+
+@router.get("/{pid}/runs/{name}/series")
+def run_series(pid: str, name: str, file: str, columns: list[str] = Query(...),
+               cases: list[str] | None = Query(None), max_points: int = 4000) -> dict:
+    """{case: {t, columns}} from <run>/<case>/<file>, subsampled to max_points."""
+    if Path(file).name != file or not file.endswith(".csv"):
+        raise HTTPException(422, "file must be a CSV name")
+    p = load(pid)
+    run = safe_child(_dir(pid) / "runs", name)
+    max_points = max(1, min(max_points, 50000))
+    out = {}
+    for cid, d in _case_dirs(p, run).items():
+        if cases and cid not in cases or not (d / file).is_file():
+            continue
+        f = safe_child(run, (d / file).relative_to(run).as_posix())
+        with open(f, newline="") as fh:
+            reader = csv.reader(fh)
+            hdr = next(reader, [])
+            rows = list(reader)
+        if not hdr or hdr[0] != "time_s":
+            raise HTTPException(422, f"{file} has no time_s column")
+        idx = {c: hdr.index(c) for c in columns if c in hdr}
+        rows = rows[::max(1, -(-len(rows) // max_points))]
+        num = [[_num(v) for v in r] for r in rows]
+        out[cid] = {"t": [r[0] for r in num],
+                    "columns": {c: [r[j] if j < len(r) and not isinstance(r[j], str)
+                                    else None for r in num] for c, j in idx.items()}}
+    return out
 
 
 # ------------------------------------------------------------------ files

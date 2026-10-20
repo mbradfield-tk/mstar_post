@@ -191,17 +191,11 @@ def _fraction_names(h: dict, assoc: str) -> list[str]:
             and re.search(r"volume fraction", a["name"], re.I)]
 
 
-def extract_plane(path: Path, name: str, comp: str, axis: int | None,
-                  pos: float | None, mask: bool = True) -> dict:
-    """Scalar plane of a .vti normal to axis at world position pos.
-
-    For a 2D slice file axis/pos are taken from the file. Solid cells (all
-    'Volume Fraction' arrays ~0, M-Star two-fluid) are NaN when mask is set.
-    """
-    h = header(path)
+def _plane_geom(h: dict, a: dict, axis: int | None, pos: float | None):
+    """(axis, index, dims, sample origin, spacing) of the plane normal to axis at
+    pos; a 2D slice file fixes axis and index."""
     if "extent" not in h:
-        raise ValueError(f"{path.name} is not image data")
-    a = find_array(h, name)
+        raise ValueError("not image data")
     dims = grid_dims(h, a["assoc"])
     e = h["extent"]
     thin = [ax for ax in range(3) if e[2 * ax + 1] == e[2 * ax]]
@@ -215,18 +209,23 @@ def extract_plane(path: Path, name: str, comp: str, axis: int | None,
     else:
         p = so[axis] + (dims[axis] - 1) * sp[axis] / 2 if pos is None else pos
         idx = int(np.clip(round((p - so[axis]) / sp[axis]), 0, dims[axis] - 1))
-    plane = reduce_comp(_take(volume_array(path, name), axis, idx), comp, a["ncomp"])
-    plane = np.array(plane, np.float32)
-    if mask:
-        fr = _fraction_names(h, a["assoc"])
-        if len(fr) >= 2:
-            total = sum(np.asarray(_take(volume_array(path, n), axis, idx), np.float32)
-                        for n in fr)
-            plane[total < 0.5] = np.nan
+    return axis, idx, dims, so, sp
+
+
+def _solid(path: Path, h: dict, assoc: str, axis: int, idx: int) -> np.ndarray | None:
+    """Solid cells of a plane (all 'Volume Fraction' arrays ~0), None if unknown."""
+    fr = _fraction_names(h, assoc)
+    if len(fr) < 2:
+        return None
+    total = sum(np.asarray(_take(volume_array(path, n), axis, idx), np.float32) for n in fr)
+    return total < 0.5
+
+
+def _plane_meta(h: dict, a: dict, axis: int, idx: int, dims, so, sp, values) -> dict:
     u, v = PLANE_AXES[axis]
-    finite = plane[np.isfinite(plane)]
+    finite = values[np.isfinite(values)]
     return {
-        "data": plane, "axis": axis, "index": idx, "count": dims[axis],
+        "axis": axis, "index": idx, "count": dims[axis],
         "pos": so[axis] + idx * sp[axis],
         "u_axis": u, "v_axis": v, "u0": so[u], "v0": so[v], "du": sp[u], "dv": sp[v],
         "vmin": float(finite.min()) if finite.size else 0.0,
@@ -235,6 +234,75 @@ def extract_plane(path: Path, name: str, comp: str, axis: int | None,
         "p99": float(np.percentile(finite, 99)) if finite.size else 0.0,
         "unit": a["unit"], "time": h["time"],
     }
+
+
+def extract_plane(path: Path, name: str, comp: str, axis: int | None,
+                  pos: float | None, mask: bool = True) -> dict:
+    """Scalar plane of a .vti normal to axis at world position pos.
+
+    For a 2D slice file axis/pos are taken from the file. Solid cells (all
+    'Volume Fraction' arrays ~0, M-Star two-fluid) are NaN when mask is set.
+    """
+    h = header(path)
+    a = find_array(h, name)
+    axis, idx, dims, so, sp = _plane_geom(h, a, axis, pos)
+    plane = reduce_comp(_take(volume_array(path, name), axis, idx), comp, a["ncomp"])
+    plane = np.array(plane, np.float32)
+    solid = _solid(path, h, a["assoc"], axis, idx) if mask else None
+    if solid is not None:
+        plane[solid] = np.nan
+    return {"data": plane, **_plane_meta(h, a, axis, idx, dims, so, sp, plane)}
+
+
+def extract_vector_plane(path: Path, name: str, axis: int | None, pos: float | None,
+                         mask: bool = True) -> dict:
+    """In-plane (u, v) components of a 3-component array as a (2, h, w) array;
+    statistics are of the in-plane speed."""
+    h = header(path)
+    a = find_array(h, name)
+    if a["ncomp"] != 3:
+        raise ValueError(f"'{name}' is not a 3-component vector")
+    axis, idx, dims, so, sp = _plane_geom(h, a, axis, pos)
+    vec = np.asarray(_take(volume_array(path, name), axis, idx), np.float32)
+    u, v = PLANE_AXES[axis]
+    data = np.stack([vec[..., u], vec[..., v]])
+    solid = _solid(path, h, a["assoc"], axis, idx) if mask else None
+    if solid is not None:
+        data[:, solid] = np.nan
+    speed = np.hypot(data[0], data[1])
+    return {"data": data, **_plane_meta(h, a, axis, idx, dims, so, sp, speed)}
+
+
+def fluid_bounds(path: Path) -> dict:
+    """Bounding box and center [m] of the fluid-filled cells of a .vti: cells
+    whose 'Volume Fraction' arrays sum to >= 0.5 (one array: >= 0.5); the whole
+    grid if there are none."""
+    st = path.stat()
+    return _fluid_bounds(str(path), st.st_mtime_ns)
+
+
+@lru_cache(maxsize=256)
+def _fluid_bounds(path_s: str, mtime_ns: int) -> dict:
+    path = Path(path_s)
+    h = header(path)
+    if "extent" not in h:
+        raise ValueError(f"{path.name} is not image data")
+    assoc = "cell" if any(a["assoc"] == "cell" for a in h["arrays"]) else "point"
+    dims = grid_dims(h, assoc)
+    so, sp = np.array(sample_origin(h, assoc)), np.array(h["spacing"])
+    fr = _fraction_names(h, assoc)
+    lo_i, hi_i, source = np.zeros(3, int), np.array(dims) - 1, "grid"
+    if fr:
+        total = sum(np.asarray(volume_array(path, n), np.float32) for n in fr)
+        fluid = total >= 0.5  # (z, y, x)
+        if fluid.any():
+            source = "volume fractions"
+            for ax, other in ((0, (0, 1)), (1, (0, 2)), (2, (1, 2))):
+                idx = np.flatnonzero(fluid.any(axis=other))
+                lo_i[ax], hi_i[ax] = idx[0], idx[-1]
+    lo, hi = so + lo_i * sp, so + hi_i * sp
+    return {"lo": lo.tolist(), "hi": hi.tolist(), "center": ((lo + hi) / 2).tolist(),
+            "source": source}
 
 
 def line_profile(path: Path, name: str, comp: str, p0: list[float], p1: list[float],
@@ -263,11 +331,11 @@ def line_profile(path: Path, name: str, comp: str, p0: list[float], p1: list[flo
 
 # ------------------------------------------------------------------ meshes
 
-def _cache_path(kind: str, *key) -> Path:
+def _cache_path(kind: str, *key, ext: str = ".stl") -> Path:
     digest = hashlib.sha1(repr(key).encode()).hexdigest()[:20]
     d = config.CACHE_DIR / kind
     d.mkdir(parents=True, exist_ok=True)
-    return d / f"{digest}.stl"
+    return d / f"{digest}{ext}"
 
 
 def _write_stl(poly, out: Path) -> None:
@@ -363,4 +431,88 @@ def isosurface_stl(path: Path, name: str, comp: str, level: float,
     fe.ComputeNormalsOff()
     fe.Update()
     _write_stl(_simplify(fe.GetOutput(), max_tris), out)
+    return out
+
+
+def streamlines(path: Path, name: str, axis: int | None, pos: float | None,
+                n_seeds: int = 20, max_steps: int = 2000, stride: int = 1) -> Path:
+    """3D streamlines of a vector array seeded on an n_seeds x n_seeds grid of
+    fluid cells in the plane normal to axis at pos (RK4, both directions), cached.
+
+    Binary little-endian: uint32 n_points, uint32 n_lines, float32 xyz[n_points*3],
+    float32 speed[n_points], uint32 offsets[n_lines + 1].
+    """
+    st = path.stat()
+    out = _cache_path("stream", str(path), st.st_mtime_ns, name, axis, pos, n_seeds,
+                      max_steps, stride, ext=".bin")
+    if out.is_file():
+        return out
+    import vtk
+    from vtk.util import numpy_support
+    h = header(path)
+    a = find_array(h, name)
+    if a["ncomp"] != 3:
+        raise ValueError(f"'{name}' is not a 3-component vector")
+    axis, idx, dims, so, sp = _plane_geom(h, a, axis, pos)
+    arr = volume_array(path, name)
+
+    u, v = PLANE_AXES[axis]
+    iu = np.unique(np.linspace(0, dims[u] - 1, n_seeds + 2).round().astype(int)[1:-1])
+    iv = np.unique(np.linspace(0, dims[v] - 1, n_seeds + 2).round().astype(int)[1:-1])
+    gv, gu = np.meshgrid(iv, iu, indexing="ij")
+    vec = np.asarray(_take(arr, axis, idx), np.float32)[gv, gu]
+    ok = np.isfinite(vec).all(axis=-1) & (np.abs(vec).sum(axis=-1) > 0)
+    solid = _solid(path, h, a["assoc"], axis, idx)
+    if solid is not None:
+        ok &= ~solid[gv, gu]
+    seeds = np.zeros((int(ok.sum()), 3))
+    seeds[:, axis] = so[axis] + idx * sp[axis]
+    seeds[:, u] = so[u] + gu[ok] * sp[u]
+    seeds[:, v] = so[v] + gv[ok] * sp[v]
+
+    pts = np.zeros((0, 3), np.float32)
+    speed = np.zeros(0, np.float32)
+    offsets = np.zeros(1, np.uint32)
+    if len(seeds):
+        sl = (slice(None, None, stride),) * 3
+        sub = np.asarray(arr[sl], np.float32)
+        nz, ny, nx = sub.shape[:3]
+        img = vtk.vtkImageData()
+        img.SetDimensions(nx, ny, nz)
+        img.SetOrigin(*so)
+        img.SetSpacing(*(s * stride for s in sp))
+        va = numpy_support.numpy_to_vtk(np.nan_to_num(sub.reshape(-1, 3)), deep=True)
+        va.SetName("v")
+        img.GetPointData().SetVectors(va)
+        src = vtk.vtkPolyData()
+        sp_pts = vtk.vtkPoints()
+        sp_pts.SetData(numpy_support.numpy_to_vtk(seeds, deep=True))
+        src.SetPoints(sp_pts)
+        tr = vtk.vtkStreamTracer()
+        tr.SetInputData(img)
+        tr.SetSourceData(src)
+        tr.SetIntegratorTypeToRungeKutta4()
+        tr.SetIntegrationDirectionToBoth()
+        tr.SetIntegrationStepUnit(vtk.vtkStreamTracer.CELL_LENGTH_UNIT)
+        tr.SetInitialIntegrationStep(0.5)
+        tr.SetMaximumNumberOfSteps(max_steps)
+        tr.SetMaximumPropagation(float(np.linalg.norm(np.array(dims) * np.array(sp))) * 4)
+        tr.SetTerminalSpeed(1e-12)
+        tr.Update()
+        o = tr.GetOutput()
+        if o.GetNumberOfPoints() and o.GetNumberOfLines():
+            lines = o.GetLines()
+            conn = numpy_support.vtk_to_numpy(lines.GetConnectivityArray())
+            offsets = numpy_support.vtk_to_numpy(lines.GetOffsetsArray()).astype(np.uint32)
+            allp = numpy_support.vtk_to_numpy(o.GetPoints().GetData())
+            pts = allp[conn].astype(np.float32)
+            vv = numpy_support.vtk_to_numpy(o.GetPointData().GetArray("v"))[conn]
+            speed = np.linalg.norm(vv, axis=1).astype(np.float32)
+    tmp = out.with_suffix(".tmp")
+    with open(tmp, "wb") as fh:
+        fh.write(np.array([len(pts), len(offsets) - 1], "<u4").tobytes())
+        fh.write(np.ascontiguousarray(pts, "<f4").tobytes())
+        fh.write(np.ascontiguousarray(speed, "<f4").tobytes())
+        fh.write(np.ascontiguousarray(offsets, "<u4").tobytes())
+    tmp.replace(out)
     return out

@@ -175,6 +175,40 @@ def test_meshes(client):
         "path": case, "file": "../../R2/caseA/Vessel.stl"}).status_code == 403
 
 
+def test_vector_plane_and_streamlines(client):
+    case = str(client.root / "R1" / "caseA")
+    vol = "out/Output/Volume/block0/Volume.2.00000e+00.vti"
+    r = client.get("/api/case/plane_vec", params={
+        "path": case, "file": vol, "array": "Velocity Vector (m/s)", "axis": 2,
+        "pos": 0.015, "mask": False})
+    assert r.status_code == 200
+    w, hh = int(r.headers["x-width"]), int(r.headers["x-height"])
+    d = np.frombuffer(r.content, "<f4").reshape(2, hh, w)
+    expect = np.arange(6 * 5 * 4, dtype=np.float32).reshape(4, 5, 6)
+    np.testing.assert_array_equal(d[0], expect[1])  # u = x component
+    np.testing.assert_array_equal(d[1], 0)
+    assert client.get("/api/case/plane_vec", params={
+        "path": case, "file": vol, "array": "Fluid 1 (Water) Volume Fraction (-)",
+        "axis": 2}).status_code == 422
+
+    r = client.get("/api/case/streamlines", params={
+        "path": case, "file": vol, "array": "Velocity Vector (m/s)", "axis": 0,
+        "pos": 0.03, "n_seeds": 3})
+    assert r.status_code == 200
+    n_pts, n_lines = np.frombuffer(r.content[:8], "<u4")
+    assert n_lines > 0 and n_pts > n_lines
+    xyz = np.frombuffer(r.content, "<f4", n_pts * 3, 8).reshape(-1, 3)
+    off = np.frombuffer(r.content, "<u4", n_lines + 1, 8 + n_pts * 16)
+    for a, b in zip(off[:-1], off[1:]):
+        seg = xyz[a:b]
+        assert np.ptp(seg[:, 1]) < 1e-6 and np.ptp(seg[:, 2]) < 1e-6  # along x only
+        assert np.ptp(seg[:, 0]) > 0.01
+
+    fc = client.get("/api/case/fluid_center", params={"path": case, "file": vol}).json()
+    assert fc["source"] == "volume fractions"
+    assert fc["center"] == pytest.approx([0.03, 0.025, 0.02])  # 6 x 5 x 4 cells of 0.01 m
+
+
 def wait(client, jid, timeout=60):
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -207,6 +241,56 @@ def test_stats_job_leaves_cases_untouched(client):
                       params={"path": "../../jobs.db"}).status_code == 403
 
 
+def test_run_timeseries(client):
+    p = client.post("/api/projects", json={"name": "ts", "root": str(client.root)}).json()
+    run = config.PROJECTS_DIR / p["id"] / "runs" / "r1"
+    for cid, scale in (("R1/caseA", 1.0), ("R2/caseA", 2.0)):
+        d = run / cid
+        d.mkdir(parents=True)
+        (d / "dispersion_timeseries.csv").write_text(
+            "time_s,E,a_norm\n" + "".join(f"{t},{scale * t},{'' if t else 'nan'}\n"
+                                         for t in range(5)))
+        (d / "holdup_profile.csv").write_text("time_s,z_m,phi_mean\n0,0,1\n0,1,1\n")
+        (d / "stats_summary.csv").write_text("file,variable\n")
+    (run / "R1" / "caseA" / "phase_uniformity.csv").write_text("time_s,cov_10x3\n0,0.5\n")
+    base = f"/api/projects/{p['id']}/runs/r1"
+    files = {f["file"]: f for f in client.get(f"{base}/timeseries").json()}
+    assert set(files) == {"dispersion_timeseries.csv", "phase_uniformity.csv"}
+    assert files["dispersion_timeseries.csv"]["cases"] == ["R1/caseA", "R2/caseA"]
+    assert files["dispersion_timeseries.csv"]["columns"] == ["E", "a_norm"]
+    s = client.get(f"{base}/series", params={"file": "dispersion_timeseries.csv",
+                                             "columns": ["E", "a_norm", "missing"]}).json()
+    assert s["R2/caseA"]["t"] == [0, 1, 2, 3, 4]
+    assert s["R2/caseA"]["columns"]["E"] == [0, 2, 4, 6, 8]
+    assert s["R1/caseA"]["columns"]["a_norm"] == [None] * 5
+    assert "missing" not in s["R1/caseA"]["columns"]
+    s = client.get(f"{base}/series", params={"file": "dispersion_timeseries.csv",
+                                             "columns": ["E"], "cases": ["R2/caseA"],
+                                             "max_points": 2}).json()
+    assert list(s) == ["R2/caseA"] and s["R2/caseA"]["t"] == [0, 3]
+    assert client.get(f"{base}/series", params={"file": "../../jobs.db",
+                                                "columns": ["E"]}).status_code == 422
+
+
+def test_job_rerun_and_delete(client):
+    p = client.post("/api/projects", json={"name": "rr", "root": str(client.root)}).json()
+    j = client.post(f"/api/projects/{p['id']}/run",
+                    json={"task": "stats_summary", "params": {"time": 1.5, "plot": False}}).json()
+    j = wait(client, j["id"])
+    assert j["status"] == "done"
+    run = Path(j["run_dir"])
+    marker = run / "stale.txt"
+    marker.write_text("old")
+    j2 = client.post(f"/api/jobs/{j['id']}/rerun").json()
+    assert j2["id"] == j["id"] and j2["status"] in ("queued", "running")
+    assert not marker.exists()
+    j2 = wait(client, j["id"])
+    assert j2["status"] == "done" and (run / "batch_summary.csv").is_file()
+    assert client.delete(f"/api/jobs/{j['id']}").json() == {"deleted": j["id"]}
+    assert not run.exists()
+    assert client.get(f"/api/jobs/{j['id']}").status_code == 404
+
+
 def test_custom_script_and_cancel(client, tmp_path):
     script = client.root / "tool.py"
     script.write_text("import sys, pathlib, time\n"
@@ -224,6 +308,8 @@ def test_custom_script_and_cancel(client, tmp_path):
         "task": "custom_script", "cases": ["R2/caseA"],
         "params": {"script": str(script), "args": "{case_id} {out} 60"}}).json()
     time.sleep(1.0)
+    assert client.delete(f"/api/jobs/{j['id']}").status_code == 409
+    assert client.post(f"/api/jobs/{j['id']}/rerun").status_code == 409
     client.post(f"/api/jobs/{j['id']}/cancel")
     assert wait(client, j["id"], 20)["status"] == "cancelled"
     bad = client.post(f"/api/projects/{p['id']}/run", json={

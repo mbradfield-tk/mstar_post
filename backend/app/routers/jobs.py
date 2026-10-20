@@ -36,6 +36,31 @@ async def cancel(jid: str) -> dict:
     return await jobs.manager.cancel(jid)
 
 
+@router.delete("/jobs/{jid}")
+async def delete(jid: str) -> dict:
+    """Delete a finished job and all its results (run folder)."""
+    _job(jid)
+    try:
+        await jobs.manager.delete(jid)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return {"deleted": jid}
+
+
+@router.post("/jobs/{jid}/rerun")
+async def rerun(jid: str) -> dict:
+    """Delete a finished job's results and run its commands again."""
+    _job(jid)
+    try:
+        return await jobs.manager.rerun(jid)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
 @router.get("/jobs/{jid}/log")
 def log(jid: str, offset: int = 0, limit: int = 256 * 1024) -> dict:
     p = Path(_job(jid)["run_dir"]) / "job.log"
