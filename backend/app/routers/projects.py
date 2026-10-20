@@ -1,0 +1,266 @@
+"""Projects: a source folder of cases, the included subset and all run outputs."""
+from __future__ import annotations
+
+import csv
+import json
+import re
+import shutil
+import time
+import zipfile
+from pathlib import Path
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+from app import cases, config, jobs, tasks
+from app.paths import safe_child, safe_path
+
+router = APIRouter(prefix="/api/projects", tags=["projects"])
+_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _dir(pid: str) -> Path:
+    if not _ID.match(pid):
+        raise HTTPException(422, "invalid project id")
+    d = config.PROJECTS_DIR / pid
+    if not (d / "project.json").is_file():
+        raise HTTPException(404, f"no project '{pid}'")
+    return d
+
+
+def load(pid: str) -> dict:
+    return json.loads((_dir(pid) / "project.json").read_text())
+
+
+def save(p: dict) -> None:
+    d = config.PROJECTS_DIR / p["id"]
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / "project.json.tmp"
+    tmp.write_text(json.dumps(p, indent=2))
+    tmp.replace(d / "project.json")
+
+
+def _discover(root: Path, old: dict | None = None) -> tuple[bool, list[dict]]:
+    single, found = cases.discover(root)
+    prev = {c["id"]: c for c in (old or {}).get("cases", [])}
+    return single, [{"id": cid, "path": str(c), "stats_dir": str(s),
+                     "included": prev.get(cid, {}).get("included", True)}
+                    for cid, c, s in found]
+
+
+class NewProject(BaseModel):
+    name: str
+    root: str
+
+
+class ProjectPatch(BaseModel):
+    name: str | None = None
+    included: dict[str, bool] | None = None
+    ref_case: str | None = None
+    notes: str | None = None
+
+
+@router.get("")
+def list_projects() -> list[dict]:
+    out = []
+    for f in sorted(config.PROJECTS_DIR.glob("*/project.json")):
+        try:
+            p = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        out.append({k: p.get(k) for k in ("id", "name", "root", "single", "created")}
+                   | {"n_cases": len(p["cases"]),
+                      "n_included": sum(c["included"] for c in p["cases"])})
+    return sorted(out, key=lambda p: -(p["created"] or 0))
+
+
+@router.post("")
+def create_project(body: NewProject) -> dict:
+    root = safe_path(body.root)
+    if not root.is_dir():
+        raise HTTPException(422, "root must be a directory")
+    single, found = _discover(root)
+    if not found:
+        raise HTTPException(422, f"no M-Star cases (Stats folders) found under {root}")
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", body.name.strip()).strip("-")[:48] or "project"
+    pid, i = slug, 2
+    while (config.PROJECTS_DIR / pid).exists():
+        pid, i = f"{slug}-{i}", i + 1
+    p = {"id": pid, "name": body.name.strip() or pid, "root": str(root),
+         "single": single, "created": time.time(), "cases": found,
+         "ref_case": found[0]["id"], "notes": ""}
+    save(p)
+    return p
+
+
+@router.get("/{pid}")
+def get_project(pid: str, details: bool = True) -> dict:
+    p = load(pid)
+    if details:
+        p["cases"] = [{**c, "info": _safe_info(c)} for c in p["cases"]]
+    return p
+
+
+def _safe_info(c: dict) -> dict | None:
+    try:
+        return cases.case_info(c["id"], Path(c["path"]), Path(c["stats_dir"]))
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@router.patch("/{pid}")
+def patch_project(pid: str, body: ProjectPatch) -> dict:
+    p = load(pid)
+    if body.name is not None:
+        p["name"] = body.name
+    if body.notes is not None:
+        p["notes"] = body.notes
+    if body.ref_case is not None:
+        if body.ref_case not in {c["id"] for c in p["cases"]}:
+            raise HTTPException(422, "unknown reference case")
+        p["ref_case"] = body.ref_case
+    for c in p["cases"]:
+        if body.included and c["id"] in body.included:
+            c["included"] = bool(body.included[c["id"]])
+    save(p)
+    return p
+
+
+@router.post("/{pid}/rediscover")
+def rediscover(pid: str) -> dict:
+    p = load(pid)
+    p["single"], p["cases"] = _discover(safe_path(p["root"]), p)
+    save(p)
+    return p
+
+
+@router.delete("/{pid}")
+def delete_project(pid: str) -> dict:
+    d = _dir(pid)
+    if any(j["status"] in ("queued", "running") for j in jobs.list_jobs(pid)):
+        raise HTTPException(409, "project has active jobs")
+    shutil.rmtree(d)
+    return {"deleted": pid}
+
+
+# ------------------------------------------------------------------ runs
+
+class RunRequest(BaseModel):
+    task: str
+    params: dict = {}
+    cases: list[str] | None = None
+    label: str | None = None
+
+
+@router.post("/{pid}/run")
+async def run_task(pid: str, body: RunRequest) -> dict:
+    p = load(pid)
+    task = tasks.TASKS.get(body.task)
+    if task is None:
+        raise HTTPException(404, f"unknown task '{body.task}'")
+    wanted = set(body.cases) if body.cases is not None else None
+    sel = [c for c in p["cases"]
+           if (c["id"] in wanted if wanted is not None else c["included"])]
+    if not sel:
+        raise HTTPException(422, "no cases selected")
+    prm = tasks.coerce(task, body.params)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    run = config.PROJECTS_DIR / pid / "runs" / f"{stamp}_{task.id}"
+    i = 2
+    while run.exists():
+        run, i = run.with_name(f"{stamp}_{task.id}_{i}"), i + 1
+    run.mkdir(parents=True)
+    try:
+        cmds = task.build(p, sel, prm, run)
+    except Exception:
+        shutil.rmtree(run, ignore_errors=True)
+        raise
+    label = body.label or f"{task.label} ({len(sel)} case{'s' * (len(sel) > 1)})"
+    return await jobs.manager.submit(pid, task.id, label, cmds, run,
+                                     {"params": prm, "cases": [c["id"] for c in sel]})
+
+
+@router.get("/{pid}/runs")
+def list_runs(pid: str) -> list[dict]:
+    d = _dir(pid) / "runs"
+    by_dir = {j["run_dir"]: j for j in jobs.list_jobs(pid)}
+    out = []
+    for r in sorted(d.glob("*"), reverse=True) if d.is_dir() else []:
+        if not r.is_dir():
+            continue
+        meta = {}
+        try:
+            meta = json.loads((r / "job.json").read_text())
+        except (OSError, ValueError):
+            pass
+        j = by_dir.get(str(r), {})
+        out.append({"name": r.name, "path": f"runs/{r.name}", "task": meta.get("task"),
+                    "label": j.get("label") or meta.get("label"),
+                    "job_id": meta.get("id"), "status": j.get("status", "unknown"),
+                    "params": meta.get("params", {}),
+                    "created_at": j.get("created_at"), "finished_at": j.get("finished_at"),
+                    "csvs": sorted(f.relative_to(r).as_posix() for f in r.rglob("*.csv")),
+                    "htmls": sorted(f.relative_to(r).as_posix() for f in r.rglob("*.html")),
+                    "images": sorted(f.relative_to(r).as_posix() for f in r.rglob("*.png"))})
+    return out
+
+
+@router.delete("/{pid}/runs/{name}")
+def delete_run(pid: str, name: str) -> dict:
+    r = safe_child(_dir(pid) / "runs", name)
+    j = next((j for j in jobs.list_jobs(pid) if j["run_dir"] == str(r)), None)
+    if j and j["status"] in ("queued", "running"):
+        raise HTTPException(409, "run is still active")
+    shutil.rmtree(r)
+    return {"deleted": name}
+
+
+# ------------------------------------------------------------------ files
+
+@router.get("/{pid}/file")
+def get_file(pid: str, path: str, download: bool = False):
+    f = safe_child(_dir(pid), path)
+    if not f.is_file():
+        raise HTTPException(422, "not a file")
+    return FileResponse(f, filename=f.name if download else None,
+                        content_disposition_type="attachment" if download else "inline")
+
+
+@router.get("/{pid}/csv")
+def get_csv(pid: str, path: str, max_rows: int = 50000) -> dict:
+    f = safe_child(_dir(pid), path)
+    with open(f, newline="") as fh:
+        reader = csv.reader(fh)
+        try:
+            columns = next(reader)
+        except StopIteration:
+            return {"columns": [], "rows": [], "truncated": False}
+        rows = []
+        for i, r in enumerate(reader):
+            if i >= max_rows:
+                return {"columns": columns, "rows": rows, "truncated": True}
+            rows.append([_num(v) for v in r])
+    return {"columns": columns, "rows": rows, "truncated": False}
+
+
+def _num(v: str):
+    try:
+        x = float(v)
+        return x if x == x and abs(x) != float("inf") else None
+    except ValueError:
+        return v
+
+
+@router.get("/{pid}/zip")
+def get_zip(pid: str, background: BackgroundTasks, path: str = "runs"):
+    base = safe_child(_dir(pid), path)
+    out = config.CACHE_DIR / f"export_{pid}_{time.time_ns()}.zip"
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        files = [base] if base.is_file() else sorted(base.rglob("*"))
+        for f in files:
+            if f.is_file():
+                z.write(f, f.relative_to(base.parent))
+    background.add_task(out.unlink, missing_ok=True)
+    return FileResponse(out, filename=f"{pid}_{base.name}.zip",
+                        media_type="application/zip")

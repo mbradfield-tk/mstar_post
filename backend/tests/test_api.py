@@ -1,0 +1,231 @@
+"""API tests on a synthetic M-Star layout (run: python3 -m pytest -q backend/tests)."""
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+pv = pytest.importorskip("pyvista")
+vtk = pytest.importorskip("vtk")
+
+from app import config, jobs  # noqa: E402
+
+FLUID_HEADER = ["Time [s]", "Fluid Volume [m^3]", "Mean Velocity [m/s]",
+                "Mean Energy Dissipation Rate [W/kg]"]
+
+
+def write_vti(path: Path, dims, origin, raw: bool, t: float) -> np.ndarray:
+    """ImageData with cell arrays; raw=True mimics M-Star (uncompressed, appended raw)."""
+    img = pv.ImageData(dimensions=[d + 1 if d > 0 else 1 for d in dims],
+                       origin=origin, spacing=(0.01, 0.01, 0.01))
+    n = img.n_cells
+    vel = np.zeros((n, 3), np.float32)
+    vel[:, 0] = np.arange(n, dtype=np.float32)
+    img.cell_data["Velocity Vector (m/s)"] = vel
+    frac = np.ones(n, np.float32)
+    frac[:5] = 0.0  # "solid" cells
+    img.cell_data["Fluid 1 (Water) Volume Fraction (-)"] = frac
+    img.cell_data["Fluid 2 (Oil) Volume Fraction (-)"] = np.zeros(n, np.float32)
+    img.field_data["TIME"] = np.array([t])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    w = vtk.vtkXMLImageDataWriter()
+    w.SetFileName(str(path))
+    w.SetInputData(img)
+    if raw:
+        w.SetDataModeToAppended()
+        w.EncodeAppendedDataOff()
+        w.SetCompressorTypeToNone()
+        w.SetHeaderTypeToUInt64()
+    w.Write()
+    return vel[:, 0].reshape(dims[::-1] if all(dims) else
+                             tuple(max(d, 1) for d in dims)[::-1])
+
+
+def make_case(case: Path, raw: bool = True) -> None:
+    (case / "input.xml").parent.mkdir(parents=True, exist_ok=True)
+    (case / "input.xml").write_text(
+        "<input><system><dx>0.01</dx><dt>0.001</dt></system></input>")
+    stats = case / "out" / "Stats"
+    stats.mkdir(parents=True)
+    t = np.arange(0, 4.0001, 0.1)
+    with open(stats / "Fluid.txt", "w") as fh:
+        fh.write("\t".join(FLUID_HEADER) + "\n")
+        for ti in t:
+            fh.write(f"{ti:g}\t0.001\t{0.1 if ti > 1 else ti / 10:g}\t1\n")
+    out = case / "out" / "Output"
+    for ti in (1.0, 2.0):
+        write_vti(out / "Volume" / "block0" / f"Volume.{ti:.5e}.vti", (6, 5, 4),
+                  (0, 0, 0), raw, ti)
+        write_vti(out / "SliceY_0.020" / "block0" / f"Slice.{ti:.5e}.vti", (6, 0, 4),
+                  (0, 0.02, 0), raw, ti)
+        s = pv.Sphere(radius=0.01, center=(0.03, 0.02, 0.02))
+        s.field_data["TIME"] = np.array([ti])
+        (out / "VolumeVOFSurface" / "block0").mkdir(parents=True, exist_ok=True)
+        s.save(out / "VolumeVOFSurface" / "block0" / f"VOFSurface.{ti:.5e}.vtp")
+    pv.Cube().save(case / "Vessel.stl")
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    make_case(root / "R1" / "caseA")
+    make_case(root / "R1" / "caseB", raw=False)
+    make_case(root / "R2" / "caseA")
+    monkeypatch.setattr(config, "ROOTS", [root.resolve()])
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "app")
+    monkeypatch.setattr(config, "PROJECTS_DIR", tmp_path / "app" / "projects")
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "app" / "cache")
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "app" / "jobs.db")
+    (tmp_path / "app").mkdir()
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+    jobs.manager.__init__()
+    with TestClient(app) as c:
+        c.root = root.resolve()
+        yield c
+
+
+def snapshot(root: Path) -> list:
+    return sorted((p, p.stat().st_mtime_ns) for p in root.rglob("*"))
+
+
+def test_path_guard(client, tmp_path):
+    assert client.get("/api/fs/list", params={"path": "/etc"}).status_code == 403
+    r = client.get("/api/fs/list", params={"path": str(client.root / ".." / "app")})
+    assert r.status_code == 403
+    r = client.get("/api/fs/list", params={"path": str(client.root)})
+    assert [e["name"] for e in r.json()["entries"]] == ["R1", "R2"]
+    r = client.get("/api/fs/list", params={"path": str(client.root / "R1")})
+    assert all(e["is_case"] for e in r.json()["entries"])
+
+
+def test_project_and_inventory(client):
+    p = client.post("/api/projects", json={"name": "step 8", "root": str(client.root)}).json()
+    assert [c["id"] for c in p["cases"]] == ["R1/caseA", "R1/caseB", "R2/caseA"]
+    assert p["id"] == "step-8"
+    p = client.patch(f"/api/projects/{p['id']}",
+                     json={"included": {"R1/caseB": False}, "ref_case": "R2/caseA"}).json()
+    assert [c["included"] for c in p["cases"]] == [True, False, True]
+    info = client.get(f"/api/projects/{p['id']}").json()["cases"][0]["info"]
+    assert info["end_time_s"] == pytest.approx(4.0)
+    assert info["settings"]["dx [m]"] == pytest.approx(0.01)
+
+    case = str(client.root / "R1" / "caseA")
+    inv = client.get("/api/case/inventory", params={"path": case}).json()
+    kinds = {k["kind"]: k for k in inv["kinds"]}
+    assert kinds["Volume"]["type"] == "volume" and kinds["Volume"]["times"] == [1.0, 2.0]
+    assert kinds["SliceY_0.020"]["type"] == "slice"
+    assert kinds["SliceY_0.020"]["slice_axis"] == 1
+    assert kinds["VolumeVOFSurface"]["type"] == "surface"
+    assert [g["name"] for g in inv["geometry"]] == ["Vessel"]
+
+    s = client.get("/api/case/series", params={"path": case, "file": "Fluid.txt",
+                                               "columns": ["Mean Velocity [m/s]"]}).json()
+    assert len(s["t"]) == 41 and s["columns"]["Mean Velocity [m/s]"][-1] == 0.1
+
+
+@pytest.mark.parametrize("case_id", ["R1/caseA", "R1/caseB"])  # raw memmap / compressed
+def test_planes(client, case_id):
+    case = str(client.root / case_id)
+    vol = "out/Output/Volume/block0/Volume.2.00000e+00.vti"
+    r = client.get("/api/case/plane", params={
+        "path": case, "file": vol, "array": "Velocity Vector (m/s)", "comp": "0",
+        "axis": 2, "pos": 0.015})
+    assert r.status_code == 200
+    h = r.headers
+    w, hh = int(h["x-width"]), int(h["x-height"])
+    assert (w, hh) == (6, 5) and int(h["x-index"]) == 1
+    d = np.frombuffer(r.content, "<f4").reshape(hh, w)
+    expect = np.arange(6 * 5 * 4, dtype=np.float32).reshape(4, 5, 6)
+    np.testing.assert_array_equal(d, expect[1])
+    r = client.get("/api/case/plane", params={
+        "path": case, "file": vol, "array": "Velocity Vector (m/s)", "comp": "0",
+        "axis": 2, "pos": 0.0})
+    d = np.frombuffer(r.content, "<f4").reshape(hh, w)
+    assert np.isnan(d[0, :5]).all()  # no fluid in the first five cells -> masked
+    np.testing.assert_array_equal(d[1:], expect[0, 1:])
+    r = client.get("/api/case/plane", params={
+        "path": case, "file": vol, "array": "Velocity Vector (m/s)", "axis": 0,
+        "pos": 0.0, "mask": False})
+    assert (int(r.headers["x-width"]), int(r.headers["x-height"])) == (4, 5)
+    r = client.get("/api/case/plane", params={
+        "path": case, "file": "out/Output/SliceY_0.020/block0/Slice.1.00000e+00.vti",
+        "array": "Velocity Vector (m/s)"})
+    assert r.headers["x-axis"] == "1" and int(r.headers["x-width"]) == 6
+    line = client.get("/api/case/line", params={
+        "path": case, "file": vol, "array": "Velocity Vector (m/s)", "comp": "0",
+        "p0": "0.005,0.005,0.005", "p1": "0.055,0.005,0.005", "n": 6}).json()
+    assert line["value"] == [float(i) for i in range(6)]
+
+
+def test_meshes(client):
+    case = str(client.root / "R1" / "caseA")
+    r = client.get("/api/case/surface", params={
+        "path": case, "file": "out/Output/VolumeVOFSurface/block0/VOFSurface.1.00000e+00.vtp"})
+    assert r.status_code == 200 and len(r.content) > 84
+    r = client.get("/api/case/iso", params={
+        "path": case, "file": "out/Output/Volume/block0/Volume.1.00000e+00.vti",
+        "array": "Velocity Vector (m/s)", "comp": "0", "level": 60})
+    n = int(np.frombuffer(r.content[80:84], "<u4")[0])
+    assert r.status_code == 200 and n > 0 and len(r.content) == 84 + 50 * n
+    assert client.get("/api/case/surface", params={
+        "path": case, "file": "../../R2/caseA/Vessel.stl"}).status_code == 403
+
+
+def wait(client, jid, timeout=60):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        j = client.get(f"/api/jobs/{jid}").json()
+        if j["status"] not in ("queued", "running"):
+            return j
+        time.sleep(0.2)
+    raise TimeoutError(jid)
+
+
+def test_stats_job_leaves_cases_untouched(client):
+    before = snapshot(client.root)
+    p = client.post("/api/projects", json={"name": "p", "root": str(client.root)}).json()
+    client.patch(f"/api/projects/{p['id']}", json={"included": {"R1/caseB": False}})
+    j = client.post(f"/api/projects/{p['id']}/run",
+                    json={"task": "stats_summary", "params": {"time": 1.5, "plot": False}}).json()
+    j = wait(client, j["id"])
+    log = client.get(f"/api/jobs/{j['id']}/log").json()["text"]
+    assert j["status"] == "done", log
+    assert snapshot(client.root) == before
+    runs = client.get(f"/api/projects/{p['id']}/runs").json()
+    assert "batch_summary_means.csv" in runs[0]["csvs"]
+    assert "R2/caseA/stats_summary.csv" in runs[0]["csvs"]
+    t = client.get(f"/api/projects/{p['id']}/csv",
+                   params={"path": f"{runs[0]['path']}/batch_summary_means.csv"}).json()
+    assert [r[0] for r in t["rows"]] == ["R1/caseA", "R2/caseA"]
+    r = client.get(f"/api/projects/{p['id']}/zip", params={"path": runs[0]["path"]})
+    assert r.status_code == 200 and r.content[:2] == b"PK"
+    assert client.get(f"/api/projects/{p['id']}/file",
+                      params={"path": "../../jobs.db"}).status_code == 403
+
+
+def test_custom_script_and_cancel(client, tmp_path):
+    script = client.root / "tool.py"
+    script.write_text("import sys, pathlib, time\n"
+                      "pathlib.Path(sys.argv[2], 'out.txt').write_text(sys.argv[1])\n"
+                      "time.sleep(float(sys.argv[3]))\n")
+    p = client.post("/api/projects", json={"name": "c", "root": str(client.root)}).json()
+    j = client.post(f"/api/projects/{p['id']}/run", json={
+        "task": "custom_script", "cases": ["R2/caseA"],
+        "params": {"script": str(script), "args": "{case_id} {out} 0"}}).json()
+    j = wait(client, j["id"])
+    assert j["status"] == "done"
+    assert (Path(j["run_dir"]) / "R2" / "caseA" / "out.txt").read_text() == "R2/caseA"
+
+    j = client.post(f"/api/projects/{p['id']}/run", json={
+        "task": "custom_script", "cases": ["R2/caseA"],
+        "params": {"script": str(script), "args": "{case_id} {out} 60"}}).json()
+    time.sleep(1.0)
+    client.post(f"/api/jobs/{j['id']}/cancel")
+    assert wait(client, j["id"], 20)["status"] == "cancelled"
+    bad = client.post(f"/api/projects/{p['id']}/run", json={
+        "task": "custom_script", "params": {"script": "/etc/passwd"}})
+    assert bad.status_code == 403
