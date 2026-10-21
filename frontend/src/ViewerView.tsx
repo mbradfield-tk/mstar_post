@@ -537,7 +537,8 @@ export default function ViewerView({ project }: { project: Project }) {
               <button onClick={() => setProfiles(null)}>Close</button></div>
             <Plot height={300} exportName="line_profile" data={profiles.map((p) => (
               { type: "scatter" as const, mode: "lines" as const, x: p.distance, y: p.value, name: p.id }))}
-              layout={{ xaxis: { title: { text: "distance [m]" } }, yaxis: { title: { text: fieldLabel } } }} />
+              layout={{ xaxis: { title: { text: "distance [m]" } },
+                        yaxis: { title: { text: `${fieldLabel} [${profiles[0]?.unit || "-"}]` } } }} />
           </div>
         )}
       </div>

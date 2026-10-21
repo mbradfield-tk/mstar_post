@@ -179,7 +179,7 @@ def stats_files(stats: Path) -> list[dict]:
             continue
         if len(header) >= 2 and header[0].lower().startswith("time"):
             out.append({"file": f.relative_to(stats).as_posix(),
-                        "columns": [h.strip() for h in header[1:]]})
+                        "columns": [mss.fix_unit(h.strip()) for h in header[1:]]})
     return out
 
 
@@ -194,13 +194,18 @@ def series(stats_file: Path, columns: list[str], max_points: int = 4000) -> dict
     if table is None:
         raise ValueError(f"{stats_file.name} is not a stats table")
     header, data = table
-    names = [h.strip() for h in header]
+    raw = [h.strip() for h in header]
+    names = [mss.fix_unit(h) for h in raw]  # M-Star's [-] made explicit
     step = max(1, int(np.ceil(len(data) / max_points)))
     rows = data[::step]
     out = {"t": [float(x) for x in rows[:, 0]], "columns": {}}
     for c in columns:
-        if c not in names:
+        if c in names:
+            j = names.index(c)
+        elif c in raw:
+            j = raw.index(c)
+        else:
             raise KeyError(c)
-        v = rows[:, names.index(c)]
+        v = rows[:, j]
         out["columns"][c] = [float(x) if np.isfinite(x) else None for x in v]
     return out

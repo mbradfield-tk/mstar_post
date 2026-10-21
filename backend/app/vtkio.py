@@ -23,8 +23,19 @@ _UNIT = re.compile(r"[\(\[]([^\)\]]*)[\)\]]\s*$")
 
 
 def unit_of(name: str) -> str:
+    """Unit from a trailing (...) or [...]; dimensionless '-' is made explicit
+    (volume fractions m^3/m^3, IDs and codes are labelled as such)."""
     m = _UNIT.search(name)
-    return m.group(1) if m else ""
+    u = m.group(1) if m else ""
+    if u in ("-", ""):
+        low = name.lower()
+        if "fraction" in low:
+            return "m^3/m^3"
+        if re.search(r"\bid\b", low):
+            return "id"
+        if "type" in low or "condition" in low:
+            return "code"
+    return u
 
 
 def _attrs(tag: str) -> dict:

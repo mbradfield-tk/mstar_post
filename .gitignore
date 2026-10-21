@@ -5,5 +5,7 @@ __pycache__/
 *.pyc
 *.vti
 *.vtk
+# reference books (copyrighted, not part of the app)
+data/
 
 backend/pytest-of-michael/

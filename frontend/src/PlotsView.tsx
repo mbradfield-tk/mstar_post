@@ -61,7 +61,7 @@ function loadPanels(pid: string): Panel[] {
 function SeriesPlot({ project }: { project: Project }) {
   const cases = project.cases.filter((c) => c.included);
   const [panels, setPanels] = useState<Panel[]>(() => loadPanels(project.id));
-  const [statsFiles, setStatsFiles] = useState<StatsFile[]>([]);
+  const [caseFiles, setCaseFiles] = useState<Record<string, StatsFile[]>>({});
   const [runs, setRuns] = useState<Run[]>([]);
   const [runFiles, setRunFiles] = useState<Record<string, RunSeriesFile[]>>({});
   const [tss, setTss] = useState<number | "">("");
@@ -71,8 +71,10 @@ function SeriesPlot({ project }: { project: Project }) {
   useEffect(() => {
     setPanels(loadPanels(project.id));
     setCache({});
-    const c = cases.find((x) => x.id === project.ref_case) ?? cases[0];
-    if (c) api.stats(c.path).then(setStatsFiles).catch((e) => setError(e.message));
+    setCaseFiles({});
+    cases.forEach((c) => api.stats(c.path)
+      .then((fs) => setCaseFiles((m) => ({ ...m, [c.id]: fs })))
+      .catch((e) => setError(`${c.id}: ${e.message}`)));
     api.runs(project.id).then((rs) => {
       const ss = rs.filter((r) => r.task === "stats_summary");
       setRuns(ss);
@@ -81,6 +83,27 @@ function SeriesPlot({ project }: { project: Project }) {
     }).catch((e) => setError(e.message));
   }, [project.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // union of the Stats files/columns of all included cases, reference case first
+  const statsFiles = useMemo(() => {
+    const order = [...cases].sort((a, b) => Number(b.id === project.ref_case) - Number(a.id === project.ref_case));
+    const out: StatsFile[] = [];
+    for (const c of order) for (const f of caseFiles[c.id] ?? []) {
+      const e = out.find((x) => x.file === f.file);
+      if (!e) out.push({ file: f.file, columns: [...f.columns] });
+      else f.columns.forEach((col) => { if (!e.columns.includes(col)) e.columns.push(col); });
+    }
+    return out;
+  }, [caseFiles, project.ref_case]); // eslint-disable-line react-hooks/exhaustive-deps
+  const filesReady = cases.every((c) => caseFiles[c.id]);
+  // the case's file holding col: the same name, else one of the same kind
+  // (e.g. MovingBody_agitator.txt for MovingBody_Moving Body.txt)
+  const statsFileFor = (caseId: string, file: string, col: string): string | null => {
+    const fs = caseFiles[caseId] ?? [];
+    if (fs.some((f) => f.file === file && f.columns.includes(col))) return file;
+    const kind = file.split(/[_./]/)[0];
+    return fs.find((f) => f.file.split(/[_./]/)[0] === kind && f.columns.includes(col))?.file ?? null;
+  };
+
   useEffect(() => {
     localStorage.setItem(`mstar_post.plots.${project.id}`, JSON.stringify(panels));
   }, [panels, project.id]);
@@ -88,24 +111,44 @@ function SeriesPlot({ project }: { project: Project }) {
   const filesOf = (src: string): { file: string; columns: string[] }[] =>
     src === "stats" ? statsFiles : runFiles[src.slice(4)] ?? [];
 
+  // saved panels may name columns from before unit labels: "E" -> "E = a/a0 [...]"
+  useEffect(() => {
+    let changed = false;
+    const next = panels.map((p) => {
+      const cols = filesOf(p.src).find((f) => f.file === p.file)?.columns;
+      if (!cols || (p.src === "stats" && !filesReady)) return p;
+      const fixed = p.cols.map((c) => cols.includes(c) ? c
+        : cols.find((x) => x.startsWith(`${c} `) || x.startsWith(`${c.replace(/_(m|m2|m3|s|dx)(?=_|$)/, "")} `)
+                     || x.replace(/ \[-\]$/, "") === c.replace(/ \[[^\]]*\]$/, "")) ?? "")
+        .filter((c) => c);
+      if (fixed.join("|") === p.cols.join("|")) return p;
+      changed = true;
+      return { ...p, cols: fixed };
+    });
+    if (changed) setPanels(next);
+  }, [statsFiles, runFiles, filesReady]); // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     for (const p of panels) for (const col of p.cols) {
       const k = dataKey(p, col);
-      if (cache[k]) continue;
+      if (cache[k] || (p.src === "stats" && !filesReady)) continue;
       setCache((m) => ({ ...m, [k]: {} }));
       const put = (id: string, t: number[], v: (number | null)[]) =>
         setCache((m) => ({ ...m, [k]: { ...m[k], [id]: { t, v } } }));
       if (p.src === "stats") {
-        cases.forEach((c) => api.series(c.path, p.file, [col])
-          .then((s) => put(c.id, s.t, s.columns[col]))
-          .catch((e) => setError(`${c.id}: ${e.message}`)));
+        cases.forEach((c) => {
+          const file = statsFileFor(c.id, p.file, col);
+          if (file) api.series(c.path, file, [col])
+            .then((s) => put(c.id, s.t, s.columns[col]))
+            .catch((e) => setError(`${c.id}: ${e.message}`));
+        });
       } else {
         api.runSeries(project.id, p.src.slice(4), p.file, [col]).then((res) => {
           for (const [id, s] of Object.entries(res)) if (s.columns[col]) put(id, s.t, s.columns[col]);
         }).catch((e) => setError(`${p.file}: ${e.message}`));
       }
     }
-  }, [panels]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [panels, filesReady]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const update = (key: number, patch: Partial<Panel>) =>
     setPanels((ps) => ps.map((p) => (p.key === key ? { ...p, ...patch } : p)));

@@ -117,6 +117,9 @@ def test_project_and_inventory(client):
     inv = client.get("/api/case/inventory", params={"path": case}).json()
     kinds = {k["kind"]: k for k in inv["kinds"]}
     assert kinds["Volume"]["type"] == "volume" and kinds["Volume"]["times"] == [1.0, 2.0]
+    units = {a["name"]: a["unit"] for a in kinds["Volume"]["arrays"]}
+    assert units["Fluid 1 (Water) Volume Fraction (-)"] == "m^3/m^3"
+    assert units["Velocity Vector (m/s)"] == "m/s"
     assert kinds["SliceY_0.020"]["type"] == "slice"
     assert kinds["SliceY_0.020"]["slice_axis"] == 1
     assert kinds["VolumeVOFSurface"]["type"] == "surface"
@@ -248,7 +251,7 @@ def test_run_timeseries(client):
         d = run / cid
         d.mkdir(parents=True)
         (d / "dispersion_timeseries.csv").write_text(
-            "time_s,E,a_norm\n" + "".join(f"{t},{scale * t},{'' if t else 'nan'}\n"
+            "time [s],E,a_norm\n" + "".join(f"{t},{scale * t},{'' if t else 'nan'}\n"
                                          for t in range(5)))
         (d / "holdup_profile.csv").write_text("time_s,z_m,phi_mean\n0,0,1\n0,1,1\n")
         (d / "stats_summary.csv").write_text("file,variable\n")

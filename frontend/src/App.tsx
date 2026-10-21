@@ -6,9 +6,10 @@ import JobsView from "./JobsView";
 import PlotsView from "./PlotsView";
 import ResultsView from "./ResultsView";
 import RunView from "./RunView";
+import TheoryView from "./TheoryView";
 import ViewerView from "./ViewerView";
 
-const TABS = ["Cases", "Run", "Jobs", "Results", "Plots", "Viewer"] as const;
+const TABS = ["Cases", "Run", "Jobs", "Results", "Plots", "Viewer", "Theory"] as const;
 type Tab = (typeof TABS)[number];
 
 export default function App() {
@@ -59,7 +60,7 @@ export default function App() {
         {project && <button onClick={del}>Delete project</button>}
         <nav>
           {TABS.map((t) => (
-            <button key={t} className={t === tab ? "tab active" : "tab"} disabled={!project}
+            <button key={t} className={t === tab ? "tab active" : "tab"} disabled={!project && t !== "Theory"}
                     onClick={() => setTab(t)}>{t}</button>
           ))}
         </nav>
@@ -72,7 +73,8 @@ export default function App() {
         setTab("Cases");
       }} />}
       <main>
-        {!project && !creating && (
+        {tab === "Theory" && <TheoryView />}
+        {!project && !creating && tab !== "Theory" && (
           <div className="panel welcome">
             <h2>Post-process M-Star CFD results</h2>
             <p>Create a project from a folder of cases (searched recursively, e.g. a study with

@@ -220,6 +220,7 @@ def delete_run(pid: str, name: str) -> dict:
 
 # time_s-first CSVs with several rows per time (profiles, per-drop lists)
 _NOT_SERIES = {"holdup_profile.csv", "vof_dsd.csv"}
+_TIME_COLS = ("time [s]", "time_s")  # current and pre-unit-label headers
 
 
 def _case_dirs(p: dict, run: Path) -> dict[str, Path]:
@@ -244,7 +245,7 @@ def run_timeseries(pid: str, name: str) -> list[dict]:
     for cid, d in _case_dirs(p, run).items():
         for f in sorted(d.glob("*.csv")):
             hdr = _header(f) if f.name not in _NOT_SERIES else []
-            if not hdr or hdr[0] != "time_s":
+            if not hdr or hdr[0] not in _TIME_COLS:
                 continue
             e = files.setdefault(f.name, {"file": f.name, "columns": [], "cases": []})
             e["cases"].append(cid)
@@ -270,7 +271,7 @@ def run_series(pid: str, name: str, file: str, columns: list[str] = Query(...),
             reader = csv.reader(fh)
             hdr = next(reader, [])
             rows = list(reader)
-        if not hdr or hdr[0] != "time_s":
+        if not hdr or hdr[0] not in _TIME_COLS:
             raise HTTPException(422, f"{file} has no time_s column")
         idx = {c: hdr.index(c) for c in columns if c in hdr}
         rows = rows[::max(1, -(-len(rows) // max_points))]
