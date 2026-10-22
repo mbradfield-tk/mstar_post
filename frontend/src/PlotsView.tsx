@@ -1,13 +1,19 @@
 import { useEffect, useMemo, useState } from "react";
 import type Plotly from "plotly.js-dist-min";
-import { api, download, fmt, toCsv, type CsvTable, type Project, type Run, type RunSeriesFile,
+import { api, caseName, download, fmt, toCsv, type CsvTable, type Project, type Run, type RunSeriesFile,
          type StatsFile } from "./api";
+import CaseNames from "./CaseNames";
 import Plot from "./Plot";
+import { caseColor, PlotStyleEditor, usePlotStyle, type PlotStyle } from "./PlotStyle";
 
 type Mode = "series" | "bars" | "scatter";
 
-export default function PlotsView({ project }: { project: Project }) {
+export default function PlotsView({ project, onProjectChange }: {
+  project: Project;
+  onProjectChange: (p: Project) => void;
+}) {
   const [mode, setMode] = useState<Mode>("series");
+  const [style, setStyle] = usePlotStyle(project.id);
   return (
     <div className="panel">
       <div className="row">
@@ -18,11 +24,16 @@ export default function PlotsView({ project }: { project: Project }) {
           </button>
         ))}
       </div>
-      {mode === "series" && <SeriesPlot project={project} />}
-      {mode !== "series" && <MeansPlots project={project} scatter={mode === "scatter"} />}
+      <CaseNames project={project} onChange={onProjectChange} />
+      <PlotStyleEditor style={style} setStyle={setStyle} project={project}
+                       caseIds={project.cases.map((c) => c.id)} />
+      {mode === "series" && <SeriesPlot project={project} style={style} />}
+      {mode !== "series" && <MeansPlots project={project} scatter={mode === "scatter"} style={style} />}
     </div>
   );
 }
+
+const caseIndex = (p: Project, id: string) => p.cases.findIndex((c) => c.id === id);
 
 const movingAvg = (t: number[], v: (number | null)[], win: number) => {
   if (!(win > 0)) return v;
@@ -42,8 +53,6 @@ const movingAvg = (t: number[], v: (number | null)[], win: number) => {
 type Panel = { key: number; src: string; file: string; cols: string[]; win: number; logY: boolean };
 type SeriesMap = Record<string, { t: number[]; v: (number | null)[] }>;
 
-const PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-                 "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"];
 const DASHES = ["solid", "dash", "dot", "dashdot", "longdash"] as const;
 const DEFAULT_PANEL: Panel = { key: 1, src: "stats", file: "Fluid.txt",
                                cols: ["Mean Velocity [m/s]"], win: 0, logY: false };
@@ -58,7 +67,7 @@ function loadPanels(pid: string): Panel[] {
   return [DEFAULT_PANEL];
 }
 
-function SeriesPlot({ project }: { project: Project }) {
+function SeriesPlot({ project, style }: { project: Project; style: PlotStyle }) {
   const cases = project.cases.filter((c) => c.included);
   const [panels, setPanels] = useState<Panel[]>(() => loadPanels(project.id));
   const [caseFiles, setCaseFiles] = useState<Record<string, StatsFile[]>>({});
@@ -160,7 +169,7 @@ function SeriesPlot({ project }: { project: Project }) {
   const addPanel = () => setPanels((ps) => [...ps, { ...(ps[ps.length - 1] ?? DEFAULT_PANEL),
     key: Math.max(0, ...ps.map((p) => p.key)) + 1 }]);
 
-  const caseColor = (id: string) => PALETTE[Math.max(0, cases.findIndex((c) => c.id === id)) % PALETTE.length];
+  const colorOf = (id: string) => caseColor(style, id, caseIndex(project, id));
   const n = panels.length;
   const gap = n > 1 ? 0.06 / Math.max(1, n - 1) + 0.02 : 0;
   const yName = (i: number) => (i ? `y${i + 1}` : "y");
@@ -179,11 +188,11 @@ function SeriesPlot({ project }: { project: Project }) {
       const d = cache[dataKey(p, col)] ?? {};
       cases.filter((c) => d[c.id]).forEach((c) => {
         traces.push({
-          type: "scattergl", mode: "lines", name: c.id, legendgroup: c.id,
+          type: "scattergl", mode: "lines", name: caseName(project, c.id), legendgroup: c.id,
           showlegend: !seen.has(c.id), yaxis: yName(i),
           x: d[c.id].t, y: movingAvg(d[c.id].t, d[c.id].v, p.win),
-          hovertemplate: `${c.id}<br>${col}: %{y:.5g}<br>t = %{x:.4g} s<extra></extra>`,
-          line: { width: c.id === project.ref_case ? 2.5 : 1.3, color: caseColor(c.id),
+          hovertemplate: `${caseName(project, c.id)}<br>${col}: %{y:.5g}<br>t = %{x:.4g} s<extra></extra>`,
+          line: { width: c.id === project.ref_case ? style.lineWidth * 1.9 : style.lineWidth, color: colorOf(c.id),
                   dash: DASHES[j % DASHES.length] },
         });
         seen.add(c.id);
@@ -263,7 +272,7 @@ function SeriesPlot({ project }: { project: Project }) {
         {!runs.some((r) => runFiles[r.name]?.length) && <span className="muted">Run "M-Star Stats summary" with dispersion/uniformity for metric time series.</span>}
       </div>
       {error && <div className="error">{error}</div>}
-      <Plot data={traces} exportName="time_series" height={Math.max(360, 250 * n + 90)} layout={{
+      <Plot data={traces} exportName="time_series" style={style} height={Math.round(Math.max(360, 250 * n + 90) * style.heightScale)} layout={{
         ...layout, xaxis: { title: { text: "Time [s]" }, anchor: yName(n - 1) as Plotly.AxisName }, shapes,
         legend: { orientation: "h", y: 1.0, yanchor: "bottom" }, margin: { t: 50, r: 20, b: 50, l: 80 },
       }} />
@@ -271,7 +280,7 @@ function SeriesPlot({ project }: { project: Project }) {
         <table className="grid narrow">
           <thead><tr><th>variable</th><th>case</th><th>mean (t &ge; {tss} s)</th><th>std</th><th>CoV</th><th>n</th></tr></thead>
           <tbody>{stats.map((s) => (
-            <tr key={s.key}><td>{s.col}</td><td className="mono">{s.id}</td><td className="num">{fmt(s.mean)}</td>
+            <tr key={s.key}><td>{s.col}</td><td className="mono" title={s.id}>{caseName(project, s.id)}</td><td className="num">{fmt(s.mean)}</td>
               <td className="num">{fmt(s.std)}</td><td className="num">{fmt(s.std / Math.abs(s.mean))}</td>
               <td className="num">{s.n}</td></tr>))}</tbody>
         </table>
@@ -280,10 +289,40 @@ function SeriesPlot({ project }: { project: Project }) {
   );
 }
 
-function MeansPlots({ project, scatter }: { project: Project; scatter: boolean }) {
+type Merged = { columns: string[]; rows: CsvTable["rows"]; origin: string[] };
+
+// one row per case (column 0); a case in several sources takes the first source's values per column
+function mergeTables(tables: { label: string; t: CsvTable }[]): Merged {
+  const columns = ["case"];
+  const rows = new Map<string, Map<string, string | number | null>>();
+  const origin = new Map<string, string[]>();
+  for (const { label, t } of tables) {
+    t.columns.slice(1).forEach((c) => { if (!columns.includes(c)) columns.push(c); });
+    for (const r of t.rows) {
+      const cs = String(r[0]);
+      if (!rows.has(cs)) { rows.set(cs, new Map()); origin.set(cs, []); }
+      const m = rows.get(cs)!;
+      t.columns.forEach((c, i) => { if (i > 0 && !m.has(c) && r[i] !== null && r[i] !== "") m.set(c, r[i]); });
+      if (!origin.get(cs)!.includes(label)) origin.get(cs)!.push(label);
+    }
+  }
+  const cases = [...rows.keys()];
+  return {
+    columns,
+    rows: cases.map((cs) => [cs, ...columns.slice(1).map((c) => rows.get(cs)!.get(c) ?? null)]),
+    origin: cases.map((cs) => origin.get(cs)!.join(", ")),
+  };
+}
+
+function MeansPlots({ project, scatter, style }: { project: Project; scatter: boolean; style: PlotStyle }) {
+  const store = `mstar_post.means.${project.id}`;
+  const saved = useMemo(() => {
+    try { return JSON.parse(localStorage.getItem(store) ?? "{}"); } catch { return {}; }
+  }, [store]);
   const [runs, setRuns] = useState<Run[]>([]);
-  const [src, setSrc] = useState("");  // "<run path>/<csv>"
-  const [table, setTable] = useState<CsvTable | null>(null);
+  const [srcs, setSrcs] = useState<string[]>(saved.srcs ?? []);  // "<run path>/<csv>"
+  const [excluded, setExcluded] = useState<string[]>(saved.excluded ?? []);
+  const [merged, setMerged] = useState<Merged | null>(null);
   const [sel, setSel] = useState<string[]>([]);
   const [colFilter, setColFilter] = useState("");
   const [xCol, setXCol] = useState("");
@@ -294,25 +333,46 @@ function MeansPlots({ project, scatter }: { project: Project; scatter: boolean }
   useEffect(() => {
     api.runs(project.id).then((rs) => {
       setRuns(rs);
+      const all = new Set(rs.flatMap((r) => r.csvs.map((c) => `${r.path}/${c}`)));
+      const kept = srcs.filter((s) => all.has(s));
+      if (kept.length) { if (kept.length !== srcs.length) setSrcs(kept); return; }
       const r = rs.find((x) => x.csvs.some((c) => c.endsWith("_means.csv")));
-      if (r) setSrc(`${r.path}/${r.csvs.find((c) => c === "batch_summary_means.csv") ?? r.csvs.find((c) => c.endsWith("_means.csv"))}`);
+      setSrcs(r ? [`${r.path}/${r.csvs.find((c) => c === "batch_summary_means.csv") ?? r.csvs.find((c) => c.endsWith("_means.csv"))}`] : []);
     });
-  }, [project.id]);
+  }, [project.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    if (!src) return;
-    api.csv(project.id, src).then((t) => {
-      setTable(t);
+    localStorage.setItem(store, JSON.stringify({ srcs, excluded }));
+  }, [store, srcs, excluded]);
+
+  const options = runs.flatMap((r) => r.csvs.filter((c) => c.endsWith("_means.csv") || c.endsWith("_settings.csv"))
+    .map((c) => ({ value: `${r.path}/${c}`, label: `${r.label ?? r.name} (${r.name.slice(0, 15)}): ${c}` })));
+
+  useEffect(() => {
+    if (!srcs.length) { setMerged(null); return; }
+    // keep the dropdown order so precedence does not depend on click order
+    const ordered = options.map((o) => o.value).filter((v) => srcs.includes(v));
+    if (!ordered.length) return;
+    let stale = false;
+    Promise.all(ordered.map((s) => api.csv(project.id, s).then((t) => ({
+      label: options.find((o) => o.value === s)!.label, t }))))
+      .then((tables) => {
+      if (stale) return;
+      const t = mergeTables(tables);
+      setMerged(t);
       const num = t.columns.slice(1);
       setSel((s) => s.filter((c) => num.includes(c)).length ? s.filter((c) => num.includes(c)) : num.slice(0, 4));
       if (!num.includes(xCol)) setXCol(num.find((c) => /speed|rpm/i.test(c)) ?? num[0] ?? "");
       if (!num.includes(yCol)) setYCol(num.find((c) => /power number/i.test(c)) ?? num[1] ?? "");
     });
-  }, [src]); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => { stale = true; };
+  }, [srcs.join("|"), runs]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const options = runs.flatMap((r) => r.csvs.filter((c) => c.endsWith("_means.csv") || c.endsWith("_settings.csv"))
-    .map((c) => ({ value: `${r.path}/${c}`, label: `${r.label ?? r.name}: ${c}` })));
-  const cases = table?.rows.map((r) => String(r[0])) ?? [];
+  const allCases = merged?.rows.map((r) => String(r[0])) ?? [];
+  const shown = merged ? merged.rows.filter((r) => !excluded.includes(String(r[0]))) : [];
+  const table = merged && { columns: merged.columns, rows: shown };
+  const cases = shown.map((r) => String(r[0]));
+  const names = cases.map((c) => caseName(project, c));
   const colVals = (c: string) => table!.rows.map((r) => r[table!.columns.indexOf(c)]);
   const refIdx = Math.max(0, cases.indexOf(project.ref_case ?? ""));
   const numeric = table?.columns.slice(1).filter((c) => colVals(c).some((v) => typeof v === "number")) ?? [];
@@ -320,12 +380,35 @@ function MeansPlots({ project, scatter }: { project: Project; scatter: boolean }
   return (
     <>
       <div className="row">
-        <label>Source <select value={src} onChange={(e) => setSrc(e.target.value)}>
-          <option value="" disabled>choose a means CSV</option>
-          {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-        </select></label>
         {!options.length && <span className="muted">Run "M-Star Stats summary" first.</span>}
       </div>
+      {options.length > 0 && (
+        <div className="split">
+          <div className="side">
+            <b className="small">Sources</b>
+            <div className="checklist">
+              {options.map((o) => (
+                <label key={o.value} className="small"><input type="checkbox" checked={srcs.includes(o.value)}
+                  onChange={(e) => setSrcs(e.target.checked ? [...srcs, o.value] : srcs.filter((x) => x !== o.value))} />{o.label}</label>
+              ))}
+            </div>
+            <span className="muted small">A case in several sources uses the first listed one.</span>
+          </div>
+          {merged && (
+            <div className="side">
+              <b className="small">Cases ({cases.length}/{allCases.length})</b>{" "}
+              <button onClick={() => setExcluded([])}>all</button>
+              <button onClick={() => setExcluded(allCases)}>none</button>
+              <div className="checklist">
+                {allCases.map((c, i) => (
+                  <label key={c} className="small" title={`${c}\n${merged.origin[i]}`}><input type="checkbox" checked={!excluded.includes(c)}
+                    onChange={(e) => setExcluded(e.target.checked ? excluded.filter((x) => x !== c) : [...excluded, c])} />{caseName(project, c)}</label>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
       {table && !scatter && (
         <div className="split">
           <div className="side">
@@ -337,7 +420,7 @@ function MeansPlots({ project, scatter }: { project: Project; scatter: boolean }
               ))}
             </div>
             <button onClick={() => download("means_selection.csv", toCsv(["case", ...sel],
-              cases.map((c, i) => [c, ...sel.map((s) => colVals(s)[i])])))}>Export selection CSV</button>
+              cases.map((c, i) => [names[i], ...sel.map((s) => colVals(s)[i])])))}>Export selection CSV</button>
           </div>
           <div className="main plotgrid">
             {sel.map((c) => {
@@ -345,9 +428,10 @@ function MeansPlots({ project, scatter }: { project: Project; scatter: boolean }
               const ref = ys[refIdx];
               const pct = ys.map((y) => (y !== null && ref ? ((y - ref) / Math.abs(ref)) * 100 : null));
               return (
-                <Plot key={c} exportName={c} height={340} data={[
-                  { type: "bar", x: cases, y: ys, name: "value", marker: { color: "steelblue" } },
-                  { type: "bar", x: cases, y: pct, name: "% vs ref", yaxis: "y2", marker: { color: "indianred" }, visible: "legendonly" },
+                <Plot key={c} exportName={c} style={style} height={Math.round(340 * style.heightScale)} data={[
+                  { type: "bar", x: names, y: ys, name: "value", marker: {
+                    color: style.barsByCase ? cases.map((id) => caseColor(style, id, caseIndex(project, id))) : style.barColor } },
+                  { type: "bar", x: names, y: pct, name: "% vs ref", yaxis: "y2", marker: { color: style.pctColor }, visible: "legendonly" },
                 ]} layout={{
                   title: { text: c, font: { size: 13 } }, barmode: "group",
                   yaxis2: { overlaying: "y", side: "right", title: { text: "% vs ref" } },
@@ -359,7 +443,9 @@ function MeansPlots({ project, scatter }: { project: Project; scatter: boolean }
         </div>
       )}
       {table && scatter && (
-        <ScatterFit cases={cases} x={xCol} y={yCol} xs={colVals(xCol)} ys={colVals(yCol)}
+        <ScatterFit cases={cases} labels={cases.map((c) => project.aliases?.[c] ?? c.split("/").pop()!)}
+                    colors={cases.map((id) => caseColor(style, id, caseIndex(project, id)))} style={style}
+                    x={xCol} y={yCol} xs={colVals(xCol)} ys={colVals(yCol)}
                     numeric={numeric} setX={setXCol} setY={setYCol} fit={fit} setFit={setFit}
                     logAxes={logAxes} setLogAxes={setLogAxes} />
       )}
@@ -367,13 +453,14 @@ function MeansPlots({ project, scatter }: { project: Project; scatter: boolean }
   );
 }
 
-function ScatterFit({ cases, x, y, xs, ys, numeric, setX, setY, fit, setFit, logAxes, setLogAxes }: {
-  cases: string[]; x: string; y: string; xs: unknown[]; ys: unknown[]; numeric: string[];
+function ScatterFit({ cases, labels, colors, style, x, y, xs, ys, numeric, setX, setY, fit, setFit, logAxes, setLogAxes }: {
+  cases: string[]; labels: string[]; colors: string[]; style: PlotStyle;
+  x: string; y: string; xs: unknown[]; ys: unknown[]; numeric: string[];
   setX: (s: string) => void; setY: (s: string) => void; fit: boolean; setFit: (b: boolean) => void;
   logAxes: boolean; setLogAxes: (b: boolean) => void;
 }) {
-  const pts = cases.map((c, i) => [c, xs[i], ys[i]] as const)
-    .filter((p): p is readonly [string, number, number] => typeof p[1] === "number" && typeof p[2] === "number");
+  const pts = cases.map((c, i) => [labels[i], xs[i], ys[i], c, colors[i]] as const)
+    .filter((p): p is readonly [string, number, number, string, string] => typeof p[1] === "number" && typeof p[2] === "number");
   // power law y = a x^b by least squares in log-log
   const pos = pts.filter((p) => p[1] > 0 && p[2] > 0);
   let law: { a: number; b: number; r2: number } | null = null;
@@ -401,10 +488,11 @@ function ScatterFit({ cases, x, y, xs, ys, numeric, setX, setY, fit, setFit, log
         <label><input type="checkbox" checked={logAxes} onChange={(e) => setLogAxes(e.target.checked)} /> log axes</label>
         {law && <span className="mono">y = {fmt(law.a)} x^{fmt(law.b, 3)} (R&sup2; = {fmt(law.r2, 3)})</span>}
       </div>
-      <Plot exportName={`${y}_vs_${x}`} height={520} data={[
+      <Plot exportName={`${y}_vs_${x}`} style={style} height={Math.round(520 * style.heightScale)} data={[
         { type: "scatter", mode: "text+markers", x: pts.map((p) => p[1]), y: pts.map((p) => p[2]),
-          text: pts.map((p) => p[0].split("/").pop()!), textposition: "top center",
-          hovertext: pts.map((p) => p[0]), marker: { size: 10 }, name: "cases" },
+          text: pts.map((p) => p[0]), textposition: "top center",
+          hovertext: pts.map((p) => p[3]), marker: { size: style.markerSize, color: pts.map((p) => p[4]) },
+          textfont: { size: style.fontSize }, name: "cases" },
         ...(law ? [{ type: "scatter" as const, mode: "lines" as const, x: fx,
           y: fx.map((v) => law!.a * v ** law!.b), name: "fit", line: { dash: "dash" as const } }] : []),
       ]} layout={{

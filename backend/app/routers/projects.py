@@ -59,6 +59,7 @@ class ProjectPatch(BaseModel):
     included: dict[str, bool] | None = None
     ref_case: str | None = None
     notes: str | None = None
+    aliases: dict[str, str] | None = None
 
 
 @router.get("")
@@ -120,6 +121,13 @@ def patch_project(pid: str, body: ProjectPatch) -> dict:
         if body.ref_case not in {c["id"] for c in p["cases"]}:
             raise HTTPException(422, "unknown reference case")
         p["ref_case"] = body.ref_case
+    if body.aliases is not None:
+        ids = {c["id"] for c in p["cases"]}
+        p["aliases"] = {k: v.strip()[:80] for k, v in body.aliases.items()
+                        if k in ids and v.strip() and v.strip() != k}
+        names = [p["aliases"].get(i, i) for i in ids]
+        if len(set(names)) < len(names):
+            raise HTTPException(422, "case display names must be unique")
     for c in p["cases"]:
         if body.included and c["id"] in body.included:
             c["included"] = bool(body.included[c["id"]])
@@ -176,7 +184,8 @@ async def run_task(pid: str, body: RunRequest) -> dict:
     except Exception:
         shutil.rmtree(run, ignore_errors=True)
         raise
-    label = body.label or f"{task.label} ({len(sel)} case{'s' * (len(sel) > 1)})"
+    label = (body.label or "").strip() or tasks.default_label(task, prm, len(sel))
+    label = jobs.unique_label(pid, label)
     return await jobs.manager.submit(pid, task.id, label, cmds, run,
                                      {"params": prm, "cases": [c["id"] for c in sel]})
 

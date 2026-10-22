@@ -77,6 +77,15 @@ def coerce(task: Task, raw: dict) -> dict:
     return out
 
 
+def default_label(task: Task, prm: dict, n_cases: int) -> str:
+    """Task name, switched-on options and case count, e.g.
+    'M-Star Stats summary + dispersion + uniformity, 5 cases'."""
+    on = [p["name"] for p in task.params
+          if p["type"] == "bool" and prm.get(p["name"]) and not p["default"]]
+    return "".join([task.label, *(f" + {n}" for n in on),
+                    f", {n_cases} case{'s' * (n_cases != 1)}"])
+
+
 # ------------------------------------------------------------------ tasks
 
 def _stats_build(project: dict, cases: list[dict], prm: dict, run: Path) -> list[dict]:

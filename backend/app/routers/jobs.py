@@ -2,10 +2,15 @@
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 
 from app import jobs, tasks
 
 router = APIRouter(prefix="/api", tags=["jobs"])
+
+
+class RenameRequest(BaseModel):
+    label: str
 
 
 @router.get("/tasks")
@@ -47,6 +52,17 @@ async def delete(jid: str) -> dict:
     except ValueError as e:
         raise HTTPException(422, str(e))
     return {"deleted": jid}
+
+
+@router.patch("/jobs/{jid}")
+async def rename(jid: str, body: RenameRequest) -> dict:
+    _job(jid)
+    try:
+        return await jobs.manager.rename(jid, body.label)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
 
 
 @router.post("/jobs/{jid}/rerun")

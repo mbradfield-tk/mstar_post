@@ -54,6 +54,14 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
       setJobs((js) => [nj, ...js.filter((x) => x.id !== j.id)]);
     } catch (e) { setError((e as Error).message); }
   };
+  const rename = async (j: Job) => {
+    const label = prompt("Job name", j.label)?.trim();
+    if (!label || label === j.label) return;
+    try {
+      const nj = await api.renameJob(j.id, label);
+      setJobs((js) => js.map((x) => (x.id === j.id ? nj : x)));
+    } catch (e) { setError((e as Error).message); }
+  };
   const remove = async (j: Job) => {
     if (!confirm(`Delete "${j.label}" and all its results?\n${j.run_dir}`)) return;
     try {
@@ -101,6 +109,7 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
               <h2 className="grow">{job.label} <span className={`status ${job.status}`}>{job.status}</span></h2>
               {active && <button onClick={() => api.cancelJob(job.id)}>Cancel</button>}
               {job.status === "done" && <button className="primary" onClick={onOpenResults}>Open results</button>}
+              <button onClick={() => rename(job)}>Rename</button>
               {!active && <button onClick={() => rerun(job)} title="delete the results and run again with the same settings">Re-run</button>}
               {!active && <button className="danger" onClick={() => remove(job)} title="delete the job and all its results">Delete</button>}
             </div>

@@ -92,8 +92,8 @@ export default function App() {
             setTab("Results");
           }} />
         )}
-        {project && tab === "Results" && <ResultsView project={project} runName={run} onRunChange={setRun} />}
-        {project && tab === "Plots" && <PlotsView project={project} />}
+        {project && tab === "Results" && <ResultsView project={project} runName={run} onRunChange={setRun} onProjectChange={setProject} />}
+        {project && tab === "Plots" && <PlotsView project={project} onProjectChange={setProject} />}
         {project && tab === "Viewer" && <ViewerView project={project} />}
       </main>
     </div>

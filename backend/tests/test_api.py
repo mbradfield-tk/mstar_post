@@ -1,4 +1,5 @@
 """API tests on a synthetic M-Star layout (run: python3 -m pytest -q backend/tests)."""
+import json
 import sys
 import time
 from pathlib import Path
@@ -292,6 +293,34 @@ def test_job_rerun_and_delete(client):
     assert client.delete(f"/api/jobs/{j['id']}").json() == {"deleted": j["id"]}
     assert not run.exists()
     assert client.get(f"/api/jobs/{j['id']}").status_code == 404
+
+
+def test_case_aliases(client):
+    p = client.post("/api/projects", json={"name": "al", "root": str(client.root)}).json()
+    url = f"/api/projects/{p['id']}"
+    r = client.patch(url, json={"aliases": {"R1/caseA": " A1 ", "R2/caseA": "", "nope": "x"}})
+    assert r.json()["aliases"] == {"R1/caseA": "A1"}
+    assert client.get(url).json()["aliases"] == {"R1/caseA": "A1"}
+    assert client.patch(url, json={"aliases": {"R1/caseA": "R2/caseA"}}).status_code == 422
+    assert client.patch(url, json={"aliases": {}}).json()["aliases"] == {}
+
+
+def test_job_labels_unique_and_rename(client):
+    p = client.post("/api/projects", json={"name": "lb", "root": str(client.root)}).json()
+    body = {"task": "stats_summary", "cases": ["R2/caseA"],
+            "params": {"time": 1.5, "plot": False, "dispersion": True}}
+    j1 = client.post(f"/api/projects/{p['id']}/run", json=body).json()
+    j2 = client.post(f"/api/projects/{p['id']}/run", json=body).json()
+    assert j1["label"] == "M-Star Stats summary + dispersion, 1 case"
+    assert j2["label"] == j1["label"] + " #2"
+    wait(client, j1["id"]), wait(client, j2["id"])
+    r = client.patch(f"/api/jobs/{j2['id']}", json={"label": " low rpm "})
+    assert r.json()["label"] == "low rpm"
+    assert json.loads((Path(j2["run_dir"]) / "job.json").read_text())["label"] == "low rpm"
+    runs = client.get(f"/api/projects/{p['id']}/runs").json()
+    assert "low rpm" in [x["label"] for x in runs]
+    assert client.patch(f"/api/jobs/{j1['id']}", json={"label": "low rpm"}).status_code == 409
+    assert client.patch(f"/api/jobs/{j1['id']}", json={"label": "  "}).status_code == 422
 
 
 def test_custom_script_and_cancel(client, tmp_path):

@@ -14,6 +14,7 @@ export default function RunView({ project, onSubmitted }: {
   const [tasks, setTasks] = useState<TaskDef[]>([]);
   const [sel, setSel] = useState<string>("stats_summary");
   const [values, setValues] = useState<Values>({});
+  const [name, setName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const task = tasks.find((t) => t.id === sel);
@@ -33,7 +34,8 @@ export default function RunView({ project, onSubmitted }: {
     setBusy(true);
     setError(null);
     try {
-      onSubmitted(await api.run(project.id, task.id, values));
+      onSubmitted(await api.run(project.id, task.id, values, undefined, name.trim() || undefined));
+      setName("");
     } catch (e) { setError((e as Error).message); }
     setBusy(false);
   };
@@ -82,6 +84,10 @@ export default function RunView({ project, onSubmitted }: {
               <div className="small muted">Outputs go to the project folder; case folders are only read.</div>
             </div>
             {error && <div className="error">{error}</div>}
+            <div className="row">
+              <label>Job name <input className="wide" value={name} onChange={(e) => setName(e.target.value)}
+                placeholder="default: task + options + case count" /></label>
+            </div>
             <button className="primary big" disabled={busy || !included.length} onClick={submit}>
               {busy ? "Submitting..." : "Run"}
             </button>

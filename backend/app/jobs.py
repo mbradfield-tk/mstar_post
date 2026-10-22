@@ -61,6 +61,15 @@ def list_jobs(project: str | None = None) -> list[dict]:
         return [_row(r) for r in c.execute(q, (project,) if project else ())]
 
 
+def unique_label(project: str, label: str) -> str:
+    """label, or label #2, #3, ... if another job of the project already has it."""
+    taken = {j["label"] for j in list_jobs(project)}
+    out, i = label, 2
+    while out in taken:
+        out, i = f"{label} #{i}", i + 1
+    return out
+
+
 def _update(job_id: str, **kw) -> None:
     with _conn() as c:
         c.execute(f"UPDATE jobs SET {', '.join(f'{k}=?' for k in kw)} WHERE id=?",
@@ -184,6 +193,27 @@ class JobManager:
                 finished_at=None, returncode=None, pid=None, step=0, error=None)
         await self._broadcast(jid)
         await self._dispatch()
+        return get_job(jid)
+
+    async def rename(self, jid: str, label: str) -> dict:
+        """Set a job's label (unique within its project)."""
+        j = get_job(jid)
+        if j is None:
+            raise KeyError(jid)
+        label = label.strip()
+        if not label:
+            raise ValueError("name must not be empty")
+        if any(o["label"] == label and o["id"] != jid for o in list_jobs(j["project"])):
+            raise RuntimeError(f"another job is already named '{label}'")
+        _update(jid, label=label)
+        meta = Path(j["run_dir"]) / "job.json"
+        try:
+            d = json.loads(meta.read_text())
+            d["label"] = label
+            meta.write_text(json.dumps(d, indent=2))
+        except (OSError, ValueError):
+            pass
+        await self._broadcast(jid)
         return get_job(jid)
 
     @staticmethod

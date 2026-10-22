@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { api, type CsvTable, type Project, type Run } from "./api";
+import { api, caseName, type CsvTable, type Project, type Run } from "./api";
+import CaseNames from "./CaseNames";
 import CsvTableView from "./CsvTableView";
 
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : "");
@@ -7,10 +8,11 @@ const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : ""
 // Prefer the cross-case means table when a run is opened.
 const PREFERRED = ["batch_summary_means.csv", "stats_summary_means.csv"];
 
-export default function ResultsView({ project, runName, onRunChange }: {
+export default function ResultsView({ project, runName, onRunChange, onProjectChange }: {
   project: Project;
   runName: string | null;
   onRunChange: (name: string | null) => void;
+  onProjectChange: (p: Project) => void;
 }) {
   const [runs, setRuns] = useState<Run[]>([]);
   const [file, setFile] = useState<string | null>(null);
@@ -96,7 +98,9 @@ export default function ResultsView({ project, runName, onRunChange }: {
               <pre className="log small">{JSON.stringify(run.params, null, 2)}</pre>
             </details>
             {error && <div className="error">{error}</div>}
-            {table && file && <CsvTableView table={table} name={file} refCase={project.ref_case} />}
+            {table?.columns[0] === "case" && <CaseNames project={project} onChange={onProjectChange} />}
+            {table && file && <CsvTableView table={table} name={file} refCase={project.ref_case}
+                                            caseLabel={(id) => caseName(project, id)} />}
             {file?.endsWith(".html") && (
               <iframe className="htmlframe" src={api.fileUrl(project.id, `${run.path}/${file}`)} />
             )}

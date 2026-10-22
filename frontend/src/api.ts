@@ -11,8 +11,9 @@ export type ProjectCase = {
 };
 export type Project = {
   id: string; name: string; root: string; single: boolean; created: number;
-  cases: ProjectCase[]; ref_case: string | null; notes: string;
+  cases: ProjectCase[]; ref_case: string | null; notes: string; aliases?: Record<string, string>;
 };
+export const caseName = (p: Project, id: string) => p.aliases?.[id] || id;
 export type ProjectSummary = {
   id: string; name: string; root: string; single: boolean; created: number;
   n_cases: number; n_included: number;
@@ -90,14 +91,14 @@ export const api = {
   createProject: (name: string, root: string) =>
     req<Project>("/api/projects", json("POST", { name, root })),
   patchProject: (id: string, body: Partial<{ name: string; included: Record<string, boolean>;
-    ref_case: string; notes: string }>) => req<Project>(`/api/projects/${id}`, json("PATCH", body)),
+    ref_case: string; notes: string; aliases: Record<string, string> }>) => req<Project>(`/api/projects/${id}`, json("PATCH", body)),
   rediscover: (id: string) => req<Project>(`/api/projects/${id}/rediscover`, { method: "POST" }),
   deleteProject: (id: string) => req(`/api/projects/${id}`, { method: "DELETE" }),
   runs: (id: string) => req<Run[]>(`/api/projects/${id}/runs`),
   deleteRun: (id: string, name: string) =>
     req(`/api/projects/${id}/runs/${encodeURIComponent(name)}`, { method: "DELETE" }),
-  run: (id: string, task: string, params: Record<string, unknown>, cases?: string[]) =>
-    req<Job>(`/api/projects/${id}/run`, json("POST", { task, params, cases })),
+  run: (id: string, task: string, params: Record<string, unknown>, cases?: string[], label?: string) =>
+    req<Job>(`/api/projects/${id}/run`, json("POST", { task, params, cases, label })),
   csv: (id: string, path: string) => req<CsvTable>(`/api/projects/${id}/csv?${qs({ path })}`),
   runTimeseries: (id: string, run: string) =>
     req<RunSeriesFile[]>(`/api/projects/${id}/runs/${encodeURIComponent(run)}/timeseries`),
@@ -112,6 +113,7 @@ export const api = {
   jobs: (project?: string) => req<Job[]>(`/api/jobs?${qs({ project })}`),
   cancelJob: (jid: string) => req<Job>(`/api/jobs/${jid}/cancel`, { method: "POST" }),
   rerunJob: (jid: string) => req<Job>(`/api/jobs/${jid}/rerun`, { method: "POST" }),
+  renameJob: (jid: string, label: string) => req<Job>(`/api/jobs/${jid}`, json("PATCH", { label })),
   deleteJob: (jid: string) => req<{ deleted: string }>(`/api/jobs/${jid}`, { method: "DELETE" }),
   jobLog: (jid: string, offset: number) =>
     req<{ offset: number; size: number; text: string }>(`/api/jobs/${jid}/log?${qs({ offset })}`),

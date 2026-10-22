@@ -5,10 +5,11 @@ type Cell = string | number | null;
 
 // Sortable/filterable table; for one-row-per-case tables (first column "case")
 // it can show % difference from a reference case and transpose.
-export default function CsvTableView({ table, name, refCase }: {
+export default function CsvTableView({ table, name, refCase, caseLabel }: {
   table: CsvTable;
   name: string;
   refCase?: string | null;
+  caseLabel?: (id: string) => string;
 }) {
   const [sort, setSort] = useState<{ col: number; asc: boolean } | null>(null);
   const [rowFilter, setRowFilter] = useState("");
@@ -17,13 +18,15 @@ export default function CsvTableView({ table, name, refCase }: {
   const [transpose, setTranspose] = useState(false);
   const caseTable = table.columns[0] === "case";
   const refRow = caseTable && refCase ? table.rows.find((r) => r[0] === refCase) : undefined;
+  const label = (v: Cell) => (caseTable && caseLabel && v !== null ? caseLabel(String(v)) : v);
 
   const colIdx = useMemo(() => table.columns.map((_, i) => i).filter((i) =>
     i === 0 || table.columns[i].toLowerCase().includes(colFilter.toLowerCase())), [table, colFilter]);
 
   const rows = useMemo(() => {
     const q = rowFilter.toLowerCase();
-    let rs = table.rows.filter((r) => !q || r.some((v) => String(v ?? "").toLowerCase().includes(q)));
+    let rs = table.rows.filter((r) => !q || r.some((v) => String(v ?? "").toLowerCase().includes(q))
+      || String(label(r[0]) ?? "").toLowerCase().includes(q));
     if (mode === "pct" && refRow) {
       rs = rs.map((r) => r.map((v, i) => {
         const ref = refRow[i];
@@ -41,10 +44,10 @@ export default function CsvTableView({ table, name, refCase }: {
       });
     }
     return rs;
-  }, [table, rowFilter, sort, mode, refRow]);
+  }, [table, rowFilter, sort, mode, refRow, caseLabel]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const cols = colIdx.map((i) => table.columns[i]);
-  const view: Cell[][] = rows.map((r) => colIdx.map((i) => r[i]));
+  const view: Cell[][] = rows.map((r) => colIdx.map((i) => (i === 0 ? label(r[i]) : r[i])));
 
   // column-wise ranges for heat shading of numeric cells
   const ranges = useMemo(() => colIdx.map((_, j) => {
@@ -87,12 +90,12 @@ export default function CsvTableView({ table, name, refCase }: {
         <button onClick={exportView}>Export view CSV</button>
         <button onClick={copyTsv}>Copy (Excel)</button>
         <span className="muted">{view.length} rows x {cols.length} cols{table.truncated && " (truncated)"}</span>
-        {mode === "pct" && refRow && <span className="muted">reference: <span className="mono">{String(refRow[0])}</span></span>}
+        {mode === "pct" && refRow && <span className="muted">reference: <span className="mono">{String(label(refRow[0]))}</span></span>}
       </div>
       <div className="tablewrap">
         {transpose ? (
           <table className="grid">
-            <thead><tr><th>variable</th>{view.map((r, i) => <th key={i} className="mono">{String(r[0])}</th>)}</tr></thead>
+            <thead><tr><th>variable</th>{view.map((r, i) => <th key={i} className="mono" title={String(rows[i][0])}>{String(r[0])}</th>)}</tr></thead>
             <tbody>
               {cols.slice(1).map((c, j) => (
                 <tr key={c}><td>{c}</td>
@@ -113,8 +116,9 @@ export default function CsvTableView({ table, name, refCase }: {
             </thead>
             <tbody>
               {view.slice(0, 5000).map((r, i) => (
-                <tr key={i} className={caseTable && r[0] === refCase ? "refrow" : ""}>
+                <tr key={i} className={caseTable && rows[i][0] === refCase ? "refrow" : ""}>
                   {r.map((v, j) => <td key={j} className={typeof v === "number" ? "num" : ""}
+                                      title={j === 0 && caseTable ? String(rows[i][0]) : undefined}
                                       style={{ background: shade(j, v) }}>
                     {fmt(v)}{mode === "pct" && j > 0 && typeof v === "number" ? "%" : ""}</td>)}
                 </tr>
