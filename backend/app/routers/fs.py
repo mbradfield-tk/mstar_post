@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app import cases, config
@@ -129,6 +130,59 @@ def dir_usage(path: str, refresh: bool = False) -> dict:
     if not truncated:
         _du_cache[str(d)] = (time.monotonic(), out)
     return {**out, "cached": False}
+
+
+# ------------------------------------------------------------------ view (read-only)
+
+_READ_MAX = 4 << 20
+_IMAGES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+           ".webp": "image/webp", ".bmp": "image/bmp", ".svg": "image/svg+xml"}
+
+
+def _regular_file(path: str) -> Path:
+    p = safe_path(path)
+    if not p.is_file():
+        raise HTTPException(422, f"not a file: {path}")
+    return p
+
+
+@router.get("/read")
+def read_file(path: str, offset: int = 0, limit: int = 256 << 10, tail: bool = False) -> dict:
+    """A chunk of a file: text (UTF-8, invalid bytes replaced) or, for binary
+    files, a hex dump of the first bytes. tail = the last `limit` bytes."""
+    p = _regular_file(path)
+    limit = max(1, min(limit, _READ_MAX))
+    size = p.stat().st_size
+    start = max(0, size - limit) if tail else max(0, min(offset, size))
+    try:
+        with open(p, "rb") as fh:
+            head = fh.read(8192)
+            fh.seek(start)
+            data = fh.read(limit)
+    except PermissionError:
+        raise HTTPException(403, f"permission denied: {path}")
+    binary = b"\0" in head
+    if binary:
+        data = data[:4096]
+        lines = [f"{start + i:08x}  {data[i:i + 16].hex(' '):<47}  "
+                 + "".join(chr(b) if 32 <= b < 127 else "." for b in data[i:i + 16])
+                 for i in range(0, len(data), 16)]
+        text = "\n".join(lines)
+    else:
+        text = data.decode("utf-8", errors="replace")
+    return {"path": str(p), "size": size, "mtime": p.stat().st_mtime, "offset": start,
+            "end": start + len(data), "binary": binary, "text": text,
+            "image": p.suffix.lower() in _IMAGES}
+
+
+@router.get("/image")
+def image(path: str) -> FileResponse:
+    p = _regular_file(path)
+    kind = _IMAGES.get(p.suffix.lower())
+    if not kind:
+        raise HTTPException(422, "not an image")
+    return FileResponse(p, media_type=kind, headers={
+        "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox; script-src 'none'"})
 
 
 # ------------------------------------------------------------------ create / delete

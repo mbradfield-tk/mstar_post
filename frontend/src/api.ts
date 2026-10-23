@@ -56,6 +56,8 @@ export type BrowseEntry = { name: string; path: string; dir: boolean; link: bool
   mtime: number; is_case: boolean };
 export type Browse = { path: string; parent: string | null; is_case: boolean; entries: BrowseEntry[];
   truncated: boolean; writable: boolean; disk: { total: number; used: number; free: number } };
+export type FileChunk = { path: string; size: number; mtime: number; offset: number; end: number;
+  binary: boolean; text: string; image: boolean };
 export type DirUsage = { path: string; bytes: number; apparent: number; files: number; dirs: number;
   truncated: boolean; seconds: number; cached: boolean };
 
@@ -101,6 +103,9 @@ export const api = {
     req<{ deleted: string }>("/api/fs/delete", json("POST", { path, recursive })),
   renamePath: (path: string, name: string) =>
     req<{ path: string }>("/api/fs/rename", json("POST", { path, name })),
+  readFile: (path: string, offset = 0, tail = false, limit = 256 << 10) =>
+    req<FileChunk>(`/api/fs/read?${qs({ path, offset, tail, limit })}`),
+  imageUrl: (path: string) => `/api/fs/image?${qs({ path })}`,
 
   projects: () => req<ProjectSummary[]>("/api/projects"),
   project: (id: string, refresh = false) => req<Project>(`/api/projects/${id}${refresh ? "?refresh=true" : ""}`),
@@ -120,9 +125,9 @@ export const api = {
   csv: (id: string, path: string) => req<CsvTable>(`/api/projects/${id}/csv?${qs({ path })}`),
   runTimeseries: (id: string, run: string) =>
     req<RunSeriesFile[]>(`/api/projects/${id}/runs/${encodeURIComponent(run)}/timeseries`),
-  runSeries: (id: string, run: string, file: string, columns: string[]) =>
+  runSeries: (id: string, run: string, file: string, columns: string[], cases?: string[]) =>
     req<Record<string, Series>>(
-      `/api/projects/${id}/runs/${encodeURIComponent(run)}/series?${qs({ file, columns })}`),
+      `/api/projects/${id}/runs/${encodeURIComponent(run)}/series?${qs({ file, columns, cases })}`),
   fileUrl: (id: string, path: string, download = false) =>
     `/api/projects/${id}/file?${qs({ path, download })}`,
   zipUrl: (id: string, path: string) => `/api/projects/${id}/zip?${qs({ path })}`,

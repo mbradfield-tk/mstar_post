@@ -120,6 +120,24 @@ def test_browse_and_du(client):
     assert client.get("/api/fs/browse", params={"path": str(d / "a.bin")}).status_code == 422
 
 
+def test_fs_read(client):
+    d = client.root / "R1"
+    (d / "log.txt").write_text("".join(f"line {i}\n" for i in range(100)))
+    (d / "x.bin").write_bytes(b"\0\1ABC")
+    (d / "p.png").write_bytes(b"\x89PNG\r\n")
+    r = client.get("/api/fs/read", params={"path": str(d / "log.txt"), "limit": 14}).json()
+    assert (r["text"], r["offset"], r["end"], r["binary"]) == ("line 0\nline 1\n", 0, 14, False)
+    r = client.get("/api/fs/read", params={"path": str(d / "log.txt"), "limit": 8, "tail": True}).json()
+    assert r["text"] == "line 99\n" and r["end"] == r["size"]
+    r = client.get("/api/fs/read", params={"path": str(d / "x.bin")}).json()
+    assert r["binary"] and r["text"].startswith("00000000  00 01 41 42 43") and r["text"].endswith("..ABC")
+    r = client.get("/api/fs/image", params={"path": str(d / "p.png")})
+    assert r.status_code == 200 and r.headers["content-type"] == "image/png"
+    assert client.get("/api/fs/image", params={"path": str(d / "log.txt")}).status_code == 422
+    assert client.get("/api/fs/read", params={"path": "/etc/passwd"}).status_code == 403
+    assert client.get("/api/fs/read", params={"path": str(d)}).status_code == 422
+
+
 def test_fs_create_and_delete(client, monkeypatch):
     d = client.root / "R2"
     r = client.post("/api/fs/mkdirs", json={"parent": str(d), "names": ["1_A_10L", "2_B_10L", "caseA", "a/b", ".."]}).json()
@@ -303,9 +321,12 @@ def test_run_timeseries(client):
         (d / "holdup_profile.csv").write_text("time_s,z_m,phi_mean\n0,0,1\n0,1,1\n")
         (d / "stats_summary.csv").write_text("file,variable\n")
     (run / "R1" / "caseA" / "phase_uniformity.csv").write_text("time_s,cov_10x3\n0,0.5\n")
+    (run / "R1" / "caseA" / "ua.csv").write_text("Time [s],UA [W/K],Momentum steady state [bool]\n0,1.5,False\n1,2.5,True\n")
     base = f"/api/projects/{p['id']}/runs/r1"
     files = {f["file"]: f for f in client.get(f"{base}/timeseries").json()}
-    assert set(files) == {"dispersion_timeseries.csv", "phase_uniformity.csv"}
+    assert set(files) == {"dispersion_timeseries.csv", "phase_uniformity.csv", "ua.csv"}
+    s = client.get(f"{base}/series", params={"file": "ua.csv", "columns": ["UA [W/K]"], "cases": ["R1/caseA"]}).json()
+    assert s["R1/caseA"] == {"t": [0, 1], "columns": {"UA [W/K]": [1.5, 2.5]}}
     assert files["dispersion_timeseries.csv"]["cases"] == ["R1/caseA", "R2/caseA"]
     assert files["dispersion_timeseries.csv"]["columns"] == ["E", "a_norm"]
     s = client.get(f"{base}/series", params={"file": "dispersion_timeseries.csv",
@@ -321,6 +342,23 @@ def test_run_timeseries(client):
     assert client.get(f"{base}/series", params={"file": "../../jobs.db",
                                                 "columns": ["E"]}).status_code == 422
 
+
+def test_run_timeseries_single_case(client):
+    p = client.post("/api/projects", json={"name": "one", "root": str(client.root / "R1" / "caseA")}).json()
+    assert p["single"]
+    cid = p["cases"][0]["id"]
+    runs = config.PROJECTS_DIR / p["id"] / "runs"
+    (runs / "ua" / cid).mkdir(parents=True)  # per-case task (calc_ua) -> <run>/<case id>/
+    (runs / "ua" / cid / "ua.csv").write_text("Time [s],UA [W/K]\n0,1\n1,2\n")
+    (runs / "ss").mkdir()  # stats_summary single case -> <run>/
+    (runs / "ss" / "dispersion_timeseries.csv").write_text("time [s],E\n0,1\n")
+    for run, f in (("ua", "ua.csv"), ("ss", "dispersion_timeseries.csv")):
+        base = f"/api/projects/{p['id']}/runs/{run}"
+        files = client.get(f"{base}/timeseries").json()
+        assert [x["file"] for x in files] == [f] and files[0]["cases"] == [cid]
+    s = client.get(f"/api/projects/{p['id']}/runs/ua/series",
+                   params={"file": "ua.csv", "columns": ["UA [W/K]"]}).json()
+    assert s[cid]["columns"]["UA [W/K]"] == [1, 2]
 
 def test_job_rerun_and_delete(client):
     p = client.post("/api/projects", json={"name": "rr", "root": str(client.root)}).json()

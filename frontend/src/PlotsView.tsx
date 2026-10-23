@@ -5,10 +5,18 @@ import { api, caseName, download, fmt, toCsv, type CsvTable, type Project, type 
 import CaseNames from "./CaseNames";
 import Plot from "./Plot";
 import { caseColor, PlotStyleEditor, usePlotStyle, type PlotStyle } from "./PlotStyle";
+import StatsSeries from "./StatsSeries";
 
-type Mode = "series" | "bars" | "scatter" | "detail";
-const MODE_LABEL: Record<Mode, string> = { series: "Time series", bars: "Compare means",
-  scatter: "Trend (x-y)", detail: "Case detail" };
+type Mode = "series" | "single" | "bars" | "scatter" | "detail";
+const MODE_LABEL: Record<Mode, string> = { series: "Time series", single: "Case time series",
+  bars: "Compare means", scatter: "Trend (x-y)", detail: "Case detail" };
+const MODE_HELP: Record<Mode, string> = {
+  series: "M-Star Stats variables (or run metrics) over time for several cases in stacked panels",
+  single: "one case: pick a Stats file or a job's time-series CSV (e.g. ua.csv) and its variables to plot over time",
+  bars: "steady-state means per case as bars",
+  scatter: "one mean against another across cases, with a power-law fit",
+  detail: "every mean of one case against the reference case",
+};
 
 export default function PlotsView({ project, onProjectChange, active, onReset }: {
   project: Project;
@@ -26,8 +34,8 @@ export default function PlotsView({ project, onProjectChange, active, onReset }:
     <div className="panel">
       <div className="row">
         <h2 className="grow">Plots</h2>
-        {(["series", "bars", "scatter", "detail"] as Mode[]).map((m) => (
-          <button key={m} className={mode === m ? "primary" : ""} onClick={() => setMode(m)}>{MODE_LABEL[m]}</button>
+        {(["series", "single", "bars", "scatter", "detail"] as Mode[]).map((m) => (
+          <button key={m} className={mode === m ? "primary" : ""} title={MODE_HELP[m]} onClick={() => setMode(m)}>{MODE_LABEL[m]}</button>
         ))}
         <label title="baseline for '% vs ref' in all plot modes (the project reference case is set on the Cases tab)">Reference case{" "}
           <select value={ref} onChange={(e) => setRef(e.target.value)}>
@@ -39,8 +47,10 @@ export default function PlotsView({ project, onProjectChange, active, onReset }:
       <CaseNames project={project} onChange={onProjectChange} />
       <PlotStyleEditor style={style} setStyle={setStyle} project={project}
                        caseIds={project.cases.map((c) => c.id)} />
+      <div className="small muted">{MODE_LABEL[mode]}: {MODE_HELP[mode]}.</div>
       {mode === "series" && <SeriesPlot project={project} style={style} active={active} refCase={ref} />}
-      {mode !== "series" && <MeansPlots project={project} view={mode} style={style} active={active} refCase={ref} />}
+      {mode === "single" && <StatsSeries project={project} style={style} />}
+      {mode !== "series" && mode !== "single" && <MeansPlots project={project} view={mode} style={style} active={active} refCase={ref} />}
     </div>
   );
 }
@@ -96,6 +106,13 @@ function loadPanels(pid: string): Panel[] {
 
 function SeriesPlot({ project, style, active, refCase }: { project: Project; style: PlotStyle; active: boolean; refCase: string }) {
   const cases = project.cases.filter((c) => c.included);
+  const hideKey = `mstar_post.plots.hidden.${project.id}`;
+  // cases hidden from the plot (data of all included cases is still loaded)
+  const [hidden, setHidden] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem(hideKey) ?? "[]"); } catch { return []; }
+  });
+  useEffect(() => localStorage.setItem(hideKey, JSON.stringify(hidden)), [hideKey, hidden]);
+  const shownCases = cases.filter((c) => !hidden.includes(c.id));
   const [panels, setPanels] = useState<Panel[]>(() => loadPanels(project.id));
   const [caseFiles, setCaseFiles] = useState<Record<string, StatsFile[]>>({});
   const [runs, setRuns] = useState<Run[]>([]);
@@ -112,9 +129,8 @@ function SeriesPlot({ project, style, active, refCase }: { project: Project; sty
       .then((fs) => setCaseFiles((m) => ({ ...m, [c.id]: fs })))
       .catch((e) => setError(`${c.id}: ${e.message}`)));
     api.runs(project.id).then((rs) => {
-      const ss = rs.filter((r) => r.task === "stats_summary");
-      setRuns(ss);
-      ss.forEach((r) => api.runTimeseries(project.id, r.name)
+      setRuns(rs);
+      rs.forEach((r) => api.runTimeseries(project.id, r.name)
         .then((fs) => setRunFiles((m) => ({ ...m, [r.name]: fs }))).catch(() => undefined));
     }).catch((e) => setError(e.message));
   }, [project.id]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -123,9 +139,8 @@ function SeriesPlot({ project, style, active, refCase }: { project: Project; sty
   useEffect(() => {
     if (!active) return;
     api.runs(project.id).then((rs) => {
-      const ss = rs.filter((r) => r.task === "stats_summary");
-      setRuns((old) => (sameRuns(old, ss) ? old : ss));
-      ss.forEach((r) => api.runTimeseries(project.id, r.name)
+      setRuns((old) => (sameRuns(old, rs) ? old : rs));
+      rs.forEach((r) => api.runTimeseries(project.id, r.name)
         .then((fs) => setRunFiles((m) => (JSON.stringify(m[r.name]) === JSON.stringify(fs) ? m : { ...m, [r.name]: fs })))
         .catch(() => undefined));
     }).catch(() => undefined);
@@ -230,7 +245,7 @@ function SeriesPlot({ project, style, active, refCase }: { project: Project; sty
       const r = d[refCase];
       const rs = r && rel !== "none" ? movingAvg(r.t, r.v, p.win) : null;
       if (rel !== "none" && !rs) return;
-      cases.filter((c) => d[c.id]).forEach((c) => {
+      cases.filter((c) => d[c.id] && !hidden.includes(c.id)).forEach((c) => {
         let y = movingAvg(d[c.id].t, d[c.id].v, p.win);
         if (rs) y = y.map((v, k) => {
           const b = interpAt(r!.t, rs, d[c.id].t[k]);
@@ -255,13 +270,13 @@ function SeriesPlot({ project, style, active, refCase }: { project: Project; sty
   const stats = useMemo(() => {
     if (tss === "") return [];
     return panels.flatMap((p) => p.cols.flatMap((col) =>
-      Object.entries(cache[dataKey(p, col)] ?? {}).map(([id, s]) => {
+      Object.entries(cache[dataKey(p, col)] ?? {}).filter(([id]) => !hidden.includes(id)).map(([id, s]) => {
         const v = s.v.filter((x, i): x is number => x !== null && s.t[i] >= tss);
         const m = v.reduce((a, b) => a + b, 0) / (v.length || 1);
         const sd = Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / Math.max(1, v.length - 1));
         return { key: `${p.key}|${col}|${id}`, pk: `${p.key}|${col}`, col, id, mean: m, std: sd, n: v.length };
       })));
-  }, [cache, panels, tss]);
+  }, [cache, panels, tss, hidden]);
   const refMean = (pk: string) => stats.find((s) => s.pk === pk && s.id === refCase)?.mean;
 
   const exportCsv = () => download("time_series.csv",
@@ -271,6 +286,21 @@ function SeriesPlot({ project, style, active, refCase }: { project: Project; sty
 
   return (
     <>
+      <details className="card">
+        <summary className="small">Cases shown: {shownCases.length} of {cases.length} included
+          {shownCases.length === 1 && <> ({caseName(project, shownCases[0].id)})</>}</summary>
+        <div className="row small">
+          <button onClick={() => setHidden([])}>all</button>
+          <button onClick={() => setHidden(cases.map((c) => c.id))}>none</button>
+          <span className="muted">tick one case to see its time series alone</span>
+        </div>
+        <div className="checklist">
+          {cases.map((c) => (
+            <label key={c.id} className="small" title={c.id}><input type="checkbox" checked={!hidden.includes(c.id)}
+              onChange={(e) => setHidden(e.target.checked ? hidden.filter((x) => x !== c.id) : [...hidden, c.id])} />
+              {caseName(project, c.id)}</label>))}
+        </div>
+      </details>
       <div className="panels">
         {panels.map((p, i) => {
           const files = filesOf(p.src);
@@ -278,22 +308,38 @@ function SeriesPlot({ project, style, active, refCase }: { project: Project; sty
           return (
             <div key={p.key} className="row panel-row">
               <b>{i + 1}</b>
-              <label>Source <select value={p.src} onChange={(e) => {
-                const src = e.target.value;
+              <label>Source <select value={p.src === "stats" ? "stats" : "jobs"} onChange={(e) => {
+                const r = runs.find((x) => runFiles[x.name]?.length);
+                const src = e.target.value === "stats" ? "stats" : r ? `run:${r.name}` : null;
+                if (!src) return;
                 const f = filesOf(src)[0];
                 update(p.key, { src, file: f?.file ?? "", cols: f ? [f.columns[0]] : [] });
               }}>
-                <option value="stats">Stats files</option>
-                {runs.filter((r) => runFiles[r.name]?.length).map((r) => (
-                  <option key={r.name} value={`run:${r.name}`}>run: {r.label ?? r.name} ({r.name.slice(0, 15)})</option>))}
+                <option value="stats">M-Star Stats</option>
+                <option value="jobs" disabled={!runs.some((r) => runFiles[r.name]?.length)}>App script outputs</option>
               </select></label>
-              <label>File <select value={p.file} onChange={(e) => {
-                const f = files.find((x) => x.file === e.target.value);
-                update(p.key, { file: e.target.value, cols: f ? [f.columns[0]] : [] });
-              }}>
-                {!files.some((f) => f.file === p.file) && <option value={p.file}>{p.file || "-"}</option>}
-                {files.map((f) => <option key={f.file}>{f.file}</option>)}
-              </select></label>
+              {p.src === "stats" ? (
+                <label>File <select value={p.file} onChange={(e) => {
+                  const f = files.find((x) => x.file === e.target.value);
+                  update(p.key, { file: e.target.value, cols: f ? [f.columns[0]] : [] });
+                }}>
+                  {!files.some((f) => f.file === p.file) && <option value={p.file}>{p.file || "-"}</option>}
+                  {files.map((f) => <option key={f.file}>{f.file}</option>)}
+                </select></label>
+              ) : (
+                <label>File <select value={`${p.src.slice(4)}|${p.file}`} onChange={(e) => {
+                  const k = e.target.value.indexOf("|");
+                  const src = `run:${e.target.value.slice(0, k)}`, file = e.target.value.slice(k + 1);
+                  const f = filesOf(src).find((x) => x.file === file);
+                  update(p.key, { src, file, cols: f ? [f.columns[0]] : [] });
+                }}>
+                  {!files.some((f) => f.file === p.file) && <option value={`${p.src.slice(4)}|${p.file}`}>{p.file || "-"}</option>}
+                  {runs.filter((r) => runFiles[r.name]?.length).map((r) => (
+                    <optgroup key={r.name} label={`${r.label ?? r.name} (${r.name.slice(0, 15)})`}>
+                      {runFiles[r.name].map((f) => <option key={f.file} value={`${r.name}|${f.file}`}>{f.file}</option>)}
+                    </optgroup>))}
+                </select></label>
+              )}
               <span className="chips">
                 {p.cols.map((c) => (
                   <span key={c} className="chip">{c}
@@ -323,7 +369,7 @@ function SeriesPlot({ project, style, active, refCase }: { project: Project; sty
         <label>Steady from [s] <input type="number" step="any" value={tss}
                                       onChange={(e) => setTss(e.target.value === "" ? "" : Number(e.target.value))} /></label>
         <button onClick={exportCsv}>Export CSV</button>
-        {!runs.some((r) => runFiles[r.name]?.length) && <span className="muted">Run "M-Star Stats summary" with dispersion/uniformity for metric time series.</span>}
+        {!runs.some((r) => runFiles[r.name]?.length) && <span className="muted">No app script outputs yet: run a task (e.g. stats summary with dispersion, heat transfer UA) to plot its time series.</span>}
       </div>
       {error && <div className="error">{error}</div>}
       {panels.some((p) => (p.rel ?? "none") !== "none") && !cases.some((c) => c.id === refCase) &&

@@ -275,13 +275,21 @@ def delete_run(pid: str, name: str) -> dict:
 
 # time_s-first CSVs with several rows per time (profiles, per-drop lists)
 _NOT_SERIES = {"holdup_profile.csv", "vof_dsd.csv"}
-_TIME_COLS = ("time [s]", "time_s")  # current and pre-unit-label headers
+_TIME_COLS = ("time [s]", "time_s")  # current and pre-unit-label headers, compared lower-case
+
+
+def _is_time(col: str) -> bool:
+    return col.strip().lower() in _TIME_COLS
 
 
 def _case_dirs(p: dict, run: Path) -> dict[str, Path]:
-    """Per-case output folder of a run (the run folder itself for a single case)."""
+    """Per-case output folder of a run. Single-case projects: <run>/<case id> when the
+    task wrote per-case folders (e.g. calc_ua), else the run folder itself (stats_summary)."""
     if p["single"]:
-        return {p["cases"][0]["id"]: run} if p["cases"] else {}
+        if not p["cases"]:
+            return {}
+        cid = p["cases"][0]["id"]
+        return {cid: run / cid if (run / cid).is_dir() else run}
     return {c["id"]: run / c["id"] for c in p["cases"] if (run / c["id"]).is_dir()}
 
 
@@ -300,7 +308,7 @@ def run_timeseries(pid: str, name: str) -> list[dict]:
     for cid, d in _case_dirs(p, run).items():
         for f in sorted(d.glob("*.csv")):
             hdr = _header(f) if f.name not in _NOT_SERIES else []
-            if not hdr or hdr[0] not in _TIME_COLS:
+            if not hdr or not _is_time(hdr[0]):
                 continue
             e = files.setdefault(f.name, {"file": f.name, "columns": [], "cases": []})
             e["cases"].append(cid)
@@ -326,7 +334,7 @@ def run_series(pid: str, name: str, file: str, columns: list[str] = Query(...),
             reader = csv.reader(fh)
             hdr = next(reader, [])
             rows = list(reader)
-        if not hdr or hdr[0] not in _TIME_COLS:
+        if not hdr or not _is_time(hdr[0]):
             raise HTTPException(422, f"{file} has no time_s column")
         idx = {c: hdr.index(c) for c in columns if c in hdr}
         rows = rows[::max(1, -(-len(rows) // max_points))]

@@ -200,11 +200,19 @@ textarea.paste { width: 100%; background: var(--control); color: var(--text); bo
   border-radius: 4px; padding: 4px 6px; font-size: 13px; }
 .batch table.grid input { width: 100%; min-width: 80px; }
 .nowrap { white-space: nowrap; }
+input.short-wide { width: 170px; }
 .modal-bg { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); z-index: 100;
   display: flex; align-items: center; justify-content: center; }
 .modal { background: var(--panel); border: 1px solid var(--control-line); border-radius: 8px;
   padding: 14px 18px; width: min(560px, 92vw); box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5); }
 .modal .mono { word-break: break-all; }
+.modal.viewer { width: min(1200px, 96vw); max-height: 92vh; display: flex; flex-direction: column; gap: 4px; }
+.viewer-body { flex: 1; min-height: 120px; overflow: auto; margin: 6px 0 0; padding: 8px;
+  background: var(--bg); border: 1px solid var(--control-line); border-radius: 4px; font-size: 13px; }
+.modal pre.viewer-body { white-space: pre; word-break: normal; }
+.modal pre.viewer-body.wrap { white-space: pre-wrap; word-break: break-all; }
+.viewer-body img { max-width: 100%; }
+tr.selected td { background: var(--panel-2); }
 .theory .refs li { margin: 3px 0; font-size: 14px; scroll-margin-top: 56px; }
 .seg { display: inline-flex; }
 .pane-bar { display: flex; align-items: center; gap: 4px; flex-wrap: nowrap; overflow-x: auto;

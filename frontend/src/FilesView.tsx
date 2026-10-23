@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type Browse, type BrowseEntry, type DirUsage } from "./api";
 import BatchFolders from "./BatchFolders";
+import FileViewer from "./FileViewer";
 
 export const fmtBytes = (b: number | null | undefined): string => {
   if (b === null || b === undefined || !Number.isFinite(b)) return "";
@@ -32,6 +33,7 @@ export default function FilesView() {
   // delete confirmation: "confirm" first, "typed" when a non-empty folder needs its name typed
   const [pending, setPending] = useState<{ e: BrowseEntry; step: "confirm" | "typed"; typed: string; busy: boolean } | null>(null);
   const [renaming, setRenaming] = useState<{ e: BrowseEntry; name: string; busy: boolean; error: string | null } | null>(null);
+  const [viewing, setViewing] = useState<string | null>(null);
   const reload = () => setTick((x) => x + 1);
 
   const doRename = async () => {
@@ -226,9 +228,10 @@ export default function FilesView() {
               {entries.map((e) => {
                 const s = sizeOf(e), u = usage[e.path];
                 return (
-                  <tr key={e.path}>
+                  <tr key={e.path} className={viewing === e.path ? "selected" : ""}>
                     <td className="mono">{e.dir
-                      ? <a onClick={() => !e.link && setPath(e.path)}>{e.name}/</a> : e.name}
+                      ? <a onClick={() => !e.link && setPath(e.path)}>{e.name}/</a>
+                      : <a title="view contents" onClick={() => setViewing(e.path)}>{e.name}</a>}
                       {e.link && <span className="muted"> (link)</span>}
                       {e.is_case && <span className="tag">case</span>}</td>
                     <td className="num">{e.dir && !e.link && u === undefined
@@ -240,6 +243,7 @@ export default function FilesView() {
                         <div style={{ width: `${(100 * s) / known}%` }} /></div>)}</td>
                     <td className="small">{when(e.mtime)}</td>
                     {listing.writable && <td className="nowrap">
+                      {!e.dir && <><button className="small" onClick={() => setViewing(e.path)}>View</button>{" "}</>}
                       <button className="small" title={`rename ${e.name}`}
                         onClick={() => setRenaming({ e, name: e.name, busy: false, error: null })}>Rename</button>{" "}
                       <button className="danger small" title={`delete ${e.name}`}
@@ -253,6 +257,7 @@ export default function FilesView() {
           {listing.truncated && <div className="muted small">Only the first 5000 entries are listed.</div>}
         </div>
       )}
+      {viewing && <FileViewer path={viewing} onClose={() => setViewing(null)} />}
       {renaming && (
         <div className="modal-bg" onClick={() => !renaming.busy && setRenaming(null)}>
           <div className="modal" role="dialog" aria-modal="true" onClick={(ev) => ev.stopPropagation()}

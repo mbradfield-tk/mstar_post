@@ -142,6 +142,7 @@ export default function App() {
                 localStorage.removeItem(`mstar_post.plots.${project.id}`);
                 localStorage.removeItem(`mstar_post.means.${project.id}`);
                 localStorage.removeItem(`mstar_post.plotref.${project.id}`);
+                localStorage.removeItem(`mstar_post.plots.hidden.${project.id}`);
                 reset("Plots");
               }} />)}
             {pane("Viewer", <ViewerView project={project} onRefresh={() => {

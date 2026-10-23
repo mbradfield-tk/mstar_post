@@ -3,8 +3,11 @@ import { api, caseName, type CsvTable, type Project, type Run } from "./api";
 import CaseNames from "./CaseNames";
 import { SimTimeTable, simTimeSummary } from "./CasesView";
 import CsvTableView from "./CsvTableView";
+import StatsSeries from "./StatsSeries";
 
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : "");
+// stats_plots/<stem>.html name of a Stats file, as written by mstar_stats_summary.make_plots
+const plotStem = (statsFile: string) => statsFile.replace(/\.[^./]+$/, "").replace(/[^\w.-]+/g, "_");
 
 // Prefer the cross-case means table when a run is opened.
 const PREFERRED = ["batch_summary_means.csv", "stats_summary_means.csv"];
@@ -21,6 +24,8 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
   const [file, setFile] = useState<string | null>(null);
   const [table, setTable] = useState<CsvTable | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [showSeries, setShowSeries] = useState(false);
+  const [seriesSel, setSeriesSel] = useState<{ caseId: string; file: string; src: string } | null>(null);
   const run = runs.find((r) => r.name === runName) ?? null;
   const runIds = run?.params?.cases;
   const runCases = Array.isArray(runIds) ? project.cases.filter((c) => runIds.includes(c.id)) : [];
@@ -36,6 +41,17 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
     const pick = PREFERRED.find((p) => run.csvs.includes(p)) ?? run.csvs[0] ?? run.htmls[0] ?? null;
     setFile(pick);
   }, [run?.name]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // the bottom block follows the top block: all variables of the same file and case
+  // (Stats file: stats_plots/<stem>.html; job CSV: the job's <stem>.html next to it, if that job is selected)
+  const seriesCandidates = !run || !seriesSel ? [] : seriesSel.src === "stats"
+    ? [`${seriesSel.caseId}/stats_plots/${plotStem(seriesSel.file)}.html`, `stats_plots/${plotStem(seriesSel.file)}.html`]
+    : seriesSel.src === `run:${run.name}`
+      ? [`${seriesSel.caseId}/${plotStem(seriesSel.file)}.html`, `${plotStem(seriesSel.file)}.html`] : [];
+  const seriesHtml = seriesCandidates.find((h) => run?.htmls.includes(h)) ?? null;
+  useEffect(() => {
+    if (showSeries && seriesHtml) setFile(seriesHtml);
+  }, [showSeries, seriesHtml]);
 
   useEffect(() => {
     setTable(null);
@@ -91,6 +107,18 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
         )}
       </div>
       <div className="main panel">
+        <details className="card" open={showSeries} onToggle={(e) => setShowSeries((e.target as HTMLDetailsElement).open)}>
+          <summary><b>Time series of one case</b> <span className="small muted">any variable of the M-Star Stats files
+            (e.g. Fluid.txt Mean Energy Dissipation Rate) or of a job's time-series CSV (e.g. ua.csv) over time</span></summary>
+          {showSeries && <StatsSeries project={project} onSelect={(caseId, f, src) => setSeriesSel({ caseId, file: f, src })} />}
+          {showSeries && seriesSel && (
+            <div className="small muted">
+              {seriesHtml ? <>All variables of {seriesSel.file} for this case are plotted below (from the selected run).</>
+                : seriesSel.src === "stats" ? <>The selected run has no plot of {seriesSel.file} for this case (run the Stats summary with HTML plots on it).</>
+                : <>Select that job in the run list to see its own plot of {seriesSel.file} below.</>}
+            </div>
+          )}
+        </details>
         {run ? (
           <>
             <div className="row">
