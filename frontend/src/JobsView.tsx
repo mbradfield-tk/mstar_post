@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type Job } from "./api";
+import { useDialog } from "./Dialog";
 
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : "");
 const dur = (j: Job) => {
@@ -21,6 +22,15 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
   const offset = useRef(0);
   const pre = useRef<HTMLPreElement>(null);
   const job = jobs.find((j) => j.id === selected);
+  const ui = useDialog();
+  // re-render every second while a job runs so its duration ticks
+  const [, setTick] = useState(0);
+  const anyActive = jobs.some((j) => j.status === "running" || j.status === "queued");
+  useEffect(() => {
+    if (!anyActive) return;
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [anyActive]);
 
   useEffect(() => {
     api.jobs(project).then(setJobs);
@@ -46,7 +56,8 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
   }, [selected]);
 
   const rerun = async (j: Job) => {
-    if (!confirm(`Delete the results of "${j.label}" and run it again with the same settings?`)) return;
+    if (!await ui.confirm({ title: "Re-run job?", ok: "Re-run", danger: true,
+      body: <p>The results of <b>{j.label}</b> are deleted and the job runs again with the same settings.</p> })) return;
     try {
       const nj = await api.rerunJob(j.id);
       setLog("");
@@ -55,7 +66,7 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
     } catch (e) { setError((e as Error).message); }
   };
   const rename = async (j: Job) => {
-    const label = prompt("Job name", j.label)?.trim();
+    const label = (await ui.prompt({ title: "Rename job", input: j.label, ok: "Rename" }))?.trim();
     if (!label || label === j.label) return;
     try {
       const nj = await api.renameJob(j.id, label);
@@ -63,7 +74,9 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
     } catch (e) { setError((e as Error).message); }
   };
   const remove = async (j: Job) => {
-    if (!confirm(`Delete "${j.label}" and all its results?\n${j.run_dir}`)) return;
+    if (!await ui.confirm({ title: "Delete job?", ok: "Delete", danger: true,
+      body: <><p>Delete <b>{j.label}</b> and all its results? This cannot be undone.</p>
+        <div className="mono small muted">{j.run_dir}</div></> })) return;
     try {
       await api.deleteJob(j.id);
       setJobs((js) => js.filter((x) => x.id !== j.id));
@@ -92,6 +105,7 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
 
   return (
     <div className="split">
+      {ui.dialog}
       <div className="side">
         <h3>Jobs</h3>
         {jobs.map((j) => (
@@ -107,7 +121,7 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
           <>
             <div className="row">
               <h2 className="grow plain">{job.label} <span className={`status ${job.status}`}>{job.status}</span></h2>
-              {active && <button onClick={() => api.cancelJob(job.id)}>Cancel</button>}
+              {active && <button onClick={() => api.cancelJob(job.id).catch((e) => setError(e.message))}>Cancel</button>}
               {job.status === "done" && <button className="primary" onClick={onOpenResults}>Open results</button>}
               <button onClick={() => rename(job)}>Rename</button>
               {!active && <button onClick={() => rerun(job)} title="delete the results and run again with the same settings">Re-run</button>}
@@ -123,9 +137,9 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
               <summary className="small">Commands</summary>
               <pre className="log small">{job.commands.map((c) => c.argv.join(" ")).join("\n")}</pre>
             </details>
-            <pre ref={pre} className="log">{log || "(no output yet)"}</pre>
+            <pre ref={pre} className="log">{log || (active ? "Waiting for output..." : "(no output)")}</pre>
           </>
-        ) : <div className="muted">Select a job.</div>}
+        ) : <div className="muted">{jobs.length ? "Select a job to see its log." : "Jobs started on the Run tab appear here with their live log."}</div>}
       </div>
     </div>
   );

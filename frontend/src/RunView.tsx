@@ -44,6 +44,7 @@ export default function RunView({ project, onSubmitted }: {
     <div className="split">
       <div className="side">
         <h3>Calculations</h3>
+        {!tasks.length && !error && <div className="muted">Loading...</div>}
         {tasks.map((t) => (
           <div key={t.id} className={`taskcard${t.id === sel ? " active" : ""}`} onClick={() => setSel(t.id)}>
             <b>{t.label}</b>
@@ -64,7 +65,8 @@ export default function RunView({ project, onSubmitted }: {
               <div className="row">
                 <span className="muted">Presets:</span>
                 {task.presets.map((p) => (
-                  <button key={p.label} onClick={() => setValues({ ...initial(task), ...p.params })}>{p.label}</button>
+                  <button key={p.label} title={Object.entries(p.params).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join("\n") || "defaults"}
+                          onClick={() => setValues({ ...initial(task), ...p.params })}>{p.label}</button>
                 ))}
               </div>
             )}
@@ -78,8 +80,8 @@ export default function RunView({ project, onSubmitted }: {
               </fieldset>
             ))}
             <div className="card">
-              <b>{included.length}</b> included case(s){task.per_case ? ", run one after another" : ""}:
-              <div className="small mono muted">{included.map((c) => c.id).join(", ") || "none - include cases first"}</div>
+              <b>{included.length}</b> included {included.length === 1 ? "case" : "cases"}{task.per_case ? ", run one after another" : ""}:
+              <div className="small mono muted">{included.map((c) => c.id).join(", ") || "none: include cases on the Cases tab first"}</div>
               {project.ref_case && <div className="small">reference case: <span className="mono">{project.ref_case}</span></div>}
               <div className="small muted">Outputs go to the project folder; case folders are only read.</div>
             </div>
@@ -88,7 +90,8 @@ export default function RunView({ project, onSubmitted }: {
               <label>Job name <input className="wide" value={name} onChange={(e) => setName(e.target.value)}
                 placeholder="default: task + options + case count" /></label>
             </div>
-            <button className="primary big" disabled={busy || !included.length} onClick={submit}>
+            <button className="primary big" disabled={busy || !included.length} onClick={submit}
+                    title={included.length ? undefined : "include at least one case on the Cases tab"}>
               {busy ? "Submitting..." : "Run"}
             </button>
           </>
@@ -118,7 +121,7 @@ function Field({ p, value, onChange }: { p: Param; value: unknown; onChange: (v:
     }
   })();
   return (
-    <label className="field" title={p.help}>
+    <label className="field">
       <span>{p.label}</span>
       {input}
       {p.help && <span className="small muted">{p.help}</span>}

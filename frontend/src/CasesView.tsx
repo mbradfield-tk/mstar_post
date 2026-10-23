@@ -111,6 +111,7 @@ export default function CasesView({ project, onChange }: {
       <div className="small">Included cases: {simTimeSummary(project.cases.filter((c) => c.included))}</div>
       {error && <div className="error">{error}</div>}
       {showDiff && <SettingsDiff cases={project.cases.filter((c) => c.included)} />}
+      <div className="scroll-x">
       <table className="grid">
         <thead>
           <tr>
@@ -137,15 +138,18 @@ export default function CasesView({ project, onChange }: {
                            onChange={() => patch({ ref_case: c.id })} /></td>
                 <td className="mono" title={c.path}>{g ? c.id.slice(g.length + 1) : c.id}
                   {c.info?.error && <span className="error"> {c.info.error}</span>}</td>
-                <td>{fmt(simTime(c).end)}</td>
+                <td className="num">{fmt(simTime(c).end)}</td>
                 <td className="small">{(c.info?.output_kinds ?? []).map((k) =>
                   <span key={k} className="tag">{k}</span>)}</td>
-                {cols.map((k) => <td key={k}>{fmt(c.info?.settings?.[k])}</td>)}
+                {cols.map((k) => <td key={k} className={typeof c.info?.settings?.[k] === "number" ? "num" : ""}>{fmt(c.info?.settings?.[k])}</td>)}
               </tr>
             )),
           ])}
+          {!shown.length && <tr><td colSpan={5 + cols.length} className="muted">
+            {project.cases.length ? "No case matches the filter." : "No cases found under this folder: check the path or use Rediscover."}</td></tr>}
         </tbody>
       </table>
+      </div>
     </div>
   );
 }
@@ -172,7 +176,7 @@ function SettingsDiff({ cases }: { cases: ProjectCase[] }) {
           <tbody>
             {rows.map((r) => (
               <tr key={r.k} className={r.differs ? "differs" : ""}>
-                <td>{r.k}</td>{r.vals.map((v, i) => <td key={i}>{fmt(v, 6)}</td>)}
+                <td>{r.k}</td>{r.vals.map((v, i) => <td key={i} className={typeof v === "number" ? "num" : ""}>{fmt(v, 6)}</td>)}
               </tr>
             ))}
             {!rows.length && <tr><td colSpan={cases.length + 1} className="muted">no differences</td></tr>}

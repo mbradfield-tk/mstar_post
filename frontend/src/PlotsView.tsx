@@ -3,6 +3,7 @@ import type Plotly from "plotly.js-dist-min";
 import { api, caseName, download, fmt, toCsv, type CsvTable, type Project, type Run, type RunSeriesFile,
          type StatsFile } from "./api";
 import CaseNames from "./CaseNames";
+import { useDialog } from "./Dialog";
 import Plot from "./Plot";
 import { caseColor, PlotStyleEditor, usePlotStyle, type PlotStyle } from "./PlotStyle";
 import StatsSeries from "./StatsSeries";
@@ -26,6 +27,7 @@ export default function PlotsView({ project, onProjectChange, active, onReset }:
 }) {
   const [mode, setMode] = useState<Mode>("series");
   const [style, setStyle] = usePlotStyle(project.id);
+  const ui = useDialog();
   const refKey = `mstar_post.plotref.${project.id}`;
   // Plots-only reference for % differences; the project reference case is the default
   const [ref, setRef] = useState<string>(() => localStorage.getItem(refKey) ?? project.ref_case ?? project.cases[0]?.id ?? "");
@@ -42,7 +44,9 @@ export default function PlotsView({ project, onProjectChange, active, onReset }:
             {project.cases.map((c) => <option key={c.id} value={c.id}>{caseName(project, c.id)}
               {c.id === project.ref_case ? " (project ref)" : ""}</option>)}
           </select></label>
-        <button onClick={() => confirm("Reset all Plots panels, sources, case selections and the reference case to the defaults? (Plot style and case names are kept.)") && onReset()}>Reset</button>
+        <button onClick={async () => await ui.confirm({ title: "Reset Plots?", ok: "Reset",
+          body: <p>All panels, sources, case selections and the reference case go back to the defaults. Plot style and case names are kept.</p> }) && onReset()}>Reset</button>
+        {ui.dialog}
       </div>
       <CaseNames project={project} onChange={onProjectChange} />
       <PlotStyleEditor style={style} setStyle={setStyle} project={project}

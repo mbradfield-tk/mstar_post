@@ -193,6 +193,12 @@ def test_project_and_inventory(client):
     s = client.get("/api/case/series", params={"path": case, "file": "Fluid.txt",
                                                "columns": ["Mean Velocity [m/s]"]}).json()
     assert len(s["t"]) == 41 and s["columns"]["Mean Velocity [m/s]"][-1] == 0.1
+    # decimation keeps the extremes of every bucket, not just every k-th sample
+    s = client.get("/api/case/series", params={"path": case, "file": "Fluid.txt",
+                                               "columns": ["Mean Velocity [m/s]"], "max_points": 5}).json()
+    v = s["columns"]["Mean Velocity [m/s]"]
+    assert 5 <= len(v) <= 12 and s["t"][0] == 0 and s["t"][-1] == 4.0
+    assert max(v) == 0.1 and v[-1] == 0.1
 
 
 @pytest.mark.parametrize("case_id", ["R1/caseA", "R1/caseB"])  # raw memmap / compressed
@@ -338,7 +344,7 @@ def test_run_timeseries(client):
     s = client.get(f"{base}/series", params={"file": "dispersion_timeseries.csv",
                                              "columns": ["E"], "cases": ["R2/caseA"],
                                              "max_points": 2}).json()
-    assert list(s) == ["R2/caseA"] and s["R2/caseA"]["t"] == [0, 3]
+    assert list(s) == ["R2/caseA"] and s["R2/caseA"]["t"] == [0, 1, 2, 4]  # bucket extremes kept
     assert client.get(f"{base}/series", params={"file": "../../jobs.db",
                                                 "columns": ["E"]}).status_code == 422
 

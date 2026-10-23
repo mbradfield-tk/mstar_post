@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { api } from "./api";
+import { useDialog } from "./Dialog";
 
 const DEFAULT_PATTERN = "{no}_{reactor_name}_{volume}L_{stir_speed}rpm_{note}";
 const PATTERN_KEY = "mstar_post.files.pattern";
@@ -32,6 +33,7 @@ export default function BatchFolders({ parent, existing, onDone }: {
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const ui = useDialog();
   const fields = useMemo(() => fieldsOf(pattern), [pattern]);
 
   const names = rows.map((r, i) => build(pattern, r, String(start + i * step).padStart(pad, "0"), tidy));
@@ -48,7 +50,8 @@ export default function BatchFolders({ parent, existing, onDone }: {
     setPaste(null);
   };
   const create = async () => {
-    if (!ok.length || !confirm(`Create ${ok.length} folder(s) in\n${parent}?`)) return;
+    if (!ok.length || !await ui.confirm({ title: `Create ${ok.length} folder${ok.length > 1 ? "s" : ""}?`, ok: "Create",
+      body: <div className="mono small">{parent}</div> })) return;
     setBusy(true);
     setError(null);
     try {
@@ -63,6 +66,7 @@ export default function BatchFolders({ parent, existing, onDone }: {
 
   return (
     <div className="card batch">
+      {ui.dialog}
       <div className="row small">
         <b>Create folders from a pattern</b>
         <span className="muted">placeholders in braces; {"{no}"} is numbered automatically</span>

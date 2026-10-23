@@ -35,6 +35,11 @@ export default function FilesView() {
   const [renaming, setRenaming] = useState<{ e: BrowseEntry; name: string; busy: boolean; error: string | null } | null>(null);
   const [viewing, setViewing] = useState<string | null>(null);
   const reload = () => setTick((x) => x + 1);
+  useEffect(() => {
+    if (!note) return;
+    const id = setTimeout(() => setNote(null), 6000);
+    return () => clearTimeout(id);
+  }, [note]);
 
   const doRename = async () => {
     if (!renaming) return;
@@ -175,7 +180,7 @@ export default function FilesView() {
         </div>
       )}
       {error && <div className="error">{error}</div>}
-      {note && <div className="small muted" onClick={() => setNote(null)}>{note}</div>}
+      {note && <div className="note small" onClick={() => setNote(null)}>{note}</div>}
       {listing && (listing.writable ? (
         <div className="row small">
           {(["folder", "file", "batch"] as const).map((k) => (
@@ -223,7 +228,7 @@ export default function FilesView() {
         <div className="tablewrap">
           <table className="grid">
             <thead><tr>{head("name", "name")}{head("size", "size")}<th>share</th>{head("mtime", "modified")}
-              {listing.writable && <th>Modify</th>}</tr></thead>
+              {listing.writable && <th>actions</th>}</tr></thead>
             <tbody>
               {entries.map((e) => {
                 const s = sizeOf(e), u = usage[e.path];
@@ -251,7 +256,7 @@ export default function FilesView() {
                   </tr>
                 );
               })}
-              {!entries.length && <tr><td colSpan={5} className="muted">(empty)</td></tr>}
+              {!entries.length && <tr><td colSpan={listing.writable ? 5 : 4} className="muted">(empty folder)</td></tr>}
             </tbody>
           </table>
           {listing.truncated && <div className="muted small">Only the first 5000 entries are listed.</div>}

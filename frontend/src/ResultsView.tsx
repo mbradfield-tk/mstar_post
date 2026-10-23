@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
-import { api, caseName, type CsvTable, type Project, type Run } from "./api";
+import { api, caseName, type CsvTable, type Project, type Run, type TaskDef } from "./api";
 import CaseNames from "./CaseNames";
 import { SimTimeTable, simTimeSummary } from "./CasesView";
 import CsvTableView from "./CsvTableView";
+import { useDialog } from "./Dialog";
+import RunSummary from "./RunSummary";
 import StatsSeries from "./StatsSeries";
 
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : "");
@@ -11,6 +13,12 @@ const plotStem = (statsFile: string) => statsFile.replace(/\.[^./]+$/, "").repla
 
 // Prefer the cross-case means table when a run is opened.
 const PREFERRED = ["batch_summary_means.csv", "stats_summary_means.csv"];
+type Section = "overview" | "files" | "series";
+const SECTIONS: [Section, string, string][] = [
+  ["overview", "Overview", "what was run, which cases were compared and the key results"],
+  ["files", "Files", "every table, HTML plot and image of the run"],
+  ["series", "Case time series", "any variable of one case over time"],
+];
 
 export default function ResultsView({ project, runName, onRunChange, onProjectChange, active, onReset }: {
   project: Project;
@@ -21,14 +29,19 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
   onReset: () => void;
 }) {
   const [runs, setRuns] = useState<Run[]>([]);
+  const [tasks, setTasks] = useState<TaskDef[]>([]);
+  const [section, setSection] = useState<Section>("overview");
   const [file, setFile] = useState<string | null>(null);
   const [table, setTable] = useState<CsvTable | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [showSeries, setShowSeries] = useState(false);
   const [seriesSel, setSeriesSel] = useState<{ caseId: string; file: string; src: string } | null>(null);
   const run = runs.find((r) => r.name === runName) ?? null;
+  const ui = useDialog();
   const runIds = run?.params?.cases;
   const runCases = Array.isArray(runIds) ? project.cases.filter((c) => runIds.includes(c.id)) : [];
+  const openFile = (f: string) => { setFile(f); setSection("files"); };
+
+  useEffect(() => { api.tasks().then(setTasks).catch(() => undefined); }, []);
 
   const reload = () => api.runs(project.id).then((rs) => {
     setRuns(rs);
@@ -49,9 +62,6 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
     : seriesSel.src === `run:${run.name}`
       ? [`${seriesSel.caseId}/${plotStem(seriesSel.file)}.html`, `${plotStem(seriesSel.file)}.html`] : [];
   const seriesHtml = seriesCandidates.find((h) => run?.htmls.includes(h)) ?? null;
-  useEffect(() => {
-    if (showSeries && seriesHtml) setFile(seriesHtml);
-  }, [showSeries, seriesHtml]);
 
   useEffect(() => {
     setTable(null);
@@ -61,7 +71,8 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
   }, [run?.path, file]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const del = async () => {
-    if (!run || !confirm(`Delete run ${run.name} and its outputs?`)) return;
+    if (!run || !await ui.confirm({ title: "Delete run?", ok: "Delete", danger: true,
+      body: <p>Delete run <b>{run.label ?? run.name}</b> and all its outputs? This cannot be undone.</p> })) return;
     await api.deleteRun(project.id, run.name);
     onRunChange(null);
     reload();
@@ -78,25 +89,27 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
 
   return (
     <div className="split">
+      {ui.dialog}
       <div className="side">
         <div className="row"><h3 className="grow">Runs</h3><button onClick={reload}>Refresh</button>
           <button onClick={onReset} title="newest run, default file, no table filters">Reset</button></div>
         {runs.map((r) => (
           <div key={r.name} className={`taskcard${r.name === runName ? " active" : ""}`} onClick={() => onRunChange(r.name)}>
             <span className={`status ${r.status}`}>{r.status}</span> <b>{r.label ?? r.task}</b>
-            <div className="small muted">{when(r.created_at)}</div>
+            <div className="small muted">{when(r.created_at)}
+              {Array.isArray(r.params?.cases) && <> &middot; {(r.params.cases as string[]).length} case{(r.params.cases as string[]).length === 1 ? "" : "s"}</>}</div>
           </div>
         ))}
-        {!runs.length && <div className="muted">No runs yet.</div>}
+        {!runs.length && <div className="muted">No runs yet: start a calculation on the Run tab.</div>}
         {run && (
           <>
             <h3>Files</h3>
             {[...group([...run.csvs, ...run.htmls, ...run.images])].map(([d, fs]) => (
               <details key={d} open={d === "(run)"}>
-                <summary className="small mono">{d}</summary>
+                <summary className="small mono">{d === "(run)" ? "run folder" : caseName(project, d)}</summary>
                 <ul className="filelist">
                   {fs.map((f) => (
-                    <li key={f} className={f === file ? "active" : ""} onClick={() => setFile(f)}>
+                    <li key={f} className={f === file && section === "files" ? "active" : ""} onClick={() => openFile(f)}>
                       {f.slice(f.lastIndexOf("/") + 1)}
                     </li>
                   ))}
@@ -107,47 +120,75 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
         )}
       </div>
       <div className="main panel">
-        <details className="card" open={showSeries} onToggle={(e) => setShowSeries((e.target as HTMLDetailsElement).open)}>
-          <summary><b>Time series of one case</b> <span className="small muted">any variable of the M-Star Stats files
-            (e.g. Fluid.txt Mean Energy Dissipation Rate) or of a job's time-series CSV (e.g. ua.csv) over time</span></summary>
-          {showSeries && <StatsSeries project={project} onSelect={(caseId, f, src) => setSeriesSel({ caseId, file: f, src })} />}
-          {showSeries && seriesSel && (
-            <div className="small muted">
-              {seriesHtml ? <>All variables of {seriesSel.file} for this case are plotted below (from the selected run).</>
-                : seriesSel.src === "stats" ? <>The selected run has no plot of {seriesSel.file} for this case (run the Stats summary with HTML plots on it).</>
-                : <>Select that job in the run list to see its own plot of {seriesSel.file} below.</>}
-            </div>
-          )}
-        </details>
         {run ? (
           <>
             <div className="row">
-              <h2 className="grow plain">{file ?? run.name}</h2>
-              {file && <a className="button" href={api.fileUrl(project.id, `${run.path}/${file}`, true)}>Download file</a>}
+              <h2 className="grow plain">{run.label ?? run.name} <span className={`status ${run.status}`}>{run.status}</span></h2>
               <a className="button" href={api.zipUrl(project.id, run.path)}>Download run (.zip)</a>
-              <button onClick={del}>Delete run</button>
+              <button className="danger" onClick={del} title="delete this run and all its outputs">Delete run</button>
             </div>
-            <details>
-              <summary className="small">Run parameters</summary>
-              <pre className="log small">{JSON.stringify(run.params, null, 2)}</pre>
-            </details>
-            {runCases.length > 0 && (
-              <details>
-                <summary className="small">Simulation time: {simTimeSummary(runCases)}</summary>
-                <SimTimeTable project={project} cases={runCases} />
-              </details>
+            <div className="row small muted">
+              <span>{tasks.find((t) => t.id === run.task)?.label ?? run.task}</span>
+              <span>&middot;</span><span>{when(run.created_at)}</span>
+              <span>&middot;</span><span className="mono">{run.name}</span>
+            </div>
+            <div className="row section-bar">
+              <span className="seg">
+                {SECTIONS.map(([k, label, help]) => (
+                  <button key={k} className={section === k ? "primary" : ""} title={help} onClick={() => setSection(k)}>{label}</button>))}
+              </span>
+              <span className="small muted">{SECTIONS.find(([k]) => k === section)?.[2]}</span>
+            </div>
+
+            {section === "overview" && (
+              <>
+                <RunSummary project={project} run={run} task={tasks.find((t) => t.id === run.task)} onOpenFile={openFile} />
+                {runCases.length > 0 && (
+                  <details className="card">
+                    <summary><b>Simulation time</b> <span className="small muted">{simTimeSummary(runCases)}</span></summary>
+                    <SimTimeTable project={project} cases={runCases} />
+                  </details>
+                )}
+                <details className="card">
+                  <summary><b>All run parameters</b></summary>
+                  <pre className="log small">{JSON.stringify(run.params, null, 2)}</pre>
+                </details>
+              </>
             )}
-            {error && <div className="error">{error}</div>}
-            {table?.columns[0] === "case" && <CaseNames project={project} onChange={onProjectChange} />}
-            {table && file && <CsvTableView table={table} name={file} refCase={project.ref_case}
-                                            caseLabel={(id) => caseName(project, id)} />}
-            {file?.endsWith(".html") && (
-              <iframe className="htmlframe" src={api.fileUrl(project.id, `${run.path}/${file}`)} />
+
+            {section === "series" && (
+              <div className="card">
+                <StatsSeries project={project} onSelect={(caseId, f, src) => setSeriesSel({ caseId, file: f, src })} />
+                {seriesSel && (
+                  <div className="small muted">
+                    {seriesHtml ? <>The run's HTML plot of all variables of {seriesSel.file} for this case: <a onClick={() => openFile(seriesHtml)}>{seriesHtml}</a></>
+                      : seriesSel.src === "stats" ? <>This run has no plot of {seriesSel.file} for this case (run the Stats summary with HTML plots on it).</>
+                      : <>Select that job in the run list to open its own plot of {seriesSel.file}.</>}
+                  </div>
+                )}
+              </div>
             )}
-            {file?.endsWith(".png") && <img className="result-img" src={api.fileUrl(project.id, `${run.path}/${file}`)} />}
-            {!file && <div className="muted">This run has no CSV/HTML/PNG outputs (yet). Check the job log.</div>}
+
+            {section === "files" && (
+              <>
+                <div className="row">
+                  <h3 className="grow plain">{file ?? "Pick a file on the left"}</h3>
+                  {file && <a className="button" href={api.fileUrl(project.id, `${run.path}/${file}`, true)}>Download file</a>}
+                </div>
+                {error && <div className="error">{error}</div>}
+                {file?.endsWith(".csv") && !table && !error && <div className="muted">Loading table...</div>}
+                {table?.columns[0] === "case" && <CaseNames project={project} onChange={onProjectChange} />}
+                {table && file && <CsvTableView table={table} name={file} refCase={project.ref_case}
+                                                caseLabel={(id) => caseName(project, id)} />}
+                {file?.endsWith(".html") && (
+                  <iframe className="htmlframe" src={api.fileUrl(project.id, `${run.path}/${file}`)} />
+                )}
+                {file?.endsWith(".png") && <img className="result-img" src={api.fileUrl(project.id, `${run.path}/${file}`)} />}
+                {!file && <div className="muted">This run has no CSV/HTML/PNG outputs (yet). Check the job log.</div>}
+              </>
+            )}
           </>
-        ) : <div className="muted">Select a run.</div>}
+        ) : <div className="muted">{runs.length ? "Select a run on the left." : "Results of finished jobs appear here: an overview of each run, its tables, HTML plots and images."}</div>}
       </div>
     </div>
   );

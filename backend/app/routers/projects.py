@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import shutil
 import time
@@ -12,8 +13,10 @@ from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+import numpy as np
 
 from app import cases, config, jobs, tasks
+from app import cases as cases_mod
 from app.paths import safe_child, safe_path
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -250,14 +253,20 @@ def list_runs(pid: str) -> list[dict]:
         except (OSError, ValueError):
             pass
         j = by_dir.get(str(r), {})
+        found: dict[str, list[str]] = {".csv": [], ".html": [], ".png": []}
+        for root, _dirs, files in os.walk(r):
+            rel = Path(root).relative_to(r)
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in found:
+                    found[ext].append((rel / f).as_posix())
         out.append({"name": r.name, "path": f"runs/{r.name}", "task": meta.get("task"),
                     "label": j.get("label") or meta.get("label"),
                     "job_id": meta.get("id"), "status": j.get("status", "unknown"),
                     "params": meta.get("params", {}),
                     "created_at": j.get("created_at"), "finished_at": j.get("finished_at"),
-                    "csvs": sorted(f.relative_to(r).as_posix() for f in r.rglob("*.csv")),
-                    "htmls": sorted(f.relative_to(r).as_posix() for f in r.rglob("*.html")),
-                    "images": sorted(f.relative_to(r).as_posix() for f in r.rglob("*.png"))})
+                    "csvs": sorted(found[".csv"]), "htmls": sorted(found[".html"]),
+                    "images": sorted(found[".png"])})
     return out
 
 
@@ -337,8 +346,11 @@ def run_series(pid: str, name: str, file: str, columns: list[str] = Query(...),
         if not hdr or not _is_time(hdr[0]):
             raise HTTPException(422, f"{file} has no time_s column")
         idx = {c: hdr.index(c) for c in columns if c in hdr}
-        rows = rows[::max(1, -(-len(rows) // max_points))]
         num = [[_num(v) for v in r] for r in rows]
+        if len(num) > max_points and idx:
+            vals = np.array([[r[j] if j < len(r) and isinstance(r[j], float) else np.nan
+                              for j in idx.values()] for r in num], float)
+            num = [num[i] for i in cases_mod.decimate_idx(vals, max_points)]
         out[cid] = {"t": [r[0] for r in num],
                     "columns": {c: [r[j] if j < len(r) and not isinstance(r[j], str)
                                     else None for r in num] for c, j in idx.items()}}

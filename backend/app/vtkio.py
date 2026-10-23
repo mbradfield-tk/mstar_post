@@ -153,6 +153,8 @@ def _read_full(path: str, name: str, assoc: str) -> np.ndarray:
         (reader.enable_cell_array if assoc == "cell" else reader.enable_point_array)(name)
     mesh = reader.read()
     arr = np.asarray((mesh.cell_data if assoc == "cell" else mesh.point_data)[name])
+    if arr.nbytes > _FULL_CACHE_BYTES // 2:  # never let one array evict everything else
+        return arr
     _full_cache[key] = arr
     while sum(a.nbytes for a in _full_cache.values()) > _FULL_CACHE_BYTES \
             and len(_full_cache) > 1:

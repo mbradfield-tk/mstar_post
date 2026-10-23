@@ -12,6 +12,7 @@ export default function DirBrowser({ onSelect, initial }: {
   const [roots, setRoots] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [typed, setTyped] = useState(initial ?? "");
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     api.roots().then((r) => {
@@ -24,8 +25,9 @@ export default function DirBrowser({ onSelect, initial }: {
   useEffect(() => {
     if (!path) return;
     setError(null);
+    setLoading(true);
     api.listDir(path).then((l) => { setListing(l); setTyped(l.path); })
-      .catch((e) => setError(e.message));
+      .catch((e) => setError(e.message)).finally(() => setLoading(false));
   }, [path]);
 
   return (
@@ -35,11 +37,12 @@ export default function DirBrowser({ onSelect, initial }: {
                 onChange={(e) => setPath(e.target.value)}>
           {roots.map((r) => <option key={r} value={r}>{r}</option>)}
         </select>
-        <input className="grow" value={typed} onChange={(e) => setTyped(e.target.value)}
-               onKeyDown={(e) => e.key === "Enter" && setPath(typed)} />
+        <input className="grow mono" value={typed} onChange={(e) => setTyped(e.target.value)}
+               onKeyDown={(e) => e.key === "Enter" && setPath(typed)} placeholder="folder path" />
         <button onClick={() => setPath(typed)}>Go</button>
       </div>
       {error && <div className="error">{error}</div>}
+      {loading && !listing && <div className="muted">Loading...</div>}
       {listing && (
         <>
           <div className="row muted">

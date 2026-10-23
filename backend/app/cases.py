@@ -194,24 +194,52 @@ def _table(path: str, mtime_ns: int):
     return mss.load_stats_table(Path(path))
 
 
+def decimate_idx(values: np.ndarray, max_points: int) -> np.ndarray:
+    """Row indices keeping the min and max of every bucket (<= 2 * max_points
+    points) so peaks of turbulent traces survive, unlike a plain stride. Rows of
+    `values` with only NaN keep their first sample. values: (n, k) or (n,)."""
+    n = len(values)
+    if n <= max_points:
+        return np.arange(n)
+    v = np.asarray(values, float).reshape(n, -1)
+    edges = np.linspace(0, n, max_points + 1).astype(int)
+    keep = {0, n - 1}
+    with np.errstate(invalid="ignore"):
+        for a, b in zip(edges[:-1], edges[1:]):
+            if b <= a:
+                continue
+            blk = v[a:b]
+            hit = False
+            for j in range(blk.shape[1]):
+                if np.isfinite(blk[:, j]).any():
+                    keep.add(a + int(np.nanargmin(blk[:, j])))
+                    keep.add(a + int(np.nanargmax(blk[:, j])))
+                    hit = True
+            if not hit:
+                keep.add(a)
+    return np.fromiter(sorted(keep), int)
+
+
 def series(stats_file: Path, columns: list[str], max_points: int = 4000) -> dict:
-    """Time series of the given columns, uniformly subsampled to max_points."""
+    """Time series of the given columns, decimated to about max_points buckets
+    (min and max of each bucket kept)."""
     table = _table(str(stats_file), stats_file.stat().st_mtime_ns)
     if table is None:
         raise ValueError(f"{stats_file.name} is not a stats table")
     header, data = table
     raw = [h.strip() for h in header]
     names = [mss.fix_unit(h) for h in raw]  # M-Star's [-] made explicit
-    step = max(1, int(np.ceil(len(data) / max_points)))
-    rows = data[::step]
-    out = {"t": [float(x) for x in rows[:, 0]], "columns": {}}
+    cols = []
     for c in columns:
         if c in names:
-            j = names.index(c)
+            cols.append(names.index(c))
         elif c in raw:
-            j = raw.index(c)
+            cols.append(raw.index(c))
         else:
             raise KeyError(c)
+    rows = data[decimate_idx(data[:, cols] if cols else data[:, :1], max_points)]
+    out = {"t": [float(x) for x in rows[:, 0]], "columns": {}}
+    for c, j in zip(columns, cols):
         v = rows[:, j]
         out["columns"][c] = [float(x) if np.isfinite(x) else None for x in v]
     return out
