@@ -14,6 +14,11 @@ const toVec2 = (p: Plane): Vec2 => ({ w: p.w, h: p.h, du: p.du, dv: p.dv,
   u: p.data.subarray(0, p.w * p.h), v: p.data.subarray(p.w * p.h, 2 * p.w * p.h) });
 type RangeMode = "auto" | "robust" | "manual";
 type Profile = { id: string; distance: number[]; value: (number | null)[]; unit: string };
+// additional 2D + 3D row for one case with its own field (same output, time and plane)
+type ExtraRange = "shared" | RangeMode;
+type Extra = { key: number; id: string; array: string; comp: string; cmap: string; log: boolean;
+               range: ExtraRange; manual: [number, number] };
+const MAX_EXTRAS = 6;
 const nearest = (k: OutputKind, t: number) => {
   let best = 0;
   k.times.forEach((x, i) => { if (Math.abs(x - t) < Math.abs(k.times[best] - t)) best = i; });
@@ -34,7 +39,7 @@ const geoDefaults = (inv: Inventory) => {
 const surfDefaults = (inv: Inventory) => Object.fromEntries(inv.kinds.filter((k) => k.type === "surface")
   .map((k) => [k.kind, /^VolumeMovingBody/i.test(k.kind)]));
 
-export default function ViewerView({ project }: { project: Project }) {
+export default function ViewerView({ project, onRefresh }: { project: Project; onRefresh: () => void }) {
   const cases = project.cases.filter((c) => c.included);
   // first selected case is the reference: its outputs, times and 3D settings drive the view
   const [sel, setSel] = useState<string[]>(() => {
@@ -69,7 +74,7 @@ export default function ViewerView({ project }: { project: Project }) {
   const [planeIn3d, setPlaneIn3d] = useState(true);
   const [syncCams, setSyncCams] = useState(false);
   const camSync = useMemo(() => new CameraSync(), []);
-  const [bg, setBg] = useState(() => localStorage.getItem("mstar_post.viewer.bg") ?? BG_PRESETS[0]);
+  const [bg, setBg] = useState(() => localStorage.getItem("mstar_post.viewer.bg") ?? "#1e293b");
   useEffect(() => { localStorage.setItem("mstar_post.viewer.bg", bg); }, [bg]);
   const [flow, setFlow] = useState({
     vec: "", mode: "none" as FlowMode, density: 30, lineColor: "#ffffff", licL: 20, licScale: 2,
@@ -82,6 +87,8 @@ export default function ViewerView({ project }: { project: Project }) {
   const [cp, setCp] = useState({ on: false, cx: 0, cz: 0, yAuto: true, cy: 0 });
   const [fluidC, setFluidC] = useState<Record<string, number[]>>({});
   const [cplanes, setCplanes] = useState<Record<string, Plane[]>>({});
+  const [extras, setExtras] = useState<Extra[]>([]);
+  const [xPlanes, setXPlanes] = useState<Record<number, Plane | null>>({});
 
   const pathOf = (id: string) => cases.find((c) => c.id === id)?.path ?? "";
   const invA = invs[ref] ?? null;
@@ -145,6 +152,37 @@ export default function ViewerView({ project }: { project: Project }) {
   };
   const urls = sel.map((id) => { const f = frameOf(id); return f ? urlFor(pathOf(id), f[0], f[1]) : null; });
   const urlsKey = urls.join("\n");
+
+  const shownExtras = extras.filter((e) => sel.includes(e.id));
+  const extraArr = (e: Extra) => frameOf(e.id)?.[0].arrays.find((a) => a.name === e.array);
+  const extraComp = (e: Extra) => ((extraArr(e)?.ncomp ?? 1) > 1 ? e.comp || "mag" : "");
+  const extraUrls = shownExtras.map((e) => {
+    const f = frameOf(e.id);
+    return f && extraArr(e) ? api.planeUrl(pathOf(e.id), f[0].files[f[1]][0], e.array, extraComp(e),
+      isVolume ? axis : null, isVolume ? pos : null, mask) : null;
+  });
+  const extraKey = JSON.stringify(shownExtras.map((e, i) => [e.key, extraUrls[i]]));
+  useEffect(() => {
+    if (layout === "3d" && !planeIn3d) return;
+    let live = true;
+    shownExtras.forEach((e, i) => {
+      const u = extraUrls[i];
+      if (!u) { setXPlanes((m) => ({ ...m, [e.key]: null })); return; }
+      fetchPlane(u).then((p) => live && setXPlanes((m) => ({ ...m, [e.key]: p })))
+        .catch((err) => live && setError(`${e.id} (${e.array}): ${err.message}`));
+    });
+    return () => { live = false; };
+  }, [extraKey, layout, planeIn3d]); // eslint-disable-line react-hooks/exhaustive-deps
+  const addExtra = () => {
+    const arrays = kind?.arrays ?? [];
+    const used = new Set([array, ...extras.filter((e) => e.id === ref).map((e) => e.array)]);
+    const pick = arrays.find((a) => !used.has(a.name)) ?? arrays[0];
+    if (!pick) return;
+    setExtras([...extras, { key: Math.max(0, ...extras.map((e) => e.key)) + 1, id: ref, array: pick.name,
+                            comp: pick.ncomp > 1 ? "mag" : "", cmap, log: false, range: "shared", manual: [0, 1] }]);
+  };
+  const setExtra = (key: number, patch: Partial<Extra>) =>
+    setExtras((xs) => xs.map((e) => (e.key === key ? { ...e, ...patch } : e)));
 
   useEffect(() => {
     if (layout === "3d" && !planeIn3d) return;
@@ -264,6 +302,23 @@ export default function ViewerView({ project }: { project: Project }) {
       ? [Math.min(...shown.map((p) => p.p01)), Math.max(...shown.map((p) => p.p99))]
       : [Math.min(...shown.map((p) => p.vmin)), Math.max(...shown.map((p) => p.vmax))];
   }, [rangeMode, manual, rangeKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  // "shared": views of the same field share one color range (with the main rows when it is the main field)
+  const rangeOf = (e: Extra): [number, number] => {
+    if (e.range === "manual") return e.manual;
+    const span = (ps: Plane[], mode: RangeMode): [number, number] => mode === "auto"
+      ? [Math.min(...ps.map((p) => p.vmin)), Math.max(...ps.map((p) => p.vmax))]
+      : [Math.min(...ps.map((p) => p.p01)), Math.max(...ps.map((p) => p.p99))];
+    if (e.range !== "shared") {
+      const p = xPlanes[e.key];
+      return p ? span([p], e.range) : [0, 1];
+    }
+    const same = (x: Extra) => x.range === "shared" && x.array === e.array && extraComp(x) === extraComp(e);
+    if (e.array === array && extraComp(e) === comp) return range;
+    const ps = shownExtras.filter(same).map((x) => xPlanes[x.key]).filter((p): p is Plane => !!p);
+    return ps.length ? span(ps, rangeMode === "auto" ? "auto" : "robust") : [0, 1];
+  };
+  const labelOf = (name: string, c: string, ncomp: number) =>
+    `${name}${ncomp > 1 ? (c === "mag" ? " |mag|" : ` (${AXES[Number(c)] ?? c})`) : ""}`;
 
   const onLine = async (p0: number[], p1: number[]) => {
     try {
@@ -307,14 +362,19 @@ export default function ViewerView({ project }: { project: Project }) {
   const imgKinds = invA?.kinds.filter((k) => k.type === "volume" || k.type === "slice") ?? [];
   const volKind = invA?.kinds.find((k) => k.type === "volume");
   const n = sel.length;
+  const rows = n + shownExtras.length;
   const both = layout === "both";
-  const paneH = n === 1 ? (both ? 480 : 620) : n === 2 ? (both ? 400 : 440) : 330;
+  const paneH = rows === 1 ? (both ? 480 : 620) : rows === 2 ? (both ? 400 : 440) : 330;
   const fieldLabel = `${array}${arr && arr.ncomp > 1 ? (comp === "mag" ? " |mag|" : ` (${AXES[Number(comp)] ?? comp})`) : ""}`;
   const legend = array ? { label: fieldLabel, unit: planeA?.unit ?? arr?.unit ?? "" } : undefined;
 
   return (
     <div className="split">
       <div className="side controls">
+        <div className="row">
+          <span className="grow" />
+          <button onClick={onRefresh} title="reload the case list and output files (new time steps, fields) and reset the view">Refresh</button>
+        </div>
         <Section id="cases" title={`Cases (max ${MAX_CASES})`}>
           <div className="checklist">
             {cases.map((c) => {
@@ -344,9 +404,9 @@ export default function ViewerView({ project }: { project: Project }) {
             </select></label>
             {kind && (
               <>
-                <label>Time {fmt(t)} s ({ti + 1}/{kind.times.length})
-                  <input type="range" min={0} max={kind.times.length - 1} value={ti}
-                         onChange={(e) => setTi(Number(e.target.value))} /></label>
+                <SliderNum label={`Time [s] (${ti + 1}/${kind.times.length})`} min={0} max={kind.times.length - 1} step={1}
+                           value={ti} onChange={setTi} num={t} numMin={kind.times[0]} numMax={kind.times[kind.times.length - 1]}
+                           onNum={(v) => setTi(nearest(kind, v))} title="time [s]; snaps to the nearest output time" />
                 <div className="row">
                   <button onClick={() => setTi(Math.max(0, ti - 1))}>&lt;</button>
                   <button onClick={() => setPlaying(!playing)}>{playing ? "Pause" : "Play"}</button>
@@ -365,9 +425,8 @@ export default function ViewerView({ project }: { project: Project }) {
                   <>
                     <label>Normal <select value={axis} onChange={(e) => setAxis(Number(e.target.value))}>
                       {AXES.map((a, i) => <option key={a} value={i}>{a}</option>)}</select></label>
-                    <label>{AXES[axis]} = {fmt(pos)} m
-                      <input type="range" min={lo} max={hi} step={(hi - lo) / 500 || 1} value={pos ?? lo}
-                             onChange={(e) => setPos(Number(e.target.value))} /></label>
+                    <SliderNum label={`${AXES[axis]} [m]`} min={lo} max={hi} step={(hi - lo) / 500 || 1}
+                               value={pos ?? lo} onChange={setPos} />
                   </>
                 ) : <div className="small muted">slice normal {AXES[kind.slice_axis ?? 0]} at {fmt(kind.slice_pos)} m</div>}
                 <label>Colormap <select value={cmap} onChange={(e) => setCmap(e.target.value)}>
@@ -402,9 +461,8 @@ export default function ViewerView({ project }: { project: Project }) {
               <option value="lic">LIC</option><option value="both">LIC + streamlines</option></select></label>
             {showLines && (
               <>
-                <label>Streamline density {flow.density}
-                  <input type="range" min={10} max={60} value={flow.density}
-                         onChange={(e) => setF({ density: Number(e.target.value) })} /></label>
+                <SliderNum label="Streamline density" min={10} max={60} step={1} value={flow.density}
+                           onChange={(v) => setF({ density: Math.round(v) })} />
                 <label>Line color <select value={flow.lineColor} onChange={(e) => setF({ lineColor: e.target.value })}>
                   <option value="#ffffff">white</option><option value="#000000">black</option>
                   <option value="#808080">grey</option></select></label>
@@ -412,9 +470,8 @@ export default function ViewerView({ project }: { project: Project }) {
             )}
             {showLic && (
               <>
-                <label>LIC length {flow.licL}
-                  <input type="range" min={5} max={40} value={flow.licL}
-                         onChange={(e) => setF({ licL: Number(e.target.value) })} /></label>
+                <SliderNum label="LIC length" min={5} max={40} step={1} value={flow.licL}
+                           onChange={(v) => setF({ licL: Math.round(v) })} />
                 <label>LIC resolution <select value={flow.licScale} onChange={(e) => setF({ licScale: Number(e.target.value) })}>
                   <option value={1}>1x</option><option value={2}>2x</option><option value={3}>3x</option></select></label>
                 <label>LIC color <select value={flow.licMode} onChange={(e) => setF({ licMode: e.target.value as "field" | "grey" })}>
@@ -426,9 +483,8 @@ export default function ViewerView({ project }: { project: Project }) {
                 <label><input type="checkbox" checked={flow.stream3d} onChange={(e) => setF({ stream3d: e.target.checked })} /> 3D streamlines (seeded on the plane)</label>
                 {flow.stream3d && (
                   <>
-                    <label>Seeds per side {flow.seeds3d}
-                      <input type="range" min={5} max={40} value={flow.seeds3d}
-                             onChange={(e) => setF({ seeds3d: Number(e.target.value) })} /></label>
+                    <SliderNum label="Seeds per side" min={5} max={40} step={1} value={flow.seeds3d}
+                               onChange={(v) => setF({ seeds3d: Math.round(v) })} />
                     <label>3D line color <input type="color" value={flow.color3d}
                                                onChange={(e) => setF({ color3d: e.target.value })} /></label>
                     <div className="small muted">colored by speed when the field is this vector's magnitude</div>
@@ -436,6 +492,66 @@ export default function ViewerView({ project }: { project: Project }) {
                 )}
               </>
             )}
+          </Section>
+        )}
+        {kind && (
+          <Section id="extras" title={`Extra views (${shownExtras.length})`}>
+            <div className="small muted">More fields side by side: same output, time and plane. Range "shared": views of the same field share a color range (the main one for the main field).</div>
+            {extras.map((e) => {
+              const k = frameOf(e.id)?.[0];
+              const a = k?.arrays.find((x) => x.name === e.array);
+              return (
+                <div key={e.key} className="extra-view">
+                  <div className="row small">
+                    <select value={e.id} title="case" onChange={(ev) => setExtra(e.key, { id: ev.target.value })}>
+                      {sel.map((id) => <option key={id} value={id}>{id}</option>)}
+                      {!sel.includes(e.id) && <option value={e.id}>{e.id} (not selected)</option>}
+                    </select>
+                    <button title="remove view" onClick={() => setExtras(extras.filter((x) => x.key !== e.key))}>&times;</button>
+                  </div>
+                  <div className="row small">
+                    <select value={e.array} title="field" onChange={(ev) => {
+                      const na = k?.arrays.find((x) => x.name === ev.target.value);
+                      setExtra(e.key, { array: ev.target.value, comp: na && na.ncomp > 1 ? "mag" : "" });
+                    }}>
+                      {!a && <option value={e.array}>{e.array} (missing)</option>}
+                      {k?.arrays.map((x) => <option key={x.name}>{x.name}</option>)}
+                    </select>
+                    {a && a.ncomp > 1 && (
+                      <select value={e.comp || "mag"} title="component" onChange={(ev) => setExtra(e.key, { comp: ev.target.value })}>
+                        <option value="mag">mag</option>
+                        {Array.from({ length: a.ncomp }, (_, i) => <option key={i} value={String(i)}>{AXES[i] ?? i}</option>)}
+                      </select>
+                    )}
+                  </div>
+                  <div className="row small">
+                    <select value={e.cmap} title="colormap" onChange={(ev) => setExtra(e.key, { cmap: ev.target.value })}>
+                      {cmaps.map((c) => <option key={c}>{c}</option>)}</select>
+                    <label><input type="checkbox" checked={e.log} onChange={(ev) => setExtra(e.key, { log: ev.target.checked })} /> log</label>
+                  </div>
+                  <div className="row small">
+                    <select value={e.range} title="color range" onChange={(ev) => {
+                      const m = ev.target.value as ExtraRange;
+                      setExtra(e.key, m === "manual" ? { range: m, manual: rangeOf(e) } : { range: m });
+                    }}>
+                      <option value="shared">range: shared</option>
+                      <option value="robust">range: own 1-99th pct</option>
+                      <option value="auto">range: own min-max</option>
+                      <option value="manual">range: manual</option>
+                    </select>
+                  </div>
+                  {e.range === "manual" && (
+                    <div className="row small">
+                      <input type="number" step="any" className="short" value={e.manual[0]} title="min"
+                             onChange={(ev) => setExtra(e.key, { manual: [Number(ev.target.value), e.manual[1]] })} />
+                      <input type="number" step="any" className="short" value={e.manual[1]} title="max"
+                             onChange={(ev) => setExtra(e.key, { manual: [e.manual[0], Number(ev.target.value)] })} />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            <button disabled={extras.length >= MAX_EXTRAS} onClick={addExtra}>+ Add view</button>
           </Section>
         )}
         {invA && layout !== "2d" && (
@@ -461,7 +577,7 @@ export default function ViewerView({ project }: { project: Project }) {
                 )}
               </>
             )}
-            {n > 1 && <label><input type="checkbox" checked={syncCams} onChange={(e) => setSyncCams(e.target.checked)} /> link cameras</label>}
+            {rows > 1 && <label><input type="checkbox" checked={syncCams} onChange={(e) => setSyncCams(e.target.checked)} /> link cameras</label>}
             <div className="row small">Background <input type="color" value={bg} onChange={(e) => setBg(e.target.value)} />
               {BG_PRESETS.map((c) => <button key={c} className="swatch" style={{ background: c }} title={c}
                                              onClick={() => setBg(c)} />)}</div>
@@ -470,8 +586,8 @@ export default function ViewerView({ project }: { project: Project }) {
                 <label className="grow"><input type="checkbox" checked={!!geo[g.name]?.on}
                   onChange={(e) => setGeo({ ...geo, [g.name]: { ...geo[g.name], on: e.target.checked } })} />
                   <span title={g.file}>{g.name}</span></label>
-                <input type="range" min={0.05} max={1} step={0.05} value={geo[g.name]?.opacity ?? 0.5} title="opacity"
-                       onChange={(e) => setGeo({ ...geo, [g.name]: { ...geo[g.name], opacity: Number(e.target.value) } })} />
+                <SliderNum inline min={0.05} max={1} step={0.05} value={geo[g.name]?.opacity ?? 0.5} title="opacity"
+                           onChange={(v) => setGeo({ ...geo, [g.name]: { ...geo[g.name], opacity: v } })} />
               </div>
             ))}
             {invA.kinds.filter((k) => k.type === "surface").map((k) => (
@@ -500,7 +616,7 @@ export default function ViewerView({ project }: { project: Project }) {
       <div className="main">
         {error && <div className="error">{error}</div>}
         <div className="viewer-wrap">
-          <div className={`viewer-grid${!both && n > 1 ? " cols2" : ""}`}>
+          <div className={`viewer-grid${!both && rows > 1 ? " cols2" : ""}`}>
             {sel.map((id) => {
               const has = !!invs[id]?.kinds.some((k) => k.kind === kindName);
               return (
@@ -520,7 +636,34 @@ export default function ViewerView({ project }: { project: Project }) {
                                 legend={legend} overlay={overlayOf(id)} lines={lines3dBy[id]}
                                 extraPlanes={cp.on ? cplanes[id] : undefined}
                                 exportName={`${id}_3d_t${fmt(t)}`}
-                                sync={syncCams && n > 1 ? camSync : undefined} />
+                                sync={syncCams && rows > 1 ? camSync : undefined} />
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+            {shownExtras.map((e) => {
+              const a = extraArr(e);
+              const p = xPlanes[e.key] ?? null;
+              const lab = labelOf(e.array, extraComp(e), a?.ncomp ?? 1);
+              const lg = { label: lab, unit: p?.unit ?? a?.unit ?? "" };
+              const r = rangeOf(e);
+              return (
+                <div key={`x${e.key}`} className="viewer-case">
+                  <div className="slice-title">{e.id} - {lab}
+                    {!a && <span className="muted"> - field not in this case's '{kindName}' output</span>}</div>
+                  <div className={`viewer-row${both ? " both" : ""}`}>
+                    {layout !== "3d" && (
+                      <SliceCanvas plane={p} cmap={e.cmap} range={r} log={e.log} height={paneH}
+                                   lineMode={false} onLine={onLine} legend={lg} overlay={overlayOf(e.id)}
+                                   background={bg} exportName={`${e.id}_${e.array}_t${fmt(t)}`} />
+                    )}
+                    {layout !== "2d" && invs[e.id] && (
+                      <Viewer3D layers={layersBy[e.id] ?? []} plane={planeIn3d ? p : null}
+                                cmap={e.cmap} range={r} log={e.log} height={paneH} background={bg}
+                                legend={lg} overlay={overlayOf(e.id)}
+                                exportName={`${e.id}_${e.array}_3d_t${fmt(t)}`}
+                                sync={syncCams ? camSync : undefined} />
                     )}
                   </div>
                 </div>
@@ -544,6 +687,34 @@ export default function ViewerView({ project }: { project: Project }) {
       </div>
     </div>
   );
+}
+
+// Slider with a numeric box; the box commits on Enter or blur, clamped to its range.
+// num/onNum let the box show a different quantity than the slider (e.g. time for a frame index).
+function SliderNum({ label, min, max, step, value, onChange, num, numMin, numMax, onNum, title, inline }: {
+  label?: string; min: number; max: number; step: number; value: number; onChange: (v: number) => void;
+  num?: number; numMin?: number; numMax?: number; onNum?: (v: number) => void; title?: string; inline?: boolean;
+}) {
+  const shownNum = num ?? value;
+  const [draft, setDraft] = useState<string | null>(null);
+  const commit = () => {
+    if (draft === null) return;
+    const v = Number(draft);
+    setDraft(null);
+    if (draft.trim() === "" || !Number.isFinite(v)) return;
+    const c = Math.min(numMax ?? max, Math.max(numMin ?? min, v));
+    (onNum ?? onChange)(c);
+  };
+  const body = (
+    <span className={`slider-num${inline ? " inline" : ""}`} title={title}>
+      <input type="range" min={min} max={max} step={step} value={value}
+             onChange={(e) => onChange(Number(e.target.value))} />
+      <input type="number" step="any" value={draft ?? String(Number(shownNum.toPrecision(6)))}
+             onChange={(e) => setDraft(e.target.value)} onBlur={commit}
+             onKeyDown={(e) => { if (e.key === "Enter") commit(); if (e.key === "Escape") setDraft(null); }} />
+    </span>
+  );
+  return label ? <label>{label}{body}</label> : body;
 }
 
 // Collapsible sidebar section; open state remembered in localStorage.

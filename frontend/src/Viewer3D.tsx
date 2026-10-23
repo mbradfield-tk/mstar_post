@@ -540,6 +540,8 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
         <button onClick={() => view([0, 0, 1])}>Front</button>
         <button onClick={() => view([1, 0, 0])}>Side</button>
         <button onClick={() => view([0, 1, 0], [0, 0, -1])}>Top</button>
+        <button onClick={() => view([1 / Math.sqrt(3), 1 / Math.sqrt(3), 1 / Math.sqrt(3)])}
+                title="isometric: equal angles to x, y and z, y up">Iso</button>
         <button onClick={snapshot} title="PNG with legend">PNG</button>
         {loading > 0 && <span className="muted">loading {loading}...</span>}
         {error && <span className="error">{error}</span>}

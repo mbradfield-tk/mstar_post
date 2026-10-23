@@ -94,7 +94,7 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
         {run ? (
           <>
             <div className="row">
-              <h2 className="grow">{file ?? run.name}</h2>
+              <h2 className="grow plain">{file ?? run.name}</h2>
               {file && <a className="button" href={api.fileUrl(project.id, `${run.path}/${file}`, true)}>Download file</a>}
               <a className="button" href={api.zipUrl(project.id, run.path)}>Download run (.zip)</a>
               <button onClick={del}>Delete run</button>

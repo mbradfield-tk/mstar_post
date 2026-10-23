@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { fmt } from "./api";
 import ColorLegend, { drawLegend, savePng, type LegendInfo } from "./ColorLegend";
-import { cmapLut, colorize, hexRgb, shadeLic } from "./cmap";
+import { cmapLut, colorize, hexRgb, luminance, shadeLic } from "./cmap";
 import type { Plane } from "./plane";
 
 const AX = "xyz";
@@ -198,7 +198,7 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, li
                   }} />
           <canvas ref={over} className="slice-overlay" style={{ width: cw, height: ch }} />
         </div>
-        {legend && <ColorLegend cmap={cmap} range={range} log={log} {...legend} />}
+        {legend && <ColorLegend cmap={cmap} range={range} log={log} dark={luminance(background) < 0.5} {...legend} />}
       </div>
     </div>
   );

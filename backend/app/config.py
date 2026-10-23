@@ -17,6 +17,8 @@ def _tool_python(tool: str) -> str:
 
 # browsing and case access are restricted to these trees
 ROOTS = _paths("MSTAR_POST_ROOTS", "/data:/data2")
+# the Files tab may create/delete inside these (default: all browse roots)
+WRITE_ROOTS = _paths("MSTAR_POST_WRITE_ROOTS", "/data:/data2")
 DATA_DIR = Path(os.environ.get("MSTAR_POST_DATA", TOOLS_DIR.parent / "mstar_post_data")).resolve()
 PROJECTS_DIR = DATA_DIR / "projects"
 CACHE_DIR = DATA_DIR / "cache"

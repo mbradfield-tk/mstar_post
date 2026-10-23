@@ -7,10 +7,10 @@ export type CaseInfo = {
   output_kinds: string[]; settings: CaseSettings; error?: string;
 };
 export type ProjectCase = {
-  id: string; path: string; stats_dir: string; included: boolean; info?: CaseInfo | null;
+  id: string; path: string; stats_dir: string; included: boolean; info?: CaseInfo | null; missing?: boolean;
 };
 export type Project = {
-  id: string; name: string; root: string; single: boolean; created: number;
+  id: string; name: string; root: string; single: boolean; created: number; root_missing?: boolean;
   cases: ProjectCase[]; ref_case: string | null; notes: string; aliases?: Record<string, string>;
 };
 export const caseName = (p: Project, id: string) => p.aliases?.[id] || id;
@@ -52,6 +52,12 @@ export type StatsFile = { file: string; columns: string[] };
 export type RunSeriesFile = { file: string; columns: string[]; cases: string[] };
 export type Series = { t: number[]; columns: Record<string, (number | null)[]> };
 export type CsvTable = { columns: string[]; rows: (string | number | null)[][]; truncated: boolean };
+export type BrowseEntry = { name: string; path: string; dir: boolean; link: boolean; size: number | null;
+  mtime: number; is_case: boolean };
+export type Browse = { path: string; parent: string | null; is_case: boolean; entries: BrowseEntry[];
+  truncated: boolean; writable: boolean; disk: { total: number; used: number; free: number } };
+export type DirUsage = { path: string; bytes: number; apparent: number; files: number; dirs: number;
+  truncated: boolean; seconds: number; cached: boolean };
 
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
   const r = await fetch(url, init);
@@ -85,14 +91,26 @@ export const api = {
     path: string; parent: string | null; is_case: boolean;
     entries: { name: string; path: string; is_case: boolean }[];
   }>(`/api/fs/list?${qs({ path })}`),
+  browse: (path: string, show_hidden = false) => req<Browse>(`/api/fs/browse?${qs({ path, show_hidden })}`),
+  du: (path: string, refresh = false) => req<DirUsage>(`/api/fs/du?${qs({ path, refresh })}`),
+  mkdirs: (parent: string, names: string[]) => req<{ parent: string; created: string[];
+    skipped: { name: string; reason: string }[] }>("/api/fs/mkdirs", json("POST", { parent, names })),
+  newFile: (parent: string, name: string, content: string) =>
+    req<{ path: string }>("/api/fs/file", json("POST", { parent, name, content })),
+  deletePath: (path: string, recursive = false) =>
+    req<{ deleted: string }>("/api/fs/delete", json("POST", { path, recursive })),
+  renamePath: (path: string, name: string) =>
+    req<{ path: string }>("/api/fs/rename", json("POST", { path, name })),
 
   projects: () => req<ProjectSummary[]>("/api/projects"),
-  project: (id: string) => req<Project>(`/api/projects/${id}`),
+  project: (id: string, refresh = false) => req<Project>(`/api/projects/${id}${refresh ? "?refresh=true" : ""}`),
   createProject: (name: string, root: string) =>
     req<Project>("/api/projects", json("POST", { name, root })),
   patchProject: (id: string, body: Partial<{ name: string; included: Record<string, boolean>;
     ref_case: string; notes: string; aliases: Record<string, string> }>) => req<Project>(`/api/projects/${id}`, json("PATCH", body)),
   rediscover: (id: string) => req<Project>(`/api/projects/${id}/rediscover`, { method: "POST" }),
+  relocate: (id: string, body: { root?: string; cases?: Record<string, string> }) =>
+    req<Project>(`/api/projects/${id}/relocate`, json("POST", body)),
   deleteProject: (id: string) => req(`/api/projects/${id}`, { method: "DELETE" }),
   runs: (id: string) => req<Run[]>(`/api/projects/${id}/runs`),
   deleteRun: (id: string, name: string) =>

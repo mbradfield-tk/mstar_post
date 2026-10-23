@@ -106,7 +106,7 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
         {job ? (
           <>
             <div className="row">
-              <h2 className="grow">{job.label} <span className={`status ${job.status}`}>{job.status}</span></h2>
+              <h2 className="grow plain">{job.label} <span className={`status ${job.status}`}>{job.status}</span></h2>
               {active && <button onClick={() => api.cancelJob(job.id)}>Cancel</button>}
               {job.status === "done" && <button className="primary" onClick={onOpenResults}>Open results</button>}
               <button onClick={() => rename(job)}>Rename</button>

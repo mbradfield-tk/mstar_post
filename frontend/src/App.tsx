@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type Job, type Project, type ProjectSummary } from "./api";
+import { THEME_KEY, ThemeContext, type Theme } from "./theme";
 import CasesView from "./CasesView";
 import DirBrowser from "./DirBrowser";
+import FilesView from "./FilesView";
+import Relocate from "./Relocate";
 import JobsView from "./JobsView";
 import PlotsView from "./PlotsView";
 import ResultsView from "./ResultsView";
@@ -9,7 +12,8 @@ import RunView from "./RunView";
 import TheoryView from "./TheoryView";
 import ViewerView from "./ViewerView";
 
-const TABS = ["Cases", "Run", "Jobs", "Results", "Plots", "Viewer", "Theory"] as const;
+const TABS = ["Cases", "Run", "Jobs", "Results", "Plots", "Viewer", "Files", "Theory"] as const;
+const GLOBAL_TABS: readonly string[] = ["Files", "Theory"];  // usable without a project
 type Tab = (typeof TABS)[number];
 
 export default function App() {
@@ -21,6 +25,11 @@ export default function App() {
   const [job, setJob] = useState<string | null>(null);
   const [run, setRun] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark"));
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
   // tabs stay mounted once opened so their state survives switching
   const [visited, setVisited] = useState<Set<Tab>>(() => new Set(["Cases"]));
   const [resets, setResets] = useState<Partial<Record<Tab, number>>>({});
@@ -69,6 +78,7 @@ export default function App() {
   };
 
   return (
+    <ThemeContext.Provider value={theme}>
     <div className="app">
       <header>
         <b className="brand">M-Star Post</b>
@@ -80,9 +90,11 @@ export default function App() {
         {project && <button onClick={del}>Delete project</button>}
         <nav>
           {TABS.map((t) => (
-            <button key={t} className={t === tab ? "tab active" : "tab"} disabled={!project && t !== "Theory"}
+            <button key={t} className={t === tab ? "tab active" : "tab"} disabled={!project && !GLOBAL_TABS.includes(t)}
                     onClick={() => go(t)}>{t}</button>
           ))}
+          <button className="tab" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+                  title="switch between dark and light mode">{theme === "dark" ? "Light mode" : "Dark mode"}</button>
         </nav>
       </header>
       {error && <div className="error banner" onClick={() => setError(null)}>{error} (click to dismiss)</div>}
@@ -93,8 +105,16 @@ export default function App() {
         go("Cases");
       }} />}
       <main>
+        {project && !GLOBAL_TABS.includes(tab) && (
+          <Relocate key={project.id} project={project} onChange={(p) => {
+            setProject(p);
+            reset("Viewer");
+            reset("Plots");
+          }} />
+        )}
         {visited.has("Theory") && <Pane show={tab === "Theory"}><TheoryView /></Pane>}
-        {!project && !creating && tab !== "Theory" && (
+        {visited.has("Files") && <Pane show={tab === "Files"}><FilesView /></Pane>}
+        {!project && !creating && !GLOBAL_TABS.includes(tab) && (
           <div className="panel welcome">
             <h2>Post-process M-Star CFD results</h2>
             <p>Create a project from a folder of cases (searched recursively, e.g. a study with
@@ -124,11 +144,15 @@ export default function App() {
                 localStorage.removeItem(`mstar_post.plotref.${project.id}`);
                 reset("Plots");
               }} />)}
-            {pane("Viewer", <ViewerView project={project} />)}
+            {pane("Viewer", <ViewerView project={project} onRefresh={() => {
+              api.project(project.id, true).then((p) => { setProject(p); reset("Viewer"); })
+                .catch((e) => setError(e.message));
+            }} />)}
           </>;
         })()}
       </main>
     </div>
+    </ThemeContext.Provider>
   );
 }
 

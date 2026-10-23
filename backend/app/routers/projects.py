@@ -96,11 +96,20 @@ def create_project(body: NewProject) -> dict:
 
 
 @router.get("/{pid}")
-def get_project(pid: str, details: bool = True) -> dict:
+def get_project(pid: str, details: bool = True, refresh: bool = False) -> dict:
     p = load(pid)
+    if refresh:
+        for c in p["cases"]:
+            cases.forget(Path(c["path"]), Path(c["stats_dir"]))
     if details:
         p["cases"] = [{**c, "info": _safe_info(c)} for c in p["cases"]]
-    return p
+    return _status(p)
+
+
+def _status(p: dict) -> dict:
+    """Copy of p flagging a missing project root and missing case folders (e.g. renamed)."""
+    return {**p, "root_missing": not Path(p["root"]).is_dir(),
+            "cases": [{**c, "missing": not Path(c["path"]).is_dir()} for c in p["cases"]]}
 
 
 def _safe_info(c: dict) -> dict | None:
@@ -132,7 +141,44 @@ def patch_project(pid: str, body: ProjectPatch) -> dict:
         if body.included and c["id"] in body.included:
             c["included"] = bool(body.included[c["id"]])
     save(p)
-    return p
+    return _status(p)
+
+
+class Relocate(BaseModel):
+    root: str | None = None
+    cases: dict[str, str] = {}
+
+
+@router.post("/{pid}/relocate")
+def relocate(pid: str, body: Relocate) -> dict:
+    """Point a project at moved/renamed data: a new root moves every case that was
+    under the old root along with it; cases maps case ids to new case folders. Case
+    ids are kept, so runs, aliases and the reference case stay valid."""
+    p = load(pid)
+    old_root = Path(p["root"])
+    if body.root:
+        new_root = safe_path(body.root)
+        if not new_root.is_dir():
+            raise HTTPException(422, f"not a directory: {body.root}")
+        for c in p["cases"]:
+            for k in ("path", "stats_dir"):
+                old = Path(c[k])
+                if old == old_root or old_root in old.parents:
+                    c[k] = str(new_root / old.relative_to(old_root))
+        p["root"] = str(new_root)
+    by_id = {c["id"]: c for c in p["cases"]}
+    for cid, path in body.cases.items():
+        if cid not in by_id:
+            raise HTTPException(422, f"unknown case: {cid}")
+        d = safe_path(path)
+        stats = cases.mss.locate_stats_dir(d) if d.is_dir() and cases.is_case_dir(d) else None
+        if stats is None:
+            raise HTTPException(422, f"{path}: no M-Star case (Stats folder) found")
+        by_id[cid]["path"], by_id[cid]["stats_dir"] = str(d), str(Path(stats).resolve())
+    save(p)
+    for c in p["cases"]:
+        cases.forget(Path(c["path"]), Path(c["stats_dir"]))
+    return get_project(pid)
 
 
 @router.post("/{pid}/rediscover")
@@ -140,7 +186,7 @@ def rediscover(pid: str) -> dict:
     p = load(pid)
     p["single"], p["cases"] = _discover(safe_path(p["root"]), p)
     save(p)
-    return p
+    return _status(p)
 
 
 @router.delete("/{pid}")

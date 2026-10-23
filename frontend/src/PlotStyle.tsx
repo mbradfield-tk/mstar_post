@@ -16,6 +16,7 @@ const FONTS = ["Open Sans, sans-serif", "Arial, sans-serif", "Helvetica, sans-se
                "Times New Roman, serif", "Courier New, monospace"];
 
 export type PlotStyle = {
+  plotTheme: "app" | "dark" | "light";
   font: string; fontSize: number; titleSize: number; tickSize: number;
   xTickAngle: "auto" | number; yTickAngle: "auto" | number;
   legend: "top" | "right" | "bottom" | "hidden"; grid: boolean;
@@ -24,6 +25,7 @@ export type PlotStyle = {
   heightScale: number; exportScale: number;
 };
 export const DEFAULT_STYLE: PlotStyle = {
+  plotTheme: "app",
   font: FONTS[0], fontSize: 12, titleSize: 13, tickSize: 11, xTickAngle: "auto", yTickAngle: "auto",
   legend: "top", grid: true, palette: "Plotly", caseColors: {}, barsByCase: false,
   barColor: "#4682b4", pctColor: "#cd5c5c", lineWidth: 1.3, markerSize: 10,
@@ -100,6 +102,10 @@ export function PlotStyleEditor({ style, setStyle, project, caseIds }: {
     <details className="plotstyle">
       <summary className="small">Plot style</summary>
       <div className="row small">
+        <label title="light gives white figures for reports (also in the PNG/SVG export)">Background <select value={style.plotTheme}
+          onChange={(e) => set({ plotTheme: e.target.value as PlotStyle["plotTheme"] })}>
+          <option value="app">as app theme</option><option value="dark">dark</option>
+          <option value="light">light (reports)</option></select></label>
         <label>Font <select value={style.font} onChange={(e) => set({ font: e.target.value })}>
           {FONTS.map((f) => <option key={f} value={f}>{f.split(",")[0]}</option>)}</select></label>
         {num("fontSize", "Text size", 6, 40)}

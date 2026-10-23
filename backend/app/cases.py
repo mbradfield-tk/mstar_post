@@ -59,6 +59,12 @@ def _last_time(path: Path) -> float | None:
 _info_cache: dict = {}
 
 
+def forget(case: Path, stats: Path) -> None:
+    """Drop the cached case info and output inventory of one case."""
+    _info_cache.pop((str(case), str(stats)), None)
+    _inv_cache.pop(str(case), None)
+
+
 def case_info(cid: str, case: Path, stats: Path) -> dict:
     """Summary of one case for the case table (cached for 60 s)."""
     key = (str(case), str(stats))

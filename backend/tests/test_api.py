@@ -75,6 +75,7 @@ def client(tmp_path, monkeypatch):
     make_case(root / "R1" / "caseB", raw=False)
     make_case(root / "R2" / "caseA")
     monkeypatch.setattr(config, "ROOTS", [root.resolve()])
+    monkeypatch.setattr(config, "WRITE_ROOTS", [root.resolve()])
     monkeypatch.setattr(config, "DATA_DIR", tmp_path / "app")
     monkeypatch.setattr(config, "PROJECTS_DIR", tmp_path / "app" / "projects")
     monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "app" / "cache")
@@ -101,6 +102,51 @@ def test_path_guard(client, tmp_path):
     assert [e["name"] for e in r.json()["entries"]] == ["R1", "R2"]
     r = client.get("/api/fs/list", params={"path": str(client.root / "R1")})
     assert all(e["is_case"] for e in r.json()["entries"])
+
+
+def test_browse_and_du(client):
+    d = client.root / "R1" / "blob"
+    d.mkdir()
+    (d / "a.bin").write_bytes(b"x" * 5000)
+    (d / "sub").mkdir()
+    (d / "sub" / "b.bin").write_bytes(b"y" * 3000)
+    r = client.get("/api/fs/browse", params={"path": str(d)}).json()
+    assert [(e["name"], e["dir"], e["size"]) for e in r["entries"]] == [("a.bin", False, 5000), ("sub", True, None)]
+    assert r["disk"]["total"] > 0 and r["parent"] == str(client.root / "R1")
+    u = client.get("/api/fs/du", params={"path": str(d)}).json()
+    assert (u["apparent"], u["files"], u["dirs"], u["truncated"]) == (8000, 2, 1, False)
+    assert client.get("/api/fs/du", params={"path": str(d)}).json()["cached"]
+    assert client.get("/api/fs/du", params={"path": "/etc"}).status_code == 403
+    assert client.get("/api/fs/browse", params={"path": str(d / "a.bin")}).status_code == 422
+
+
+def test_fs_create_and_delete(client, monkeypatch):
+    d = client.root / "R2"
+    r = client.post("/api/fs/mkdirs", json={"parent": str(d), "names": ["1_A_10L", "2_B_10L", "caseA", "a/b", ".."]}).json()
+    assert r["created"] == ["1_A_10L", "2_B_10L"]
+    assert [s["name"] for s in r["skipped"]] == ["caseA", "a/b", ".."]
+    assert (d / "1_A_10L").is_dir()
+    assert client.post("/api/fs/file", json={"parent": str(d / "1_A_10L"), "name": "notes.txt",
+                                              "content": "hi"}).status_code == 200
+    assert (d / "1_A_10L" / "notes.txt").read_text() == "hi"
+    assert client.post("/api/fs/file", json={"parent": str(d / "1_A_10L"), "name": "notes.txt"}).status_code == 409
+    assert client.post("/api/fs/delete", json={"path": str(d / "1_A_10L")}).status_code == 409
+    assert client.post("/api/fs/delete", json={"path": str(d / "1_A_10L"), "recursive": True}).status_code == 200
+    assert not (d / "1_A_10L").exists()
+    assert client.post("/api/fs/delete", json={"path": str(d / "2_B_10L")}).status_code == 200
+    (d / "old").mkdir()
+    (d / "taken").mkdir()
+    r = client.post("/api/fs/rename", json={"path": str(d / "old"), "name": "new"})
+    assert r.status_code == 200 and (d / "new").is_dir() and not (d / "old").exists()
+    assert client.post("/api/fs/rename", json={"path": str(d / "new"), "name": "taken"}).status_code == 409
+    assert client.post("/api/fs/rename", json={"path": str(d / "new"), "name": "a/b"}).status_code == 422
+    assert client.post("/api/fs/rename", json={"path": str(client.root), "name": "x"}).status_code == 403
+    assert client.post("/api/fs/delete", json={"path": str(client.root), "recursive": True}).status_code == 403
+    assert client.post("/api/fs/delete", json={"path": str(d / ".." / "R1")}).status_code == 422
+    assert client.post("/api/fs/mkdirs", json={"parent": "/etc", "names": ["x"]}).status_code == 403
+    monkeypatch.setattr(config, "WRITE_ROOTS", [d / "nowhere"])
+    assert client.post("/api/fs/mkdirs", json={"parent": str(d), "names": ["x"]}).status_code == 403
+    assert client.get("/api/fs/browse", params={"path": str(d)}).json()["writable"] is False
 
 
 def test_project_and_inventory(client):
@@ -293,6 +339,27 @@ def test_job_rerun_and_delete(client):
     assert client.delete(f"/api/jobs/{j['id']}").json() == {"deleted": j["id"]}
     assert not run.exists()
     assert client.get(f"/api/jobs/{j['id']}").status_code == 404
+
+
+def test_relocate_after_rename(client, monkeypatch):
+    p = client.post("/api/projects", json={"name": "mv", "root": str(client.root)}).json()
+    url = f"/api/projects/{p['id']}"
+    (client.root / "R2").rename(client.root / "R2b")
+    g = client.get(url).json()
+    assert not g["root_missing"]
+    assert [c["id"] for c in g["cases"] if c["missing"]] == ["R2/caseA"]
+    assert client.post(f"{url}/relocate", json={"cases": {"R2/caseA": str(client.root / "R1")}}).status_code == 422
+    r = client.post(f"{url}/relocate", json={"cases": {"R2/caseA": str(client.root / "R2b" / "caseA")}}).json()
+    c = next(c for c in r["cases"] if c["id"] == "R2/caseA")
+    assert not c["missing"] and c["path"] == str(client.root / "R2b" / "caseA")
+    moved = client.root.parent / "data_new"
+    client.root.rename(moved)
+    monkeypatch.setattr(config, "ROOTS", [client.root.parent])
+    g = client.get(url).json()
+    assert g["root_missing"] and all(c["missing"] for c in g["cases"])
+    r = client.post(f"{url}/relocate", json={"root": str(moved)}).json()
+    assert not r["root_missing"] and not any(c["missing"] for c in r["cases"])
+    assert [c["id"] for c in r["cases"]] == [c["id"] for c in g["cases"]]
 
 
 def test_case_aliases(client):
