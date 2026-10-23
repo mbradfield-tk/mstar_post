@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, type Job, type Project, type ProjectSummary } from "./api";
 import CasesView from "./CasesView";
 import DirBrowser from "./DirBrowser";
@@ -21,6 +21,24 @@ export default function App() {
   const [job, setJob] = useState<string | null>(null);
   const [run, setRun] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // tabs stay mounted once opened so their state survives switching
+  const [visited, setVisited] = useState<Set<Tab>>(() => new Set(["Cases"]));
+  const [resets, setResets] = useState<Partial<Record<Tab, number>>>({});
+  const scrolls = useRef<Partial<Record<Tab, number>>>({});
+
+  const go = (t: Tab) => {
+    scrolls.current[tab] = window.scrollY;
+    setVisited((v) => (v.has(t) ? v : new Set(v).add(t)));
+    setTab(t);
+  };
+  const reset = (t: Tab) => setResets((r) => ({ ...r, [t]: (r[t] ?? 0) + 1 }));
+  useEffect(() => {
+    const id = requestAnimationFrame(() => {
+      window.scrollTo(0, scrolls.current[tab] ?? 0);
+      window.dispatchEvent(new Event("resize"));  // Plotly sizes plots drawn while hidden
+    });
+    return () => cancelAnimationFrame(id);
+  }, [tab]);
 
   const reloadList = () => api.projects().then(setProjects).catch((e) => setError(e.message));
   useEffect(() => { reloadList(); }, []);
@@ -28,6 +46,8 @@ export default function App() {
     setProject(null);
     setRun(null);
     setJob(null);
+    setVisited(new Set([tab]));
+    scrolls.current = {};
     if (!pid) return;
     localStorage.setItem("mstar_post.project", pid);
     api.project(pid).then(setProject).catch((e) => { setError(e.message); setPid(null); });
@@ -35,7 +55,7 @@ export default function App() {
 
   const onSubmitted = (j: Job) => {
     setJob(j.id);
-    setTab("Jobs");
+    go("Jobs");
   };
 
   const del = async () => {
@@ -61,7 +81,7 @@ export default function App() {
         <nav>
           {TABS.map((t) => (
             <button key={t} className={t === tab ? "tab active" : "tab"} disabled={!project && t !== "Theory"}
-                    onClick={() => setTab(t)}>{t}</button>
+                    onClick={() => go(t)}>{t}</button>
           ))}
         </nav>
       </header>
@@ -70,10 +90,10 @@ export default function App() {
         setCreating(false);
         reloadList();
         setPid(p.id);
-        setTab("Cases");
+        go("Cases");
       }} />}
       <main>
-        {tab === "Theory" && <TheoryView />}
+        {visited.has("Theory") && <Pane show={tab === "Theory"}><TheoryView /></Pane>}
         {!project && !creating && tab !== "Theory" && (
           <div className="panel welcome">
             <h2>Post-process M-Star CFD results</h2>
@@ -84,20 +104,36 @@ export default function App() {
             <button className="primary big" onClick={() => setCreating(true)}>New project</button>
           </div>
         )}
-        {project && tab === "Cases" && <CasesView project={project} onChange={setProject} />}
-        {project && tab === "Run" && <RunView project={project} onSubmitted={onSubmitted} />}
-        {project && tab === "Jobs" && (
-          <JobsView project={project.id} selected={job} onSelect={setJob} onOpenResults={() => {
-            setRun(null);
-            setTab("Results");
-          }} />
-        )}
-        {project && tab === "Results" && <ResultsView project={project} runName={run} onRunChange={setRun} onProjectChange={setProject} />}
-        {project && tab === "Plots" && <PlotsView project={project} onProjectChange={setProject} />}
-        {project && tab === "Viewer" && <ViewerView project={project} />}
+        {project && (() => {
+          const pane = (t: Tab, el: JSX.Element) => visited.has(t) && (
+            <Pane key={`${t}|${project.id}|${resets[t] ?? 0}`} show={tab === t}>{el}</Pane>);
+          return <>
+            {pane("Cases", <CasesView project={project} onChange={setProject} />)}
+            {pane("Run", <RunView project={project} onSubmitted={onSubmitted} />)}
+            {pane("Jobs", <JobsView project={project.id} selected={job} onSelect={setJob} onOpenResults={() => {
+              setRun(null);
+              go("Results");
+            }} />)}
+            {pane("Results", <ResultsView project={project} runName={run} onRunChange={setRun}
+              onProjectChange={setProject} active={tab === "Results"}
+              onReset={() => { setRun(null); reset("Results"); }} />)}
+            {pane("Plots", <PlotsView project={project} onProjectChange={setProject} active={tab === "Plots"}
+              onReset={() => {
+                localStorage.removeItem(`mstar_post.plots.${project.id}`);
+                localStorage.removeItem(`mstar_post.means.${project.id}`);
+                localStorage.removeItem(`mstar_post.plotref.${project.id}`);
+                reset("Plots");
+              }} />)}
+            {pane("Viewer", <ViewerView project={project} />)}
+          </>;
+        })()}
       </main>
     </div>
   );
+}
+
+function Pane({ show, children }: { show: boolean; children: React.ReactNode }) {
+  return <div style={{ display: show ? "contents" : "none" }}>{children}</div>;
 }
 
 function NewProject({ onClose, onCreated }: { onClose: () => void; onCreated: (p: Project) => void }) {

@@ -94,6 +94,9 @@ th.sortable { cursor: pointer; }
 .result-img { max-width: 100%; }
 .checklist { max-height: 55vh; overflow: auto; margin: 6px 0; }
 .checklist label { display: block; margin: 2px 0; }
+.checklist .srcgroup { border-bottom: 1px solid var(--line); padding: 2px 0; }
+.checklist .srcgroup summary { cursor: pointer; }
+.checklist label.srcfile { margin-left: 16px; }
 .plotgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(460px, 1fr)); gap: 8px; }
 .panels { margin: 6px 0; }
 .panel-row { background: #f8fafc; border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
@@ -141,6 +144,9 @@ fieldset.section.closed { padding-bottom: 0; border-left-color: transparent; bor
 .theory .eq .katex-display > .katex { text-align: left; }
 .theory .eq .katex { font-size: 1.08em; }
 .theory .eq.inline { margin: 0; }
+.theory table.vars { margin: 2px 0 4px 10px; border-collapse: collapse; }
+.theory table.vars td { padding: 1px 10px 1px 0; vertical-align: top; }
+.theory table.vars td:first-child { white-space: nowrap; }
 .theory a.ref { margin-left: 3px; color: var(--accent); }
 .theory .cite { color: #7c3aed; }
 .theory .refs li { margin: 3px 0; font-size: 13px; scroll-margin-top: 56px; }

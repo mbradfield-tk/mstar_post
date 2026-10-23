@@ -1,9 +1,46 @@
 import { useMemo, useState } from "react";
-import { api, download, fmt, toCsv, type Project, type ProjectCase } from "./api";
+import { api, caseName, download, fmt, toCsv, type Project, type ProjectCase } from "./api";
 
 // Key settings shown as columns (matched by prefix).
-const KEY_SETTINGS = ["Impeller speed", "Fluid volume", "dx [m]", "Fluid 1 name",
-  "Fluid 2 name", "Surface tension", "Max Courant"];
+const KEY_SETTINGS = ["Simulated time (input runtime)", "Wall time", "Iterations", "Impeller speed",
+  "Fluid volume", "dx [m]", "Fluid 1 name", "Fluid 2 name", "Surface tension", "Max Courant"];
+const END = "Simulated time (end) [s]", RUNTIME = "Simulated time (input runtime) [s]",
+      WALL = "Wall time (cumulative) [h]", ITER = "Iterations [count]";
+const num = (v: unknown) => (typeof v === "number" ? v : null);
+
+export function simTime(c: ProjectCase) {
+  const s = c.info?.settings ?? {};
+  const end = num(s[END]) ?? c.info?.end_time_s ?? null, runtime = num(s[RUNTIME]);
+  return { end, runtime, wall: num(s[WALL]), iter: num(s[ITER]),
+           done: end !== null && runtime !== null && runtime > 0 ? end / runtime : null };
+}
+
+export function simTimeSummary(cases: ProjectCase[]) {
+  const t = cases.map(simTime);
+  const sum = (k: "end" | "wall") => t.reduce((a, x) => a + (x[k] ?? 0), 0);
+  const complete = t.filter((x) => x.done !== null && x.done >= 0.999).length;
+  return `simulated ${fmt(sum("end"))} s in total, ${complete} of ${cases.length} cases ran to the input runtime, `
+    + `wall time ${fmt(sum("wall"))} h in total`;
+}
+
+// Per-case simulated time, input runtime, progress, iterations and wall time.
+export function SimTimeTable({ project, cases }: { project: Project; cases: ProjectCase[] }) {
+  return (
+    <table className="grid narrow">
+      <thead><tr><th>case</th><th>simulated [s]</th><th>input runtime [s]</th><th>progress [%]</th>
+        <th>iterations [count]</th><th>wall time [h]</th></tr></thead>
+      <tbody>{cases.map((c) => {
+        const t = simTime(c);
+        return (
+          <tr key={c.id}><td className="mono" title={c.id}>{caseName(project, c.id)}</td><td className="num">{fmt(t.end)}</td>
+            <td className="num">{fmt(t.runtime)}</td>
+            <td className={`num${t.done !== null && t.done < 0.999 ? " error" : ""}`}>{t.done === null ? "" : fmt(100 * t.done, 4)}</td>
+            <td className="num">{fmt(t.iter)}</td><td className="num">{fmt(t.wall)}</td></tr>
+        );
+      })}</tbody>
+    </table>
+  );
+}
 
 function settingCols(cases: ProjectCase[]): string[] {
   const keys = new Set<string>();
@@ -71,6 +108,7 @@ export default function CasesView({ project, onChange }: {
         <button disabled={busy} onClick={rediscover}>{busy ? "Scanning..." : "Rediscover"}</button>
       </div>
       <div className="muted small mono">{project.root}</div>
+      <div className="small">Included cases: {simTimeSummary(project.cases.filter((c) => c.included))}</div>
       {error && <div className="error">{error}</div>}
       {showDiff && <SettingsDiff cases={project.cases.filter((c) => c.included)} />}
       <table className="grid">
@@ -78,7 +116,7 @@ export default function CasesView({ project, onChange }: {
           <tr>
             <th title="include in post-processing">incl.</th>
             <th title="reference case for % differences">ref</th>
-            <th>case</th><th>end t [s]</th><th>outputs</th>
+            <th>case</th><th>simulated [s]</th><th>outputs</th>
             {cols.map((k) => <th key={k}>{k}</th>)}
           </tr>
         </thead>
@@ -99,7 +137,7 @@ export default function CasesView({ project, onChange }: {
                            onChange={() => patch({ ref_case: c.id })} /></td>
                 <td className="mono" title={c.path}>{g ? c.id.slice(g.length + 1) : c.id}
                   {c.info?.error && <span className="error"> {c.info.error}</span>}</td>
-                <td>{fmt(c.info?.end_time_s)}</td>
+                <td>{fmt(simTime(c).end)}</td>
                 <td className="small">{(c.info?.output_kinds ?? []).map((k) =>
                   <span key={k} className="tag">{k}</span>)}</td>
                 {cols.map((k) => <td key={k}>{fmt(c.info?.settings?.[k])}</td>)}

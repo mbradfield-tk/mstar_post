@@ -6,34 +6,60 @@ import CaseNames from "./CaseNames";
 import Plot from "./Plot";
 import { caseColor, PlotStyleEditor, usePlotStyle, type PlotStyle } from "./PlotStyle";
 
-type Mode = "series" | "bars" | "scatter";
+type Mode = "series" | "bars" | "scatter" | "detail";
+const MODE_LABEL: Record<Mode, string> = { series: "Time series", bars: "Compare means",
+  scatter: "Trend (x-y)", detail: "Case detail" };
 
-export default function PlotsView({ project, onProjectChange }: {
+export default function PlotsView({ project, onProjectChange, active, onReset }: {
   project: Project;
   onProjectChange: (p: Project) => void;
+  active: boolean;
+  onReset: () => void;
 }) {
   const [mode, setMode] = useState<Mode>("series");
   const [style, setStyle] = usePlotStyle(project.id);
+  const refKey = `mstar_post.plotref.${project.id}`;
+  // Plots-only reference for % differences; the project reference case is the default
+  const [ref, setRef] = useState<string>(() => localStorage.getItem(refKey) ?? project.ref_case ?? project.cases[0]?.id ?? "");
+  useEffect(() => localStorage.setItem(refKey, ref), [refKey, ref]);
   return (
     <div className="panel">
       <div className="row">
         <h2 className="grow">Plots</h2>
-        {(["series", "bars", "scatter"] as Mode[]).map((m) => (
-          <button key={m} className={mode === m ? "primary" : ""} onClick={() => setMode(m)}>
-            {{ series: "Time series", bars: "Compare means", scatter: "Trend (x-y)" }[m]}
-          </button>
+        {(["series", "bars", "scatter", "detail"] as Mode[]).map((m) => (
+          <button key={m} className={mode === m ? "primary" : ""} onClick={() => setMode(m)}>{MODE_LABEL[m]}</button>
         ))}
+        <label title="baseline for '% vs ref' in all plot modes (the project reference case is set on the Cases tab)">Reference case{" "}
+          <select value={ref} onChange={(e) => setRef(e.target.value)}>
+            {project.cases.map((c) => <option key={c.id} value={c.id}>{caseName(project, c.id)}
+              {c.id === project.ref_case ? " (project ref)" : ""}</option>)}
+          </select></label>
+        <button onClick={() => confirm("Reset all Plots panels, sources, case selections and the reference case to the defaults? (Plot style and case names are kept.)") && onReset()}>Reset</button>
       </div>
       <CaseNames project={project} onChange={onProjectChange} />
       <PlotStyleEditor style={style} setStyle={setStyle} project={project}
                        caseIds={project.cases.map((c) => c.id)} />
-      {mode === "series" && <SeriesPlot project={project} style={style} />}
-      {mode !== "series" && <MeansPlots project={project} scatter={mode === "scatter"} style={style} />}
+      {mode === "series" && <SeriesPlot project={project} style={style} active={active} refCase={ref} />}
+      {mode !== "series" && <MeansPlots project={project} view={mode} style={style} active={active} refCase={ref} />}
     </div>
   );
 }
 
 const caseIndex = (p: Project, id: string) => p.cases.findIndex((c) => c.id === id);
+const sameRuns = (a: Run[], b: Run[]) => JSON.stringify(a) === JSON.stringify(b);
+const pctDiff = (v: unknown, r: unknown) =>
+  typeof v === "number" && typeof r === "number" && r !== 0 ? ((v - r) / Math.abs(r)) * 100 : null;
+
+// linear interpolation of v(t) at x (t ascending); null outside the range or at gaps
+function interpAt(t: number[], v: (number | null)[], x: number): number | null {
+  const n = t.length;
+  if (!n || x < t[0] || x > t[n - 1]) return null;
+  let lo = 0, hi = n - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (t[m] <= x) lo = m; else hi = m; }
+  const a = v[lo], b = v[hi];
+  if (a === null || b === null) return null;
+  return t[hi] === t[lo] ? a : a + (b - a) * (x - t[lo]) / (t[hi] - t[lo]);
+}
 
 const movingAvg = (t: number[], v: (number | null)[], win: number) => {
   if (!(win > 0)) return v;
@@ -50,7 +76,8 @@ const movingAvg = (t: number[], v: (number | null)[], win: number) => {
 
 // One stacked subplot per panel, all sharing the time axis. src is "stats"
 // (case Stats .txt) or "run:<run name>" (per-case time_s CSVs of a run).
-type Panel = { key: number; src: string; file: string; cols: string[]; win: number; logY: boolean };
+type Panel = { key: number; src: string; file: string; cols: string[]; win: number; logY: boolean;
+               rel?: "none" | "diff" | "pct" };
 type SeriesMap = Record<string, { t: number[]; v: (number | null)[] }>;
 
 const DASHES = ["solid", "dash", "dot", "dashdot", "longdash"] as const;
@@ -67,7 +94,7 @@ function loadPanels(pid: string): Panel[] {
   return [DEFAULT_PANEL];
 }
 
-function SeriesPlot({ project, style }: { project: Project; style: PlotStyle }) {
+function SeriesPlot({ project, style, active, refCase }: { project: Project; style: PlotStyle; active: boolean; refCase: string }) {
   const cases = project.cases.filter((c) => c.included);
   const [panels, setPanels] = useState<Panel[]>(() => loadPanels(project.id));
   const [caseFiles, setCaseFiles] = useState<Record<string, StatsFile[]>>({});
@@ -91,6 +118,18 @@ function SeriesPlot({ project, style }: { project: Project; style: PlotStyle }) 
         .then((fs) => setRunFiles((m) => ({ ...m, [r.name]: fs }))).catch(() => undefined));
     }).catch((e) => setError(e.message));
   }, [project.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // pick up runs finished while the tab was hidden
+  useEffect(() => {
+    if (!active) return;
+    api.runs(project.id).then((rs) => {
+      const ss = rs.filter((r) => r.task === "stats_summary");
+      setRuns((old) => (sameRuns(old, ss) ? old : ss));
+      ss.forEach((r) => api.runTimeseries(project.id, r.name)
+        .then((fs) => setRunFiles((m) => (JSON.stringify(m[r.name]) === JSON.stringify(fs) ? m : { ...m, [r.name]: fs })))
+        .catch(() => undefined));
+    }).catch(() => undefined);
+  }, [active]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // union of the Stats files/columns of all included cases, reference case first
   const statsFiles = useMemo(() => {
@@ -178,21 +217,31 @@ function SeriesPlot({ project, style }: { project: Project; style: PlotStyle }) 
   const seen = new Set<string>();
   panels.forEach((p, i) => {
     const top = 1 - i / n, bottom = 1 - (i + 1) / n;
+    const rel = p.rel ?? "none";
+    const pre = rel === "diff" ? "\u0394 " : rel === "pct" ? "% vs ref: " : "";
     layout[i ? `yaxis${i + 1}` : "yaxis"] = {
       domain: [bottom + (i < n - 1 ? gap / 2 : 0), top - (i ? gap / 2 : 0)],
-      type: p.logY ? "log" : "linear",
-      title: { text: p.cols.length === 1 ? p.cols[0]
-        : p.cols.map((c, j) => `${c} (${DASHES[j % DASHES.length]})`).join("<br>"), font: { size: 11 } },
+      type: p.logY && rel === "none" ? "log" : "linear",
+      title: { text: p.cols.length === 1 ? pre + p.cols[0]
+        : p.cols.map((c, j) => `${pre}${c} (${DASHES[j % DASHES.length]})`).join("<br>"), font: { size: 11 } },
     };
     p.cols.forEach((col, j) => {
       const d = cache[dataKey(p, col)] ?? {};
+      const r = d[refCase];
+      const rs = r && rel !== "none" ? movingAvg(r.t, r.v, p.win) : null;
+      if (rel !== "none" && !rs) return;
       cases.filter((c) => d[c.id]).forEach((c) => {
+        let y = movingAvg(d[c.id].t, d[c.id].v, p.win);
+        if (rs) y = y.map((v, k) => {
+          const b = interpAt(r!.t, rs, d[c.id].t[k]);
+          return v === null || b === null ? null : rel === "diff" ? v - b : pctDiff(v, b);
+        });
         traces.push({
           type: "scattergl", mode: "lines", name: caseName(project, c.id), legendgroup: c.id,
           showlegend: !seen.has(c.id), yaxis: yName(i),
-          x: d[c.id].t, y: movingAvg(d[c.id].t, d[c.id].v, p.win),
-          hovertemplate: `${caseName(project, c.id)}<br>${col}: %{y:.5g}<br>t = %{x:.4g} s<extra></extra>`,
-          line: { width: c.id === project.ref_case ? style.lineWidth * 1.9 : style.lineWidth, color: colorOf(c.id),
+          x: d[c.id].t, y,
+          hovertemplate: `${caseName(project, c.id)}<br>${pre}${col}: %{y:.5g}<br>t = %{x:.4g} s<extra></extra>`,
+          line: { width: c.id === refCase ? style.lineWidth * 1.9 : style.lineWidth, color: colorOf(c.id),
                   dash: DASHES[j % DASHES.length] },
         });
         seen.add(c.id);
@@ -210,9 +259,10 @@ function SeriesPlot({ project, style }: { project: Project; style: PlotStyle }) 
         const v = s.v.filter((x, i): x is number => x !== null && s.t[i] >= tss);
         const m = v.reduce((a, b) => a + b, 0) / (v.length || 1);
         const sd = Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / Math.max(1, v.length - 1));
-        return { key: `${p.key}|${col}|${id}`, col, id, mean: m, std: sd, n: v.length };
+        return { key: `${p.key}|${col}|${id}`, pk: `${p.key}|${col}`, col, id, mean: m, std: sd, n: v.length };
       })));
   }, [cache, panels, tss]);
+  const refMean = (pk: string) => stats.find((s) => s.pk === pk && s.id === refCase)?.mean;
 
   const exportCsv = () => download("time_series.csv",
     toCsv(["case", "file", "column", "time_s", "value"], panels.flatMap((p) => p.cols.flatMap((col) =>
@@ -257,6 +307,10 @@ function SeriesPlot({ project, style }: { project: Project; style: PlotStyle }) 
               <label>Avg [s] <input type="number" step="any" className="short" value={p.win || ""} placeholder="off"
                                     onChange={(e) => update(p.key, { win: Number(e.target.value) })} /></label>
               <label><input type="checkbox" checked={p.logY} onChange={(e) => update(p.key, { logY: e.target.checked })} /> log y</label>
+              <label title="plot each case relative to the reference case (interpolated onto the case's times)">vs ref <select
+                value={p.rel ?? "none"} onChange={(e) => update(p.key, { rel: e.target.value as Panel["rel"] })}>
+                <option value="none">values</option><option value="diff">difference</option><option value="pct">% difference</option>
+              </select></label>
               <button disabled={i === 0} onClick={() => move(i, -1)} title="move up">&uarr;</button>
               <button disabled={i === n - 1} onClick={() => move(i, 1)} title="move down">&darr;</button>
               <button disabled={n === 1} onClick={() => setPanels(panels.filter((x) => x.key !== p.key))} title="remove panel">&times;</button>
@@ -272,16 +326,19 @@ function SeriesPlot({ project, style }: { project: Project; style: PlotStyle }) 
         {!runs.some((r) => runFiles[r.name]?.length) && <span className="muted">Run "M-Star Stats summary" with dispersion/uniformity for metric time series.</span>}
       </div>
       {error && <div className="error">{error}</div>}
+      {panels.some((p) => (p.rel ?? "none") !== "none") && !cases.some((c) => c.id === refCase) &&
+        <div className="error">The reference case is not included in the project (Cases tab); relative panels are empty.</div>}
       <Plot data={traces} exportName="time_series" style={style} height={Math.round(Math.max(360, 250 * n + 90) * style.heightScale)} layout={{
         ...layout, xaxis: { title: { text: "Time [s]" }, anchor: yName(n - 1) as Plotly.AxisName }, shapes,
         legend: { orientation: "h", y: 1.0, yanchor: "bottom" }, margin: { t: 50, r: 20, b: 50, l: 80 },
       }} />
       {tss !== "" && (
         <table className="grid narrow">
-          <thead><tr><th>variable</th><th>case</th><th>mean (t &ge; {tss} s)</th><th>std</th><th>CoV</th><th>n</th></tr></thead>
+          <thead><tr><th>variable</th><th>case</th><th>mean (t &ge; {tss} s)</th><th>std</th><th>CoV</th><th>% vs ref</th><th>n</th></tr></thead>
           <tbody>{stats.map((s) => (
-            <tr key={s.key}><td>{s.col}</td><td className="mono" title={s.id}>{caseName(project, s.id)}</td><td className="num">{fmt(s.mean)}</td>
+            <tr key={s.key} className={s.id === refCase ? "refrow" : ""}><td>{s.col}</td><td className="mono" title={s.id}>{caseName(project, s.id)}</td><td className="num">{fmt(s.mean)}</td>
               <td className="num">{fmt(s.std)}</td><td className="num">{fmt(s.std / Math.abs(s.mean))}</td>
+              <td className="num">{fmt(pctDiff(s.mean, refMean(s.pk)))}</td>
               <td className="num">{s.n}</td></tr>))}</tbody>
         </table>
       )}
@@ -314,7 +371,10 @@ function mergeTables(tables: { label: string; t: CsvTable }[]): Merged {
   };
 }
 
-function MeansPlots({ project, scatter, style }: { project: Project; scatter: boolean; style: PlotStyle }) {
+function MeansPlots({ project, view, style, active, refCase }: {
+  project: Project; view: "bars" | "scatter" | "detail"; style: PlotStyle; active: boolean; refCase: string;
+}) {
+  const scatter = view === "scatter";
   const store = `mstar_post.means.${project.id}`;
   const saved = useMemo(() => {
     try { return JSON.parse(localStorage.getItem(store) ?? "{}"); } catch { return {}; }
@@ -322,6 +382,9 @@ function MeansPlots({ project, scatter, style }: { project: Project; scatter: bo
   const [runs, setRuns] = useState<Run[]>([]);
   const [srcs, setSrcs] = useState<string[]>(saved.srcs ?? []);  // "<run path>/<csv>"
   const [excluded, setExcluded] = useState<string[]>(saved.excluded ?? []);
+  const [pctMode, setPctMode] = useState<"value" | "both" | "pct">(saved.pctMode ?? "value");
+  const [heat, setHeat] = useState<boolean>(saved.heat ?? false);
+  const [focus, setFocus] = useState<string>(saved.focus ?? "");
   const [merged, setMerged] = useState<Merged | null>(null);
   const [sel, setSel] = useState<string[]>([]);
   const [colFilter, setColFilter] = useState("");
@@ -342,8 +405,12 @@ function MeansPlots({ project, scatter, style }: { project: Project; scatter: bo
   }, [project.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    localStorage.setItem(store, JSON.stringify({ srcs, excluded }));
-  }, [store, srcs, excluded]);
+    if (active) api.runs(project.id).then((rs) => setRuns((old) => (sameRuns(old, rs) ? old : rs))).catch(() => undefined);
+  }, [active]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    localStorage.setItem(store, JSON.stringify({ srcs, excluded, pctMode, heat, focus }));
+  }, [store, srcs, excluded, pctMode, heat, focus]);
 
   const options = runs.flatMap((r) => r.csvs.filter((c) => c.endsWith("_means.csv") || c.endsWith("_settings.csv"))
     .map((c) => ({ value: `${r.path}/${c}`, label: `${r.label ?? r.name} (${r.name.slice(0, 15)}): ${c}` })));
@@ -374,8 +441,27 @@ function MeansPlots({ project, scatter, style }: { project: Project; scatter: bo
   const cases = shown.map((r) => String(r[0]));
   const names = cases.map((c) => caseName(project, c));
   const colVals = (c: string) => table!.rows.map((r) => r[table!.columns.indexOf(c)]);
-  const refIdx = Math.max(0, cases.indexOf(project.ref_case ?? ""));
+  // the reference row is taken from all merged cases, so an excluded reference still works
+  const refRow = merged?.rows.find((r) => r[0] === refCase);
+  const refVal = (c: string) => refRow?.[merged!.columns.indexOf(c)];
+  const refName = caseName(project, refCase);
   const numeric = table?.columns.slice(1).filter((c) => colVals(c).some((v) => typeof v === "number")) ?? [];
+  const shownVars = numeric.filter((c) => c.toLowerCase().includes(colFilter.toLowerCase()));
+  const varList = (
+    <>
+      <input placeholder="filter variables" value={colFilter} onChange={(e) => setColFilter(e.target.value)} />
+      <div className="row small">
+        <button onClick={() => setSel([...new Set([...sel, ...shownVars])])}>select shown</button>
+        <button onClick={() => setSel(sel.filter((c) => !shownVars.includes(c)))}>clear shown</button>
+      </div>
+      <div className="checklist">
+        {shownVars.map((c) => (
+          <label key={c} className="small"><input type="checkbox" checked={sel.includes(c)}
+            onChange={(e) => setSel(e.target.checked ? [...sel, c] : sel.filter((x) => x !== c))} />{c}</label>
+        ))}
+      </div>
+    </>
+  );
 
   return (
     <>
@@ -387,10 +473,23 @@ function MeansPlots({ project, scatter, style }: { project: Project; scatter: bo
           <div className="side">
             <b className="small">Sources</b>
             <div className="checklist">
-              {options.map((o) => (
-                <label key={o.value} className="small"><input type="checkbox" checked={srcs.includes(o.value)}
-                  onChange={(e) => setSrcs(e.target.checked ? [...srcs, o.value] : srcs.filter((x) => x !== o.value))} />{o.label}</label>
-              ))}
+              {runs.map((r) => {
+                const opts = options.filter((o) => o.value.startsWith(`${r.path}/`));
+                if (!opts.length) return null;
+                const n = opts.filter((o) => srcs.includes(o.value)).length;
+                return (
+                  <details key={r.name} className="srcgroup" open={n > 0}>
+                    <summary className="small" title={r.name}>
+                      <b>{r.label ?? r.name}</b> <span className="muted">{r.name.slice(0, 15)}{n ? ` (${n} selected)` : ""}</span>
+                    </summary>
+                    {opts.map((o) => (
+                      <label key={o.value} className="small srcfile"><input type="checkbox" checked={srcs.includes(o.value)}
+                        onChange={(e) => setSrcs(e.target.checked ? [...srcs, o.value] : srcs.filter((x) => x !== o.value))} />
+                        {o.value.slice(r.path.length + 1)}</label>
+                    ))}
+                  </details>
+                );
+              })}
             </div>
             <span className="muted small">A case in several sources uses the first listed one.</span>
           </div>
@@ -409,38 +508,57 @@ function MeansPlots({ project, scatter, style }: { project: Project; scatter: bo
           )}
         </div>
       )}
-      {table && !scatter && (
+      {table && view === "bars" && (
         <div className="split">
           <div className="side">
-            <input placeholder="filter variables" value={colFilter} onChange={(e) => setColFilter(e.target.value)} />
-            <div className="checklist">
-              {numeric.filter((c) => c.toLowerCase().includes(colFilter.toLowerCase())).map((c) => (
-                <label key={c} className="small"><input type="checkbox" checked={sel.includes(c)}
-                  onChange={(e) => setSel(e.target.checked ? [...sel, c] : sel.filter((x) => x !== c))} />{c}</label>
-              ))}
-            </div>
-            <button onClick={() => download("means_selection.csv", toCsv(["case", ...sel],
-              cases.map((c, i) => [names[i], ...sel.map((s) => colVals(s)[i])])))}>Export selection CSV</button>
+            {varList}
+            <button onClick={() => download("means_selection.csv", toCsv(["case", ...sel, ...sel.map((s) => `% vs ${refName}: ${s}`)],
+              cases.map((c, i) => [names[i], ...sel.map((s) => colVals(s)[i]), ...sel.map((s) => pctDiff(colVals(s)[i], refVal(s)))])))}>
+              Export selection CSV</button>
           </div>
-          <div className="main plotgrid">
-            {sel.map((c) => {
-              const ys = colVals(c).map((v) => (typeof v === "number" ? v : null));
-              const ref = ys[refIdx];
-              const pct = ys.map((y) => (y !== null && ref ? ((y - ref) / Math.abs(ref)) * 100 : null));
-              return (
-                <Plot key={c} exportName={c} style={style} height={Math.round(340 * style.heightScale)} data={[
-                  { type: "bar", x: names, y: ys, name: "value", marker: {
-                    color: style.barsByCase ? cases.map((id) => caseColor(style, id, caseIndex(project, id))) : style.barColor } },
-                  { type: "bar", x: names, y: pct, name: "% vs ref", yaxis: "y2", marker: { color: style.pctColor }, visible: "legendonly" },
-                ]} layout={{
-                  title: { text: c, font: { size: 13 } }, barmode: "group",
-                  yaxis2: { overlaying: "y", side: "right", title: { text: "% vs ref" } },
-                  legend: { orientation: "h", y: 1.12 }, margin: { t: 60, b: 110, l: 70, r: 60 },
-                }} />
-              );
-            })}
+          <div className="main">
+            <div className="row small">
+              <label>Show <select value={pctMode} onChange={(e) => setPctMode(e.target.value as typeof pctMode)}>
+                <option value="value">values</option><option value="both">values + % vs ref</option>
+                <option value="pct">% vs ref only</option></select></label>
+              <label><input type="checkbox" checked={heat} onChange={(e) => setHeat(e.target.checked)} /> % difference heatmap</label>
+              <span className="muted">reference: <b>{refName}</b>{!refRow && " (not in the selected sources: no % values)"}</span>
+            </div>
+            {heat && sel.length > 0 && (
+              <Plot exportName="pct_diff_heatmap" style={style} height={Math.round(Math.max(260, 34 * sel.length + 170) * style.heightScale)} data={[{
+                type: "heatmap", x: names, y: sel, zmid: 0, colorscale: "RdBu", reversescale: true,
+                z: sel.map((s) => colVals(s).map((v) => pctDiff(v, refVal(s)))),
+                text: sel.map((s) => colVals(s).map((v) => { const p = pctDiff(v, refVal(s)); return p === null ? "" : `${p.toFixed(1)}%`; })) as unknown as string[],
+                texttemplate: "%{text}", hovertemplate: "%{y}<br>%{x}: %{z:.3g}%<extra></extra>",
+                colorbar: { title: { text: `% vs ${refName}` } },
+              } as Plotly.Data]} layout={{ title: { text: `% difference vs ${refName}` }, margin: { l: 20, b: 110 } }} />
+            )}
+            <div className="plotgrid">
+              {sel.map((c) => {
+                const ys = colVals(c).map((v) => (typeof v === "number" ? v : null));
+                const pct = ys.map((y) => pctDiff(y, refVal(c)));
+                const valTrace: Plotly.Data = { type: "bar", x: names, y: ys, name: "value", marker: {
+                  color: style.barsByCase ? cases.map((id) => caseColor(style, id, caseIndex(project, id))) : style.barColor,
+                  line: { color: "#000", width: cases.map((id) => (id === refCase ? 2 : 0)) } } };
+                const pctTrace: Plotly.Data = { type: "bar", x: names, y: pct, name: `% vs ${refName}`,
+                  yaxis: pctMode === "both" ? "y2" : "y", marker: { color: style.pctColor } };
+                return (
+                  <Plot key={c} exportName={c} style={style} height={Math.round(340 * style.heightScale)}
+                    data={pctMode === "value" ? [valTrace] : pctMode === "pct" ? [pctTrace] : [valTrace, pctTrace]} layout={{
+                    title: { text: c, font: { size: 13 } }, barmode: "group",
+                    ...(pctMode === "pct" && { yaxis: { title: { text: `% vs ${refName}` } } }),
+                    ...(pctMode === "both" && { yaxis2: { overlaying: "y", side: "right", title: { text: "% vs ref" } } }),
+                    legend: { orientation: "h", y: 1.12 }, margin: { t: 60, b: 110, l: 70, r: 60 },
+                  }} />
+                );
+              })}
+            </div>
           </div>
         </div>
+      )}
+      {merged && view === "detail" && (
+        <CaseDetail project={project} merged={merged} cases={cases} numeric={numeric} refCase={refCase} style={style}
+                    focus={focus || allCases.find((c) => c !== refCase) || allCases[0] || ""} setFocus={setFocus} />
       )}
       {table && scatter && (
         <ScatterFit cases={cases} labels={cases.map((c) => project.aliases?.[c] ?? c.split("/").pop()!)}
@@ -450,6 +568,81 @@ function MeansPlots({ project, scatter, style }: { project: Project; scatter: bo
                     logAxes={logAxes} setLogAxes={setLogAxes} />
       )}
     </>
+  );
+}
+
+// One case against the reference and the spread of the shown cases, per variable.
+function CaseDetail({ project, merged, cases, numeric, refCase, style, focus, setFocus }: {
+  project: Project; merged: Merged; cases: string[]; numeric: string[]; refCase: string; style: PlotStyle;
+  focus: string; setFocus: (c: string) => void;
+}) {
+  const [filter, setFilter] = useState("");
+  const [minPct, setMinPct] = useState<number | "">("");
+  const [order, setOrder] = useState<"var" | "pct">("pct");
+  const row = (id: string) => merged.rows.find((r) => r[0] === id);
+  const fr = row(focus), rr = row(refCase);
+  const shownRows = merged.rows.filter((r) => cases.includes(String(r[0])));
+  let rows = numeric.filter((c) => c.toLowerCase().includes(filter.toLowerCase())).map((c) => {
+    const j = merged.columns.indexOf(c);
+    const v = fr?.[j], r = rr?.[j];
+    const vals = shownRows.map((x) => x[j]).filter((x): x is number => typeof x === "number");
+    const mean = vals.reduce((a, b) => a + b, 0) / (vals.length || 1);
+    const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / Math.max(1, vals.length - 1));
+    return {
+      c, v: typeof v === "number" ? v : null, r: typeof r === "number" ? r : null, pct: pctDiff(v, r),
+      rank: typeof v === "number" ? 1 + vals.filter((x) => x > v).length : null, n: vals.length,
+      min: vals.length ? Math.min(...vals) : null, max: vals.length ? Math.max(...vals) : null, mean,
+      z: typeof v === "number" && sd > 0 ? (v - mean) / sd : null,
+    };
+  }).filter((x) => minPct === "" || (x.pct !== null && Math.abs(x.pct) >= minPct));
+  if (order === "pct") rows = [...rows].sort((a, b) => Math.abs(b.pct ?? -1) - Math.abs(a.pct ?? -1));
+  const top = rows.filter((x) => x.pct !== null).slice(0, 40);
+  const fName = caseName(project, focus), rName = caseName(project, refCase);
+  return (
+    <div>
+      <div className="row">
+        <label>Case <select value={focus} onChange={(e) => setFocus(e.target.value)}>
+          {merged.rows.map((r) => String(r[0])).map((id) => <option key={id} value={id}>{caseName(project, id)}</option>)}
+        </select></label>
+        <span className="muted">vs reference <b>{rName}</b>; rank, range, mean and z over the {cases.length} checked cases</span>
+      </div>
+      <div className="row small">
+        <input placeholder="filter variables" value={filter} onChange={(e) => setFilter(e.target.value)} />
+        <label>only |% vs ref| &ge; <input type="number" className="short" value={minPct}
+          onChange={(e) => setMinPct(e.target.value === "" ? "" : Number(e.target.value))} /></label>
+        <label>Order <select value={order} onChange={(e) => setOrder(e.target.value as "var" | "pct")}>
+          <option value="pct">largest |% vs ref| first</option><option value="var">variable</option></select></label>
+        <button onClick={() => download(`case_detail_${fName}.csv`, toCsv(
+          ["variable", fName, `${rName} (ref)`, "% vs ref", "rank", "n cases", "min", "max", "mean", "z"],
+          rows.map((x) => [x.c, x.v, x.r, x.pct, x.rank, x.n, x.min, x.max, x.mean, x.z])))}>Export CSV</button>
+      </div>
+      {!fr && <div className="error">The case is not in the selected sources.</div>}
+      {!rr && <div className="muted">The reference case is not in the selected sources: no % values.</div>}
+      {top.length > 0 && (
+        <Plot exportName={`case_detail_${fName}`} style={style} height={Math.round(Math.max(260, 22 * top.length + 120) * style.heightScale)} data={[{
+          type: "bar", orientation: "h", y: top.map((x) => x.c), x: top.map((x) => x.pct),
+          marker: { color: top.map((x) => ((x.pct ?? 0) >= 0 ? "#c0504d" : "#4f81bd")) },
+          hovertemplate: "%{y}: %{x:.3g}%<extra></extra>",
+        }]} layout={{
+          title: { text: `${fName}: % difference vs ${rName}${rows.length > top.length ? ` (largest ${top.length})` : ""}` },
+          yaxis: { autorange: "reversed", automargin: true }, xaxis: { title: { text: "% vs ref" }, zeroline: true },
+          margin: { l: 20, t: 50 },
+        }} />
+      )}
+      <div className="tablewrap">
+        <table className="grid">
+          <thead><tr><th>variable</th><th>{fName}</th><th>{rName} (ref)</th><th>% vs ref</th><th>rank</th>
+            <th>min</th><th>max</th><th>mean</th><th title="(value - mean) / std over the checked cases">z</th></tr></thead>
+          <tbody>{rows.map((x) => (
+            <tr key={x.c}><td>{x.c}</td><td className="num">{fmt(x.v)}</td><td className="num">{fmt(x.r)}</td>
+              <td className="num" style={{ background: x.pct === null ? undefined
+                : `rgba(${x.pct >= 0 ? "220,90,70" : "70,130,220"},${Math.min(1, Math.abs(x.pct) / 50) * 0.45})` }}>{fmt(x.pct)}</td>
+              <td className="num">{x.rank === null ? "" : `${x.rank} / ${x.n}`}</td>
+              <td className="num">{fmt(x.min)}</td><td className="num">{fmt(x.max)}</td><td className="num">{fmt(x.mean)}</td>
+              <td className="num">{fmt(x.z)}</td></tr>))}</tbody>
+        </table>
+      </div>
+    </div>
   );
 }
 

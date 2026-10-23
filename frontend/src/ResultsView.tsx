@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, caseName, type CsvTable, type Project, type Run } from "./api";
 import CaseNames from "./CaseNames";
+import { SimTimeTable, simTimeSummary } from "./CasesView";
 import CsvTableView from "./CsvTableView";
 
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : "");
@@ -8,23 +9,27 @@ const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : ""
 // Prefer the cross-case means table when a run is opened.
 const PREFERRED = ["batch_summary_means.csv", "stats_summary_means.csv"];
 
-export default function ResultsView({ project, runName, onRunChange, onProjectChange }: {
+export default function ResultsView({ project, runName, onRunChange, onProjectChange, active, onReset }: {
   project: Project;
   runName: string | null;
   onRunChange: (name: string | null) => void;
   onProjectChange: (p: Project) => void;
+  active: boolean;
+  onReset: () => void;
 }) {
   const [runs, setRuns] = useState<Run[]>([]);
   const [file, setFile] = useState<string | null>(null);
   const [table, setTable] = useState<CsvTable | null>(null);
   const [error, setError] = useState<string | null>(null);
   const run = runs.find((r) => r.name === runName) ?? null;
+  const runIds = run?.params?.cases;
+  const runCases = Array.isArray(runIds) ? project.cases.filter((c) => runIds.includes(c.id)) : [];
 
   const reload = () => api.runs(project.id).then((rs) => {
     setRuns(rs);
     if (!runName && rs.length) onRunChange(rs[0].name);
   }).catch((e) => setError(e.message));
-  useEffect(() => { reload(); }, [project.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (active) reload(); }, [project.id, active]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!run) { setFile(null); return; }
@@ -58,7 +63,8 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
   return (
     <div className="split">
       <div className="side">
-        <div className="row"><h3 className="grow">Runs</h3><button onClick={reload}>Refresh</button></div>
+        <div className="row"><h3 className="grow">Runs</h3><button onClick={reload}>Refresh</button>
+          <button onClick={onReset} title="newest run, default file, no table filters">Reset</button></div>
         {runs.map((r) => (
           <div key={r.name} className={`taskcard${r.name === runName ? " active" : ""}`} onClick={() => onRunChange(r.name)}>
             <span className={`status ${r.status}`}>{r.status}</span> <b>{r.label ?? r.task}</b>
@@ -97,6 +103,12 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
               <summary className="small">Run parameters</summary>
               <pre className="log small">{JSON.stringify(run.params, null, 2)}</pre>
             </details>
+            {runCases.length > 0 && (
+              <details>
+                <summary className="small">Simulation time: {simTimeSummary(runCases)}</summary>
+                <SimTimeTable project={project} cases={runCases} />
+              </details>
+            )}
             {error && <div className="error">{error}</div>}
             {table?.columns[0] === "case" && <CaseNames project={project} onChange={onProjectChange} />}
             {table && file && <CsvTableView table={table} name={file} refCase={project.ref_case}

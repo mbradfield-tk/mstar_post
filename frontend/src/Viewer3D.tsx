@@ -238,6 +238,7 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
                       lines: new Map(), extra: [], fitted: false, draw };
     const resize = () => {
       const w = el.clientWidth, h = el.clientHeight;
+      if (!w || !h) return;  // hidden tab
       renderer.setSize(w, h);
       camera.aspect = w / Math.max(h, 1);
       camera.updateProjectionMatrix();
@@ -246,7 +247,10 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
     const ro = new ResizeObserver(resize);
     ro.observe(el);
     let raf = 0;
-    const loop = () => { controls.update(); draw(); raf = requestAnimationFrame(loop); };
+    const loop = () => {
+      if (el.clientWidth) { controls.update(); draw(); }
+      raf = requestAnimationFrame(loop);
+    };
     loop();
     return () => {
       cancelAnimationFrame(raf);

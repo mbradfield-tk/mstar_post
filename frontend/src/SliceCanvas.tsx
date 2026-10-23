@@ -62,7 +62,7 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, li
   useEffect(() => {
     const el = box.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => setBoxW(el.clientWidth));
+    const ro = new ResizeObserver(() => el.clientWidth && setBoxW(el.clientWidth));
     ro.observe(el);
     setBoxW(el.clientWidth);
     const onWheel = (e: WheelEvent) => {
