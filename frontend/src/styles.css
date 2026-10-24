@@ -219,6 +219,7 @@ th.sortable { cursor: pointer; }
 .overview .chips .chip { padding: 2px 10px; font-size: 13px; }
 .overview .findings { margin: 8px 0 0; padding-left: 18px; line-height: 1.5; }
 .overview td .pct { font-variant-numeric: tabular-nums; }
+.overview th.cond, .overview td.cond { border-right: 2px solid var(--control-line); }
 .overview td .pct.up { color: var(--ok); }
 .overview td .pct.down { color: var(--bad); }
 .section-bar { margin: 8px 0 10px; }

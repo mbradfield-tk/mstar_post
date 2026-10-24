@@ -86,8 +86,16 @@ def case_info(cid: str, case: Path, stats: Path) -> dict:
         "has_output": out is not None,
         "output_kinds": sorted(p.name for p in out.iterdir() if p.is_dir())
         if out else [],
-        "settings": {k: v for k, v in settings.items() if k not in ("case", "input_xml")},
+        "settings": {mss.canon_body(k): v for k, v in settings.items() if k not in ("case", "input_xml")},
     }
+    # convenience columns for the case tables: volume in litres, impeller speed in rpm
+    s = info["settings"]
+    vol = s.get("Fluid volume (total, initial) [m^3]")
+    if isinstance(vol, (int, float)):
+        s["Volume [L]"] = 1000.0 * vol
+    rpm = [v for k, v in s.items() if k.startswith("Impeller speed") and isinstance(v, (int, float))]
+    if rpm:
+        s["Agitator speed [rpm]"] = rpm[0] if len(rpm) == 1 else max(rpm)
     _info_cache[key] = (time.monotonic(), info)
     return info
 

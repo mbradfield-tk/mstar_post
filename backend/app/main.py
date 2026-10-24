@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="M-Star Post", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=4096)
-for r in (fs.router, projects.router, case.router, jobs_router.router):
+for r in (fs.router, projects.router, projects.catalog, case.router, jobs_router.router):
     app.include_router(r)
 
 

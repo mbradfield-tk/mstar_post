@@ -10,6 +10,8 @@ import StatsSeries from "./StatsSeries";
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : "");
 // stats_plots/<stem>.html name of a Stats file, as written by mstar_stats_summary.make_plots
 const plotStem = (statsFile: string) => statsFile.replace(/\.[^./]+$/, "").replace(/[^\w.-]+/g, "_");
+// results are normalised to the body name "Agitator" (M-Star: "Moving Body" = "agitator")
+const canonBody = (s: string) => s.replace(/Moving[ _]Body|(?<![A-Za-z])agitator(?![A-Za-z])/g, "Agitator");
 
 // Prefer the cross-case means table when a run is opened.
 const PREFERRED = ["batch_summary_means.csv", "stats_summary_means.csv"];
@@ -58,7 +60,8 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
   // the bottom block follows the top block: all variables of the same file and case
   // (Stats file: stats_plots/<stem>.html; job CSV: the job's <stem>.html next to it, if that job is selected)
   const seriesCandidates = !run || !seriesSel ? [] : seriesSel.src === "stats"
-    ? [`${seriesSel.caseId}/stats_plots/${plotStem(seriesSel.file)}.html`, `stats_plots/${plotStem(seriesSel.file)}.html`]
+    ? [`${seriesSel.caseId}/stats_plots/${plotStem(seriesSel.file)}.html`, `stats_plots/${plotStem(seriesSel.file)}.html`,
+       `${seriesSel.caseId}/stats_plots/${canonBody(plotStem(seriesSel.file))}.html`, `stats_plots/${canonBody(plotStem(seriesSel.file))}.html`]
     : seriesSel.src === `run:${run.name}`
       ? [`${seriesSel.caseId}/${plotStem(seriesSel.file)}.html`, `${plotStem(seriesSel.file)}.html`] : [];
   const seriesHtml = seriesCandidates.find((h) => run?.htmls.includes(h)) ?? null;
@@ -77,6 +80,26 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
     onRunChange(null);
     reload();
   };
+  const [renaming, setRenaming] = useState(false);
+  const [renameNote, setRenameNote] = useState<string | null>(null);
+  // M-Star "Moving Body" / "agitator" -> "Agitator" in the result files of one run or all runs
+  const renameBody = async (all: boolean) => {
+    if (!await ui.confirm({ title: all ? "Rename the impeller body in all runs?" : "Rename the impeller body in this run?", ok: "Rename",
+      body: <p>Every <b>Moving Body</b> / <b>agitator</b> in the result files {all ? "of every finished run" : "of this run"} becomes
+        <b> Agitator</b>: CSV headers and values (columns that become identical are merged), HTML plots and file names.
+        Case folders are not touched. Runs made from now on are normalised automatically.</p> })) return;
+    setRenaming(true);
+    setRenameNote(null);
+    try {
+      const r = await api.renameBody(project.id, all ? undefined : run?.name);
+      const bad = r.runs.filter((x) => x.error || x.skipped);
+      setRenameNote(`${r.changed} file${r.changed === 1 ? "" : "s"} updated in ${r.runs.length} run${r.runs.length === 1 ? "" : "s"}`
+        + (bad.length ? `; ${bad.map((x) => `${x.run}: ${x.skipped ?? "failed"}`).join(", ")}` : ""));
+      setFile(null);
+      reload();
+    } catch (e) { setError((e as Error).message); }
+    setRenaming(false);
+  };
 
   const group = (files: string[]) => {
     const g = new Map<string, string[]>();
@@ -93,6 +116,11 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
       <div className="side">
         <div className="row"><h3 className="grow">Runs</h3><button onClick={reload}>Refresh</button>
           <button onClick={onReset} title="newest run, default file, no table filters">Reset</button></div>
+        {runs.length > 0 && <div className="row small">
+          <button disabled={renaming} onClick={() => renameBody(true)}
+                  title="rename M-Star's 'Moving Body' / 'agitator' to 'Agitator' in the result files of every run">
+            {renaming ? "Renaming..." : "Moving Body \u2192 Agitator (all runs)"}</button></div>}
+        {renameNote && <div className="note small" onClick={() => setRenameNote(null)}>{renameNote}</div>}
         {runs.map((r) => (
           <div key={r.name} className={`taskcard${r.name === runName ? " active" : ""}`} onClick={() => onRunChange(r.name)}>
             <span className={`status ${r.status}`}>{r.status}</span> <b>{r.label ?? r.task}</b>
@@ -125,6 +153,8 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
             <div className="row">
               <h2 className="grow plain">{run.label ?? run.name} <span className={`status ${run.status}`}>{run.status}</span></h2>
               <a className="button" href={api.zipUrl(project.id, run.path)}>Download run (.zip)</a>
+              <button disabled={renaming} onClick={() => renameBody(false)}
+                      title="rename M-Star's 'Moving Body' / 'agitator' to 'Agitator' in this run's result files">Moving Body {"\u2192"} Agitator</button>
               <button className="danger" onClick={del} title="delete this run and all its outputs">Delete run</button>
             </div>
             <div className="row small muted">

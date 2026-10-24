@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, type ProjectMeta, type ProjectSummary } from "./api";
+import CaseCatalog from "./CaseCatalog";
 import { META_FIELDS, metaValues } from "./ProjectMeta";
 
 const when = (t: number) => new Date(t * 1000).toLocaleDateString();
@@ -18,6 +19,7 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
   onTheory: () => void;
 }) {
   const [filter, setFilter] = useState("");
+  const [view, setView] = useState<"projects" | "cases">("projects");
   const [meta, setMeta] = useState<Filters>(() => {
     try { return JSON.parse(localStorage.getItem(FILTER_KEY) ?? "{}"); } catch { return {}; }
   });
@@ -53,12 +55,17 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
         </div>
         <div className="row">
           <button className="primary big" onClick={onNew}>New project</button>
+          <span className="seg">
+            <button className={view === "projects" ? "primary" : ""} onClick={() => setView("projects")}>Projects</button>
+            <button className={view === "cases" ? "primary" : ""} onClick={() => setView("cases")} title="every case of every project with its unique case ID">All cases</button>
+          </span>
           <span className="grow" />
           <button onClick={onFiles}>Browse files</button>
           <button onClick={onTheory}>Theory</button>
         </div>
       </div>
-      <div className="panel">
+      {view === "cases" && <CaseCatalog onOpenProject={onOpen} />}
+      {view === "projects" && <div className="panel">
         <div className="row">
           <h2 className="grow">Projects <span className="muted">({shown.length === projects.length ? projects.length : `${shown.length} of ${projects.length}`})</span></h2>
           {META_FIELDS.map(({ key, label }) => {
@@ -105,7 +112,7 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
             </div>
           ))}
         </div>
-      </div>
+      </div>}
     </div>
   );
 }

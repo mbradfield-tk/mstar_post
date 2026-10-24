@@ -110,7 +110,18 @@ def _stats_build(project: dict, cases: list[dict], prm: dict, run: Path) -> list
         _opt(argv, flag, prm.get(name))
     if prm.get("plot"):
         argv += ["--plot", *(prm.get("plot_vars") or [])]
-    return [{"argv": argv}]
+    cmds = [{"argv": argv}]
+    if prm.get("canon_body", True):
+        cmds.append({"argv": rename_body_argv(run, project.get("ref_case"))})
+    return cmds
+
+
+def rename_body_argv(run: Path, ref_case: str | None = None) -> list[str]:
+    """Command normalising the impeller body name ('Moving Body', 'agitator' ->
+    'Agitator') in every result file under run (mstar_stats_summary --rename-body)."""
+    argv = [config.STATS_SUMMARY_PY, str(config.STATS_SUMMARY), str(run), "--rename-body"]
+    _opt(argv, "--ref-case", ref_case)
+    return argv
 
 
 STATS = Task(
@@ -126,6 +137,9 @@ STATS = Task(
         P("tol", "Drift tolerance [-]", default=0.02, group="Steady state"),
         P("mix_rsd", "Mixing RSD threshold [%]", default=5.0, group="Steady state"),
         P("plot", "HTML plots per Stats file", "bool", True, group="Outputs"),
+        P("canon_body", "Impeller body name = Agitator", "bool", True,
+          help="M-Star's 'Moving Body' and 'agitator' are the same impeller: rename both to "
+               "'Agitator' in every output so cases share columns", group="Outputs"),
         P("plot_vars", "Variables to plot", "list", help="blank = all", group="Outputs"),
         P("means_vars", "Means-table variables", "list",
           help="blank = default list (dissipation, velocity, power number, ...)",

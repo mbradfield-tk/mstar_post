@@ -26,6 +26,8 @@ const KEY_METRICS: [RegExp, string][] = [
   [/^Q_wall/, "Q wall"],
 ];
 const MAX_METRICS = 10;
+// case operating conditions (keys of case_info.settings) shown in front of the key results
+const COND = [{ key: "Volume [L]", label: "Volume", unit: "L" }, { key: "Agitator speed [rpm]", label: "Speed", unit: "rpm" }];
 const unitOf = (col: string) => col.match(/\[([^\]]*)\]\s*$/)?.[1] ?? "";
 const shortName = (col: string) => col.replace(/\s*\[[^\]]*\]\s*$/, "");
 
@@ -128,6 +130,12 @@ export default function RunSummary({ project, run, task, onOpenFile }: {
 
   const ordered = caseIds.filter((c) => rows.has(c));
   const refRow = ref ? rows.get(ref) : undefined;
+  // operating conditions of each case from the project's case info (input.xml), shown before the results
+  const cond = (c: string, key: string): number | string | null => {
+    const v = project.cases.find((x) => x.id === c)?.info?.settings?.[key];
+    return typeof v === "number" || typeof v === "string" ? v : null;
+  };
+  const condCols = COND.filter((k) => ordered.some((c) => cond(c, k.key) !== null));
 
   // non-default settings
   const settings = (task?.params ?? []).flatMap((p) => {
@@ -150,8 +158,8 @@ export default function RunSummary({ project, run, task, onOpenFile }: {
   }) : [];
 
   const exportCsv = () => download(`${run.name}_overview.csv`, toCsv(
-    ["case", ...metrics.map((m) => m.col), ...(refRow ? metrics.map((m) => `${m.col} % vs ref`) : [])],
-    ordered.map((c) => [c, ...metrics.map((m) => rows.get(c)?.[m.col] ?? ""),
+    ["case", ...COND.map((k) => k.key), ...metrics.map((m) => m.col), ...(refRow ? metrics.map((m) => `${m.col} % vs ref`) : [])],
+    ordered.map((c) => [c, ...COND.map((k) => cond(c, k.key) ?? ""), ...metrics.map((m) => rows.get(c)?.[m.col] ?? ""),
       ...(refRow ? metrics.map((m) => { const p = pct(rows.get(c)?.[m.col] ?? null, refRow[m.col] ?? null); return p === null ? "" : p; }) : [])])));
 
   const n = { tables: run.csvs.length, plots: run.htmls.length, images: run.images.length };
@@ -180,7 +188,9 @@ export default function RunSummary({ project, run, task, onOpenFile }: {
           <div className="chips">
             {caseIds.map((c) => (
               <span key={c} className={`chip${c === ref ? " ref" : ""}${project.cases.some((x) => x.id === c) ? "" : " gone"}`}
-                    title={c === ref ? `${c} (reference case)` : c}>{caseName(project, c)}{c === ref ? " (ref)" : ""}</span>))}
+                    title={c === ref ? `${c} (reference case)` : c}>{caseName(project, c)}{c === ref ? " (ref)" : ""}
+                {(cond(c, "Volume [L]") !== null || cond(c, "Agitator speed [rpm]") !== null) && <span className="muted small">
+                  {" "}{[cond(c, "Volume [L]") !== null ? `${fmt(cond(c, "Volume [L]"), 3)} L` : "", cond(c, "Agitator speed [rpm]") !== null ? `${fmt(cond(c, "Agitator speed [rpm]"), 4)} rpm` : ""].filter(Boolean).join(", ")}</span>}</span>))}
           </div>
           {multi && <div className="small muted" style={{ marginTop: 6 }}>
             {ref ? <>Differences are relative to the reference case <b>{caseName(project, ref)}</b>.</>
@@ -210,6 +220,7 @@ export default function RunSummary({ project, run, task, onOpenFile }: {
             <table className="grid">
               <thead><tr>
                 <th>case</th>
+                {condCols.map((k, i) => <th key={k.key} className={i === condCols.length - 1 ? "cond" : ""} title={`${k.key} (from input.xml)`}>{k.label}<span className="muted"> [{k.unit}]</span></th>)}
                 {metrics.map((m) => <th key={m.col} title={`${m.col}\nfrom ${m.source}`}>{m.label}{m.unit && <span className="muted"> [{m.unit}]</span>}</th>)}
               </tr></thead>
               <tbody>
@@ -218,6 +229,7 @@ export default function RunSummary({ project, run, task, onOpenFile }: {
                   return (
                     <tr key={c} className={c === ref ? "refrow" : ""}>
                       <td className="mono" title={c}>{caseName(project, c)}</td>
+                      {condCols.map((k, i) => <td key={k.key} className={`num${i === condCols.length - 1 ? " cond" : ""}`}>{fmt(cond(c, k.key))}</td>)}
                       {metrics.map((m) => {
                         const v = row[m.col] ?? null;
                         const p = showPct && refRow && c !== ref ? pct(v, refRow[m.col] ?? null) : null;

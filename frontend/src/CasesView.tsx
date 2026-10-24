@@ -3,8 +3,8 @@ import { api, caseName, download, fmt, toCsv, type Project, type ProjectCase } f
 import ProjectMetaEditor from "./ProjectMeta";
 
 // Key settings shown as columns (matched by prefix).
-const KEY_SETTINGS = ["Simulated time (input runtime)", "Wall time", "Iterations", "Impeller speed",
-  "Fluid volume", "dx [m]", "Fluid 1 name", "Fluid 2 name", "Surface tension", "Max Courant"];
+const KEY_SETTINGS = ["Volume [L]", "Agitator speed [rpm]", "Simulated time (input runtime)", "Wall time", "Iterations",
+  "Fluid 1 name", "Fluid 2 name", "dx [m]", "Impeller diameter", "Surface tension", "Max Courant"];
 const END = "Simulated time (end) [s]", RUNTIME = "Simulated time (input runtime) [s]",
       WALL = "Wall time (cumulative) [h]", ITER = "Iterations [count]";
 const num = (v: unknown) => (typeof v === "number" ? v : null);
@@ -92,8 +92,8 @@ export default function CasesView({ project, onChange }: {
   };
 
   const exportTable = () => download(`${project.id}_cases.csv`, toCsv(
-    ["case", "included", "end_time_s", ...cols],
-    project.cases.map((c) => [c.id, c.included, c.info?.end_time_s ?? "",
+    ["case", "case_id", "included", "end_time_s", ...cols],
+    project.cases.map((c) => [c.id, c.uid ?? "", c.included, c.info?.end_time_s ?? "",
       ...cols.map((k) => c.info?.settings?.[k] ?? "")])));
 
   const nIncl = project.cases.filter((c) => c.included).length;
@@ -123,7 +123,7 @@ export default function CasesView({ project, onChange }: {
           <tr>
             <th title="selected: used by Run, Plots, Viewer and the case time series">sel.</th>
             <th title="reference case for % differences">ref</th>
-            <th>case</th><th>simulated [s]</th><th>outputs</th>
+            <th>case</th><th title="unique case ID across all projects (stored in mstar_post_case.json in the case folder)">ID</th><th>simulated [s]</th><th>outputs</th>
             {cols.map((k) => <th key={k}>{k}</th>)}
           </tr>
         </thead>
@@ -133,7 +133,7 @@ export default function CasesView({ project, onChange }: {
               <tr key={`g-${g}`} className="group">
                 <td><input type="checkbox" checked={cs.every((c) => c.included)}
                            onChange={(e) => setIncluded(cs.map((c) => c.id), e.target.checked)} /></td>
-                <td colSpan={4 + cols.length}><b>{g}</b> <span className="muted">({cs.length})</span></td>
+                <td colSpan={5 + cols.length}><b>{g}</b> <span className="muted">({cs.length})</span></td>
               </tr>
             ),
             ...cs.map((c) => (
@@ -144,6 +144,8 @@ export default function CasesView({ project, onChange }: {
                            onChange={() => patch({ ref_case: c.id })} /></td>
                 <td className="mono" title={c.path}>{g ? c.id.slice(g.length + 1) : c.id}
                   {c.info?.error && <span className="error"> {c.info.error}</span>}</td>
+                <td className="mono small nowrap" title={c.id_written === false ? "the case folder is not writable: the id is stored in the project only" : "written to mstar_post_case.json in the case folder"}>
+                  {c.uid ?? ""}{c.id_written === false && <span className="tag">not in folder</span>}</td>
                 <td className="num">{fmt(simTime(c).end)}</td>
                 <td className="small">{(c.info?.output_kinds ?? []).map((k) =>
                   <span key={k} className="tag">{k}</span>)}</td>
@@ -151,7 +153,7 @@ export default function CasesView({ project, onChange }: {
               </tr>
             )),
           ])}
-          {!shown.length && <tr><td colSpan={5 + cols.length} className="muted">
+          {!shown.length && <tr><td colSpan={6 + cols.length} className="muted">
             {project.cases.length ? "No case matches the filter." : "No cases found under this folder: check the path or use Rediscover."}</td></tr>}
         </tbody>
       </table>

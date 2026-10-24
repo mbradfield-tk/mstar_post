@@ -167,6 +167,27 @@ def test_fs_create_and_delete(client, monkeypatch):
     assert client.get("/api/fs/browse", params={"path": str(d)}).json()["writable"] is False
 
 
+def test_case_uids(client):
+    p = client.post("/api/projects", headers={"X-User": "Ada"}, json={"name": "u1", "root": str(client.root)}).json()
+    uids = {c["id"]: c["uid"] for c in p["cases"]}
+    assert len(set(uids.values())) == 3 and all(len(u) == 12 for u in uids.values())
+    marker = json.loads((client.root / "R1" / "caseA" / "mstar_post_case.json").read_text())
+    assert marker["uid"] == uids["R1/caseA"] and marker["created_by"] == "Ada"
+    assert all(c["id_written"] for c in p["cases"])
+    # the same folder in a second project keeps its uid (read from the marker)
+    p2 = client.post("/api/projects", json={"name": "u2", "root": str(client.root / "R1")}).json()
+    assert {c["uid"] for c in p2["cases"]} == {uids["R1/caseA"], uids["R1/caseB"]}
+    # a renamed folder keeps its uid after relocate
+    (client.root / "R2").rename(client.root / "R2x")
+    g = client.post(f"/api/projects/{p['id']}/relocate", json={"cases": {"R2/caseA": str(client.root / "R2x" / "caseA")}}).json()
+    assert next(c for c in g["cases"] if c["id"] == "R2/caseA")["uid"] == uids["R2/caseA"]
+    rows = client.get("/api/cases").json()
+    assert len(rows) == 3  # one row per uid across both projects
+    a = next(r for r in rows if r["uid"] == uids["R1/caseA"])
+    assert sorted(x["id"] for x in a["projects"]) == sorted([p["id"], p2["id"]])
+    assert a["info"]["end_time_s"] == pytest.approx(4.0) and a["name"] == "caseA"
+
+
 def test_project_metadata(client):
     p = client.post("/api/projects", headers={"X-User": "Ada"},
                     json={"name": "meta", "root": str(client.root), "program": " TAK-360 ", "purpose": "pipeline"}).json()
@@ -304,8 +325,9 @@ def wait(client, jid, timeout=60):
 
 
 def test_stats_job_leaves_cases_untouched(client):
-    before = snapshot(client.root)
     p = client.post("/api/projects", json={"name": "p", "root": str(client.root)}).json()
+    before = snapshot(client.root)  # after creation: the case-id marker is the only file the app adds
+    assert {f.name for f, _ in before} >= {"mstar_post_case.json"}
     client.patch(f"/api/projects/{p['id']}", json={"included": {"R1/caseB": False}})
     j = client.post(f"/api/projects/{p['id']}/run",
                     json={"task": "stats_summary", "params": {"time": 1.5, "plot": False}}).json()
@@ -323,6 +345,14 @@ def test_stats_job_leaves_cases_untouched(client):
     assert r.status_code == 200 and r.content[:2] == b"PK"
     assert client.get(f"/api/projects/{p['id']}/file",
                       params={"path": "../../jobs.db"}).status_code == 403
+    # body-name normalisation of existing results (new runs do it as a second job step)
+    assert len(j["commands"]) == 2 and "--rename-body" in j["commands"][1]["argv"]
+    run_dir = Path(j["run_dir"])
+    (run_dir / "extra_means.csv").write_text("case,Impeller Power P (Moving Body) [W],MovingBody_agitator: x [W]\nR1/caseA,1,\nR2/caseA,,2\n")
+    r = client.post(f"/api/projects/{p['id']}/rename-body", params={"run": run_dir.name}).json()
+    assert r["changed"] >= 1 and r["runs"][0]["changed"] >= 1
+    assert (run_dir / "extra_means.csv").read_text().splitlines()[0] == "case,Impeller Power P (Agitator) [W],MovingBody_Agitator: x [W]"
+    assert client.post(f"/api/projects/{p['id']}/rename-body").json()["changed"] == 0  # idempotent
 
 
 def test_run_timeseries(client):

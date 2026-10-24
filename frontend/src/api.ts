@@ -8,6 +8,12 @@ export type CaseInfo = {
 };
 export type ProjectCase = {
   id: string; path: string; stats_dir: string; included: boolean; info?: CaseInfo | null; missing?: boolean;
+  uid?: string; id_written?: boolean;
+};
+export type CatalogCase = {
+  uid: string; path: string; stats_dir: string; name: string; id_written: boolean; missing: boolean;
+  projects: { id: string; name: string; case_id: string; included: boolean; owner: string; program: string; purpose: string }[];
+  info?: CaseInfo | null;
 };
 export type ProjectMeta = { owner: string; program: string; purpose: string };
 export type Project = {
@@ -112,6 +118,7 @@ export const api = {
   imageUrl: (path: string) => `/api/fs/image?${qs({ path })}`,
 
   projects: () => req<ProjectSummary[]>("/api/projects"),
+  allCases: () => req<CatalogCase[]>("/api/cases"),
   project: (id: string, refresh = false) => req<Project>(`/api/projects/${id}${refresh ? "?refresh=true" : ""}`),
   createProject: (name: string, root: string, meta?: Partial<ProjectMeta>) =>
     req<Project>("/api/projects", json("POST", { name, root, ...meta })),
@@ -122,6 +129,9 @@ export const api = {
     req<Project>(`/api/projects/${id}/relocate`, json("POST", body)),
   deleteProject: (id: string) => req(`/api/projects/${id}`, { method: "DELETE" }),
   runs: (id: string) => req<Run[]>(`/api/projects/${id}/runs`),
+  renameBody: (id: string, run?: string) =>
+    req<{ runs: { run: string; changed?: number | null; skipped?: string; error?: string }[]; changed: number; log: string }>(
+      `/api/projects/${id}/rename-body?${qs({ run })}`, { method: "POST" }),
   deleteRun: (id: string, name: string) =>
     req(`/api/projects/${id}/runs/${encodeURIComponent(name)}`, { method: "DELETE" }),
   run: (id: string, task: string, params: Record<string, unknown>, cases?: string[], label?: string) =>

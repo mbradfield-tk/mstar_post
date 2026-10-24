@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import time
 import zipfile
 from pathlib import Path
@@ -16,11 +17,42 @@ from pydantic import BaseModel
 import numpy as np
 
 from app import cases, config, jobs, tasks
+from app import caseid
 from app import cases as cases_mod
 from app.paths import safe_child, safe_path
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+catalog = APIRouter(prefix="/api/cases", tags=["cases"])
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+@catalog.get("")
+def all_cases(details: bool = True, x_user: str | None = Header(None)) -> list[dict]:
+    """Every case of every project, one row per case uid (a folder used by several
+    projects appears once with all of them), with its marker status and case info."""
+    rows: dict[str, dict] = {}
+    taken = caseid.known_uids()
+    for f in sorted(config.PROJECTS_DIR.glob("*/project.json")):
+        try:
+            p = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if caseid.ensure_uids(p, x_user, taken):
+            save(p)
+        for c in p["cases"]:
+            r = rows.setdefault(c["uid"], {
+                "uid": c["uid"], "path": c["path"], "stats_dir": c["stats_dir"],
+                "name": Path(c["path"]).name, "id_written": c.get("id_written", False),
+                "missing": not Path(c["path"]).is_dir(), "projects": []})
+            r["projects"].append({"id": p["id"], "name": p["name"], "case_id": c["id"],
+                                  "included": c["included"], "owner": p.get("owner", ""),
+                                  "program": p.get("program", ""), "purpose": p.get("purpose", "")})
+    out = list(rows.values())
+    if details:
+        for r in out:
+            r["info"] = None if r["missing"] else _safe_info(
+                {"id": r["name"], "path": r["path"], "stats_dir": r["stats_dir"]})
+    return sorted(out, key=lambda r: r["path"])
 
 
 def _dir(pid: str) -> Path:
@@ -48,7 +80,8 @@ def _discover(root: Path, old: dict | None = None) -> tuple[bool, list[dict]]:
     single, found = cases.discover(root)
     prev = {c["id"]: c for c in (old or {}).get("cases", [])}
     return single, [{"id": cid, "path": str(c), "stats_dir": str(s),
-                     "included": prev.get(cid, {}).get("included", True)}
+                     "included": prev.get(cid, {}).get("included", True),
+                     **({"uid": prev[cid]["uid"]} if prev.get(cid, {}).get("uid") else {})}
                     for cid, c, s in found]
 
 
@@ -110,13 +143,17 @@ def create_project(body: NewProject, x_user: str | None = Header(None)) -> dict:
          "ref_case": found[0]["id"], "notes": "",
          "owner": _meta(body.owner) or jobs.clean_user(x_user),
          "program": _meta(body.program), "purpose": _meta(body.purpose)}
+    caseid.ensure_uids(p, x_user)
     save(p)
     return p
 
 
 @router.get("/{pid}")
-def get_project(pid: str, details: bool = True, refresh: bool = False) -> dict:
+def get_project(pid: str, details: bool = True, refresh: bool = False,
+                x_user: str | None = Header(None)) -> dict:
     p = load(pid)
+    if caseid.ensure_uids(p, x_user):  # projects created before case ids existed
+        save(p)
     if refresh:
         for c in p["cases"]:
             cases.forget(Path(c["path"]), Path(c["stats_dir"]))
@@ -198,6 +235,7 @@ def relocate(pid: str, body: Relocate) -> dict:
         if stats is None:
             raise HTTPException(422, f"{path}: no M-Star case (Stats folder) found")
         by_id[cid]["path"], by_id[cid]["stats_dir"] = str(d), str(Path(stats).resolve())
+    caseid.ensure_uids(p)
     save(p)
     for c in p["cases"]:
         cases.forget(Path(c["path"]), Path(c["stats_dir"]))
@@ -205,9 +243,10 @@ def relocate(pid: str, body: Relocate) -> dict:
 
 
 @router.post("/{pid}/rediscover")
-def rediscover(pid: str) -> dict:
+def rediscover(pid: str, x_user: str | None = Header(None)) -> dict:
     p = load(pid)
     p["single"], p["cases"] = _discover(safe_path(p["root"]), p)
+    caseid.ensure_uids(p, x_user)
     save(p)
     return _status(p)
 
@@ -379,6 +418,33 @@ def run_series(pid: str, name: str, file: str, columns: list[str] = Query(...),
 
 
 # ------------------------------------------------------------------ files
+
+@router.post("/{pid}/rename-body")
+def rename_body(pid: str, run: str | None = Query(None)) -> dict:
+    """Rename the impeller body ('Moving Body', 'agitator') to 'Agitator' in the
+    result files of one run or of every finished run of the project (CSV headers
+    and cells with merged columns, HTML, file names; case folders untouched)."""
+    p = load(pid)
+    base = _dir(pid) / "runs"
+    runs = [safe_child(base, run)] if run else sorted(d for d in base.glob("*") if d.is_dir()) if base.is_dir() else []
+    active = {j["run_dir"] for j in jobs.list_jobs(pid) if j["status"] in ("queued", "running")}
+    out, log = [], []
+    for r in runs:
+        if str(r) in active:
+            out.append({"run": r.name, "skipped": "job still active"})
+            continue
+        try:
+            res = subprocess.run(tasks.rename_body_argv(r, p.get("ref_case")), capture_output=True,
+                                 text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            out.append({"run": r.name, "error": "timed out"})
+            continue
+        text = (res.stdout + res.stderr).strip()
+        m = re.search(r"(\d+) file\(s\) updated", text)
+        out.append({"run": r.name, "changed": int(m.group(1)) if m else None,
+                    **({"error": text[-2000:]} if res.returncode else {})})
+        log.append(text)
+    return {"runs": out, "changed": sum(x.get("changed") or 0 for x in out), "log": "\n".join(log)[-20000:]}
 
 @router.get("/{pid}/file")
 def get_file(pid: str, path: str, download: bool = False):
