@@ -10,7 +10,7 @@ import time
 import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import numpy as np
@@ -55,6 +55,9 @@ def _discover(root: Path, old: dict | None = None) -> tuple[bool, list[dict]]:
 class NewProject(BaseModel):
     name: str
     root: str
+    owner: str | None = None
+    program: str | None = None   # associated project / programme name, e.g. TAK-360
+    purpose: str | None = None   # e.g. pipeline, development, reactor characterization
 
 
 class ProjectPatch(BaseModel):
@@ -63,6 +66,17 @@ class ProjectPatch(BaseModel):
     ref_case: str | None = None
     notes: str | None = None
     aliases: dict[str, str] | None = None
+    owner: str | None = None
+    program: str | None = None
+    purpose: str | None = None
+
+
+META_KEYS = ("owner", "program", "purpose")
+_META_MAX = 80
+
+
+def _meta(v: str | None) -> str:
+    return re.sub(r"\s+", " ", (v or "").strip())[:_META_MAX]
 
 
 @router.get("")
@@ -73,14 +87,14 @@ def list_projects() -> list[dict]:
             p = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
-        out.append({k: p.get(k) for k in ("id", "name", "root", "single", "created")}
+        out.append({k: p.get(k) for k in ("id", "name", "root", "single", "created", *META_KEYS)}
                    | {"n_cases": len(p["cases"]),
                       "n_included": sum(c["included"] for c in p["cases"])})
     return sorted(out, key=lambda p: -(p["created"] or 0))
 
 
 @router.post("")
-def create_project(body: NewProject) -> dict:
+def create_project(body: NewProject, x_user: str | None = Header(None)) -> dict:
     root = safe_path(body.root)
     if not root.is_dir():
         raise HTTPException(422, "root must be a directory")
@@ -93,7 +107,9 @@ def create_project(body: NewProject) -> dict:
         pid, i = f"{slug}-{i}", i + 1
     p = {"id": pid, "name": body.name.strip() or pid, "root": str(root),
          "single": single, "created": time.time(), "cases": found,
-         "ref_case": found[0]["id"], "notes": ""}
+         "ref_case": found[0]["id"], "notes": "",
+         "owner": _meta(body.owner) or jobs.clean_user(x_user),
+         "program": _meta(body.program), "purpose": _meta(body.purpose)}
     save(p)
     return p
 
@@ -129,6 +145,10 @@ def patch_project(pid: str, body: ProjectPatch) -> dict:
         p["name"] = body.name
     if body.notes is not None:
         p["notes"] = body.notes
+    for k in META_KEYS:
+        v = getattr(body, k)
+        if v is not None:
+            p[k] = _meta(v)
     if body.ref_case is not None:
         if body.ref_case not in {c["id"] for c in p["cases"]}:
             raise HTTPException(422, "unknown reference case")
@@ -211,7 +231,7 @@ class RunRequest(BaseModel):
 
 
 @router.post("/{pid}/run")
-async def run_task(pid: str, body: RunRequest) -> dict:
+async def run_task(pid: str, body: RunRequest, x_user: str | None = Header(None)) -> dict:
     p = load(pid)
     task = tasks.TASKS.get(body.task)
     if task is None:
@@ -236,7 +256,7 @@ async def run_task(pid: str, body: RunRequest) -> dict:
     label = (body.label or "").strip() or tasks.default_label(task, prm, len(sel))
     label = jobs.unique_label(pid, label)
     return await jobs.manager.submit(pid, task.id, label, cmds, run,
-                                     {"params": prm, "cases": [c["id"] for c in sel]})
+                                     {"params": prm, "cases": [c["id"] for c in sel]}, x_user)
 
 
 @router.get("/{pid}/runs")
@@ -262,6 +282,7 @@ def list_runs(pid: str) -> list[dict]:
                     found[ext].append((rel / f).as_posix())
         out.append({"name": r.name, "path": f"runs/{r.name}", "task": meta.get("task"),
                     "label": j.get("label") or meta.get("label"),
+                    "user": j.get("user") or meta.get("user"),
                     "job_id": meta.get("id"), "status": j.get("status", "unknown"),
                     "params": meta.get("params", {}),
                     "created_at": j.get("created_at"), "finished_at": j.get("finished_at"),

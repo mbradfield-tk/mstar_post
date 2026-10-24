@@ -12,11 +12,13 @@ export const fmtBytes = (b: number | null | undefined): string => {
 };
 const when = (t: number) => new Date(t * 1000).toLocaleString();
 type SortKey = "name" | "size" | "mtime";
+// the only folders where M-Star models are stored: quick locations and the default path
+export const MODEL_DIRS = ["/data/mstar", "/data2/mstar"];
 
 // Read-only server file browser with file sizes, recursive folder sizes and disk usage.
 export default function FilesView() {
   const [roots, setRoots] = useState<string[]>([]);
-  const [path, setPath] = useState(() => localStorage.getItem("mstar_post.files.path") ?? "");
+  const [path, setPath] = useState(() => localStorage.getItem("mstar_post.files.path") ?? MODEL_DIRS[0]);
   const [typed, setTyped] = useState(path);
   const [hidden, setHidden] = useState(false);
   const [listing, setListing] = useState<Browse | null>(null);
@@ -96,7 +98,7 @@ export default function FilesView() {
     api.roots().then((r) => {
       const ok = r.filter((x) => x.exists).map((x) => x.path);
       setRoots(ok);
-      if (!path && ok.length) setPath(ok[0]);
+      if (!path) setPath(MODEL_DIRS.find((d) => ok.some((r) => d === r || d.startsWith(`${r}/`))) ?? ok[0] ?? "");
     }).catch((e) => setError(e.message));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -150,7 +152,10 @@ export default function FilesView() {
   const disk = listing?.disk;
   const usedPct = disk ? (100 * disk.used) / disk.total : 0;
   const root = roots.find((r) => listing?.path === r || listing?.path.startsWith(`${r}/`)) ?? "";
-  const crumbs = listing && root ? [root, ...listing.path.slice(root.length).split("/").filter(Boolean)] : [];
+  // breadcrumbs start at the model folder when inside one, else at the root
+  const base = MODEL_DIRS.find((d) => listing?.path === d || listing?.path.startsWith(`${d}/`)) ?? root;
+  const crumbs = listing && base ? [base, ...listing.path.slice(base.length).split("/").filter(Boolean)] : [];
+  const location = MODEL_DIRS.find((d) => listing?.path === d || listing?.path.startsWith(`${d}/`)) ?? "";
   const head = (k: SortKey, label: string) => (
     <th className="sortable" onClick={() => setSort({ key: k, asc: sort.key === k ? !sort.asc : k === "name" })}>
       {label}{sort.key === k ? (sort.asc ? " \u25b2" : " \u25bc") : ""}</th>
@@ -160,8 +165,9 @@ export default function FilesView() {
     <div className="panel files">
       <div className="row">
         <h2 className="grow">Files</h2>
-        <select value={root} onChange={(e) => setPath(e.target.value)}>
-          {roots.map((r) => <option key={r} value={r}>{r}</option>)}
+        <select value={location} onChange={(e) => e.target.value && setPath(e.target.value)} title="M-Star model locations">
+          {!location && <option value="">other location</option>}
+          {MODEL_DIRS.map((d) => <option key={d} value={d}>{d}</option>)}
         </select>
         <input className="wide mono" value={typed} onChange={(e) => setTyped(e.target.value)}
                onKeyDown={(e) => e.key === "Enter" && setPath(typed)} />
@@ -173,7 +179,7 @@ export default function FilesView() {
       {listing && (
         <div className="row small mono crumbs">
           {crumbs.map((c, i) => {
-            const p = i === 0 ? root : `${root}/${crumbs.slice(1, i + 1).join("/")}`;
+            const p = i === 0 ? base : `${base}/${crumbs.slice(1, i + 1).join("/")}`;
             return <span key={p}>{i > 0 && " / "}<a onClick={() => setPath(p)}>{c}</a></span>;
           })}
           {listing.is_case && <span className="tag">case</span>}

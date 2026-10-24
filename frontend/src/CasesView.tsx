@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { api, caseName, download, fmt, toCsv, type Project, type ProjectCase } from "./api";
+import ProjectMetaEditor from "./ProjectMeta";
 
 // Key settings shown as columns (matched by prefix).
 const KEY_SETTINGS = ["Simulated time (input runtime)", "Wall time", "Iterations", "Impeller speed",
@@ -99,23 +100,28 @@ export default function CasesView({ project, onChange }: {
   return (
     <div className="panel">
       <div className="row">
-        <h2 className="grow">Cases <span className="muted">({nIncl} of {project.cases.length} included)</span></h2>
+        <h2 className="grow">Cases <span className="muted">({nIncl} of {project.cases.length} selected)</span></h2>
         <input placeholder="filter cases" value={filter} onChange={(e) => setFilter(e.target.value)} />
-        <button onClick={() => setIncluded(shown.map((c) => c.id), true)}>Include shown</button>
-        <button onClick={() => setIncluded(shown.map((c) => c.id), false)}>Exclude shown</button>
+        <button onClick={() => setIncluded(shown.map((c) => c.id), true)}>Select shown</button>
+        <button onClick={() => setIncluded(shown.map((c) => c.id), false)}>Deselect shown</button>
         <button onClick={() => setShowDiff(!showDiff)}>{showDiff ? "Hide" : "Compare"} settings</button>
         <button onClick={exportTable}>Export CSV</button>
         <button disabled={busy} onClick={rediscover}>{busy ? "Scanning..." : "Rediscover"}</button>
       </div>
       <div className="muted small mono">{project.root}</div>
-      <div className="small">Included cases: {simTimeSummary(project.cases.filter((c) => c.included))}</div>
+      <ProjectMetaEditor project={project} onChange={onChange} />
+      <div className="small">
+        <span className="muted">Tick the cases to work on: only selected cases are used by Run, Plots, Viewer and the case time series until you change the selection. </span>
+        Selected cases: {simTimeSummary(project.cases.filter((c) => c.included))}
+      </div>
+      {!nIncl && project.cases.length > 0 && <div className="error">No case is selected: the Run, Plots and Viewer tabs have nothing to work on.</div>}
       {error && <div className="error">{error}</div>}
       {showDiff && <SettingsDiff cases={project.cases.filter((c) => c.included)} />}
       <div className="scroll-x">
       <table className="grid">
         <thead>
           <tr>
-            <th title="include in post-processing">incl.</th>
+            <th title="selected: used by Run, Plots, Viewer and the case time series">sel.</th>
             <th title="reference case for % differences">ref</th>
             <th>case</th><th>simulated [s]</th><th>outputs</th>
             {cols.map((k) => <th key={k}>{k}</th>)}
@@ -169,7 +175,7 @@ function SettingsDiff({ cases }: { cases: ProjectCase[] }) {
   return (
     <div className="card">
       <label><input type="checkbox" checked={onlyDiff} onChange={(e) => setOnlyDiff(e.target.checked)} />
-        only settings that differ between included cases</label>
+        only settings that differ between selected cases</label>
       <div className="scroll-x">
         <table className="grid">
           <thead><tr><th>setting</th>{cases.map((c) => <th key={c.id} className="mono">{c.id}</th>)}</tr></thead>

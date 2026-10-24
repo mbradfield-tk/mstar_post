@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, type Job, type Param, type Project, type TaskDef } from "./api";
+import { useUser } from "./user";
 
 type Values = Record<string, unknown>;
 
@@ -19,6 +20,7 @@ export default function RunView({ project, onSubmitted }: {
   const [busy, setBusy] = useState(false);
   const task = tasks.find((t) => t.id === sel);
   const included = project.cases.filter((c) => c.included);
+  const user = useUser();
 
   useEffect(() => { api.tasks().then(setTasks).catch((e) => setError(e.message)); }, []);
   useEffect(() => { if (task) setValues(initial(task)); }, [task]);
@@ -83,7 +85,8 @@ export default function RunView({ project, onSubmitted }: {
               <b>{included.length}</b> included {included.length === 1 ? "case" : "cases"}{task.per_case ? ", run one after another" : ""}:
               <div className="small mono muted">{included.map((c) => c.id).join(", ") || "none: include cases on the Cases tab first"}</div>
               {project.ref_case && <div className="small">reference case: <span className="mono">{project.ref_case}</span></div>}
-              <div className="small muted">Outputs go to the project folder; case folders are only read.</div>
+              <div className="small muted">Outputs go to the project folder; case folders are only read.
+                {" "}The job is recorded as started by <b>{user || "the server account"}</b>{!user && " (set your name in the header to be named instead)"}.</div>
             </div>
             {error && <div className="error">{error}</div>}
             <div className="row">

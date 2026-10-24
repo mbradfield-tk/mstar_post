@@ -111,7 +111,7 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
         {jobs.map((j) => (
           <div key={j.id} className={`taskcard${j.id === selected ? " active" : ""}`} onClick={() => onSelect(j.id)}>
             <span className={`status ${j.status}`}>{j.status}</span> <b>{j.label}</b>
-            <div className="small muted">{when(j.created_at)} {dur(j) && `| ${dur(j)}`}</div>
+            <div className="small muted">{when(j.created_at)} {dur(j) && `| ${dur(j)}`}{j.user && ` | ${j.user}`}</div>
           </div>
         ))}
         {!jobs.length && <div className="muted">No jobs yet: start one on the Run tab.</div>}
@@ -129,6 +129,7 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
             </div>
             {error && <div className="error">{error}</div>}
             <div className="small muted">
+              {job.user && <>started by <b>{job.user}</b> | </>}
               step {Math.min(job.step + 1, job.commands.length)} of {job.commands.length}
               {job.error && <span className="error"> | {job.error}</span>}
               {" | "}<span className="mono">{job.run_dir}</span>

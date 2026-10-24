@@ -9,15 +9,16 @@ export type CaseInfo = {
 export type ProjectCase = {
   id: string; path: string; stats_dir: string; included: boolean; info?: CaseInfo | null; missing?: boolean;
 };
+export type ProjectMeta = { owner: string; program: string; purpose: string };
 export type Project = {
   id: string; name: string; root: string; single: boolean; created: number; root_missing?: boolean;
   cases: ProjectCase[]; ref_case: string | null; notes: string; aliases?: Record<string, string>;
-};
+} & Partial<ProjectMeta>;
 export const caseName = (p: Project, id: string) => p.aliases?.[id] || id;
 export type ProjectSummary = {
   id: string; name: string; root: string; single: boolean; created: number;
   n_cases: number; n_included: number;
-};
+} & Partial<ProjectMeta>;
 export type Param = {
   name: string; label: string; type: "number" | "integer" | "bool" | "string" | "list" | "select";
   default: unknown; help: string; group: string; options?: { value: string; label: string }[];
@@ -27,14 +28,14 @@ export type TaskDef = {
   presets: { label: string; params: Record<string, unknown> }[]; per_case: boolean;
 };
 export type Job = {
-  id: string; project: string; task: string; label: string;
+  id: string; project: string; task: string; label: string; user?: string | null;
   status: "queued" | "running" | "done" | "failed" | "cancelled";
   commands: { argv: string[] }[]; run_dir: string; created_at: number;
   started_at: number | null; finished_at: number | null; returncode: number | null;
   step: number; params: { params: Record<string, unknown>; cases: string[] }; error: string | null;
 };
 export type Run = {
-  name: string; path: string; task: string | null; label: string | null; job_id: string | null;
+  name: string; path: string; task: string | null; label: string | null; job_id: string | null; user?: string | null;
   status: string; params: Record<string, unknown>; created_at: number | null;
   finished_at: number | null; csvs: string[]; htmls: string[]; images: string[];
 };
@@ -62,7 +63,10 @@ export type DirUsage = { path: string; bytes: number; apparent: number; files: n
   truncated: boolean; seconds: number; cached: boolean };
 
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(url, init);
+  const user = localStorage.getItem("mstar_post.user");
+  const headers = new Headers(init?.headers);
+  if (user) headers.set("X-User", user);
+  const r = await fetch(url, { ...init, headers });
   if (!r.ok) {
     let msg = `${r.status} ${r.statusText}`;
     try {
@@ -109,10 +113,10 @@ export const api = {
 
   projects: () => req<ProjectSummary[]>("/api/projects"),
   project: (id: string, refresh = false) => req<Project>(`/api/projects/${id}${refresh ? "?refresh=true" : ""}`),
-  createProject: (name: string, root: string) =>
-    req<Project>("/api/projects", json("POST", { name, root })),
+  createProject: (name: string, root: string, meta?: Partial<ProjectMeta>) =>
+    req<Project>("/api/projects", json("POST", { name, root, ...meta })),
   patchProject: (id: string, body: Partial<{ name: string; included: Record<string, boolean>;
-    ref_case: string; notes: string; aliases: Record<string, string> }>) => req<Project>(`/api/projects/${id}`, json("PATCH", body)),
+    ref_case: string; notes: string; aliases: Record<string, string> } & ProjectMeta>) => req<Project>(`/api/projects/${id}`, json("PATCH", body)),
   rediscover: (id: string) => req<Project>(`/api/projects/${id}/rediscover`, { method: "POST" }),
   relocate: (id: string, body: { root?: string; cases?: Record<string, string> }) =>
     req<Project>(`/api/projects/${id}/relocate`, json("POST", body)),

@@ -1,7 +1,7 @@
 """Job listing, logs, cancel and live status over WebSocket."""
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Header, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from app import jobs, tasks
@@ -66,11 +66,11 @@ async def rename(jid: str, body: RenameRequest) -> dict:
 
 
 @router.post("/jobs/{jid}/rerun")
-async def rerun(jid: str) -> dict:
+async def rerun(jid: str, x_user: str | None = Header(None)) -> dict:
     """Delete a finished job's results and run its commands again."""
     _job(jid)
     try:
-        return await jobs.manager.rerun(jid)
+        return await jobs.manager.rerun(jid, x_user)
     except RuntimeError as e:
         raise HTTPException(409, str(e))
     except ValueError as e:

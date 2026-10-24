@@ -167,6 +167,16 @@ def test_fs_create_and_delete(client, monkeypatch):
     assert client.get("/api/fs/browse", params={"path": str(d)}).json()["writable"] is False
 
 
+def test_project_metadata(client):
+    p = client.post("/api/projects", headers={"X-User": "Ada"},
+                    json={"name": "meta", "root": str(client.root), "program": " TAK-360 ", "purpose": "pipeline"}).json()
+    assert (p["owner"], p["program"], p["purpose"]) == ("Ada", "TAK-360", "pipeline")  # owner defaults to the user
+    p = client.patch(f"/api/projects/{p['id']}", json={"owner": "Bob", "purpose": "x" * 100}).json()
+    assert p["owner"] == "Bob" and len(p["purpose"]) == 80 and p["program"] == "TAK-360"
+    s = next(x for x in client.get("/api/projects").json() if x["id"] == p["id"])
+    assert (s["owner"], s["program"]) == ("Bob", "TAK-360")
+
+
 def test_project_and_inventory(client):
     p = client.post("/api/projects", json={"name": "step 8", "root": str(client.root)}).json()
     assert [c["id"] for c in p["cases"]] == ["R1/caseA", "R1/caseB", "R2/caseA"]
@@ -368,15 +378,18 @@ def test_run_timeseries_single_case(client):
 
 def test_job_rerun_and_delete(client):
     p = client.post("/api/projects", json={"name": "rr", "root": str(client.root)}).json()
-    j = client.post(f"/api/projects/{p['id']}/run",
+    j = client.post(f"/api/projects/{p['id']}/run", headers={"X-User": "  Ada <L>  "},
                     json={"task": "stats_summary", "params": {"time": 1.5, "plot": False}}).json()
+    assert j["user"] == "Ada L"  # X-User header, cleaned
     j = wait(client, j["id"])
     assert j["status"] == "done"
     run = Path(j["run_dir"])
+    assert json.loads((run / "job.json").read_text())["user"] == "Ada L"
+    assert client.get(f"/api/projects/{p['id']}/runs").json()[0]["user"] == "Ada L"
     marker = run / "stale.txt"
     marker.write_text("old")
-    j2 = client.post(f"/api/jobs/{j['id']}/rerun").json()
-    assert j2["id"] == j["id"] and j2["status"] in ("queued", "running")
+    j2 = client.post(f"/api/jobs/{j['id']}/rerun", headers={"X-User": "Bob"}).json()
+    assert j2["id"] == j["id"] and j2["status"] in ("queued", "running") and j2["user"] == "Bob"
     assert not marker.exists()
     j2 = wait(client, j["id"])
     assert j2["status"] == "done" and (run / "batch_summary.csv").is_file()

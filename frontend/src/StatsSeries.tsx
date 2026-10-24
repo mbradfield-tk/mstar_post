@@ -13,7 +13,9 @@ export default function StatsSeries({ project, cases, style, onSelect }: {
   project: Project; cases?: ProjectCase[]; style?: PlotStyle;
   onSelect?: (caseId: string, file: string, src: string) => void;
 }) {
-  const list = cases?.length ? cases : project.cases;
+  // selected (included) cases of the project unless the caller passes a list; all cases if none is selected
+  const included = project.cases.filter((c) => c.included);
+  const list = cases?.length ? cases : included.length ? included : project.cases;
   const saved = useMemo(() => {
     try { return JSON.parse(localStorage.getItem(`${KEY}.${project.id}`) ?? "{}"); } catch { return {}; }
   }, [project.id]);

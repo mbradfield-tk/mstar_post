@@ -7,8 +7,10 @@ WebSocket subscribers.
 from __future__ import annotations
 
 import asyncio
+import getpass
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -21,8 +23,20 @@ from app.paths import under
 
 _COLS = ("id", "project", "task", "label", "status", "commands", "run_dir",
          "created_at", "started_at", "finished_at", "returncode", "pid", "step",
-         "params", "error")
+         "params", "error", "user")
 _KILL_GRACE_S = 10.0
+
+
+def clean_user(name: str | None) -> str:
+    """Display name of the person who started a job: the browser's X-User header
+    (printable, <= 64 chars) or, without one, the account running the server."""
+    n = re.sub(r"[^\w .@'\-]", "", (name or "").strip())[:64].strip()
+    if n:
+        return n
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "unknown"
 
 
 def _conn() -> sqlite3.Connection:
@@ -37,7 +51,9 @@ def init_db() -> None:
             id TEXT PRIMARY KEY, project TEXT, task TEXT, label TEXT, status TEXT,
             commands TEXT, run_dir TEXT, created_at REAL, started_at REAL,
             finished_at REAL, returncode INTEGER, pid INTEGER, step INTEGER,
-            params TEXT, error TEXT)""")
+            params TEXT, error TEXT, user TEXT)""")
+        if "user" not in {r[1] for r in c.execute("PRAGMA table_info(jobs)")}:  # older databases
+            c.execute("ALTER TABLE jobs ADD COLUMN user TEXT")
 
 
 def _row(r: sqlite3.Row | None) -> dict | None:
@@ -133,17 +149,19 @@ class JobManager:
             t.cancel()
 
     async def submit(self, project: str, task: str, label: str,
-                     commands: list[dict], run_dir: Path, params: dict) -> dict:
+                     commands: list[dict], run_dir: Path, params: dict,
+                     user: str | None = None) -> dict:
         jid = uuid.uuid4().hex[:12]
+        user = clean_user(user)
         run_dir.mkdir(parents=True, exist_ok=True)
         with _conn() as c:
             c.execute(f"INSERT INTO jobs ({', '.join(_COLS)}) VALUES "
                       f"({', '.join('?' * len(_COLS))})",
                       (jid, project, task, label, "queued", json.dumps(commands),
                        str(run_dir), time.time(), None, None, None, None, 0,
-                       json.dumps(params), None))
+                       json.dumps(params), None, user))
         (run_dir / "job.json").write_text(json.dumps(
-            {"id": jid, "task": task, "label": label, "params": params,
+            {"id": jid, "task": task, "label": label, "user": user, "params": params,
              "commands": commands}, indent=2))
         await self._broadcast(jid)
         await self._dispatch()
@@ -182,15 +200,17 @@ class JobManager:
             except Exception:
                 self._sockets.discard(ws)
 
-    async def rerun(self, jid: str) -> dict:
-        """Delete a finished job's outputs and queue its commands again."""
+    async def rerun(self, jid: str, user: str | None = None) -> dict:
+        """Delete a finished job's outputs and queue its commands again; the job
+        is then attributed to the user re-running it."""
         j = self._idle(jid)
+        user = clean_user(user)
         run = _clear_run_dir(j, recreate=True)
         (run / "job.json").write_text(json.dumps(
-            {"id": jid, "task": j["task"], "label": j["label"], "params": j["params"],
-             "commands": j["commands"]}, indent=2))
+            {"id": jid, "task": j["task"], "label": j["label"], "user": user,
+             "params": j["params"], "commands": j["commands"]}, indent=2))
         _update(jid, status="queued", created_at=time.time(), started_at=None,
-                finished_at=None, returncode=None, pid=None, step=0, error=None)
+                finished_at=None, returncode=None, pid=None, step=0, error=None, user=user)
         await self._broadcast(jid)
         await self._dispatch()
         return get_job(jid)

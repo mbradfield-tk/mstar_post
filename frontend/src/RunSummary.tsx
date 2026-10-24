@@ -171,6 +171,7 @@ export default function RunSummary({ project, run, task, onOpenFile }: {
           <div className="small muted" style={{ marginTop: 6 }}>
             {run.created_at && new Date(run.created_at * 1000).toLocaleString()}
             {dur(run.created_at, run.finished_at) && <> &middot; took {dur(run.created_at, run.finished_at)}</>}
+            {run.user && <> &middot; started by <b>{run.user}</b></>}
             {" "}&middot; <span className={`status ${run.status}`}>{run.status}</span>
           </div>
         </div>

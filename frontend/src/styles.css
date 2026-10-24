@@ -99,11 +99,30 @@ header .tab { background: transparent; color: #cbd5e1; border: 1px solid transpa
 header .tab:hover:not(:disabled) { background: var(--tab-hover); border-color: transparent; color: #fff; }
 header .tab.active { background: var(--accent-strong); color: #fff; }
 header .theme-toggle { border-color: rgba(255, 255, 255, 0.2); min-width: 64px; }
+header .user-btn { border-color: rgba(255, 255, 255, 0.2); max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+header .user-btn::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--ok); vertical-align: 1px; }
+header .user-btn.unset { color: #fcd34d; }
+header .user-btn.unset::before { background: #f59e0b; }
 main { padding: 12px; flex: 1; }
 
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; box-shadow: var(--shadow); }
 .card { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin: 8px 0; }
 .welcome { max-width: 860px; margin: 40px auto; }
+.dashboard { max-width: 1100px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+.dashboard .welcome { margin: 20px 0 0; max-width: none; }
+.project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; margin-top: 8px; }
+.project-card { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; cursor: pointer;
+  display: flex; flex-direction: column; gap: 4px; transition: border-color 0.12s, transform 0.12s, box-shadow 0.12s; }
+.project-card:hover { border-color: var(--accent); transform: translateY(-1px); box-shadow: var(--shadow); }
+.project-card.active { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.project-card .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-stats { display: flex; gap: 14px; flex-wrap: wrap; margin: 2px 0 4px; }
+.meta-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0; min-height: 20px; }
+.chip.meta { cursor: pointer; background: var(--control); color: var(--text); padding: 1px 8px; }
+.chip.meta:hover { background: var(--control-hover); }
+.chip.meta.on { background: var(--accent-bg); color: var(--accent); outline: 1px solid var(--accent); }
+.meta-row input { width: 200px; }
+header .brand[role="button"] { cursor: pointer; }
 .welcome > h2 { background: linear-gradient(90deg, var(--accent), #a78bfa); -webkit-background-clip: text; background-clip: text; color: transparent; }
 .feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin: 14px 0 18px; }
 .feature { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; border-top: 3px solid var(--accent); }

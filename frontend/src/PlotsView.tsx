@@ -41,8 +41,8 @@ export default function PlotsView({ project, onProjectChange, active, onReset }:
         ))}
         <label title="baseline for '% vs ref' in all plot modes (the project reference case is set on the Cases tab)">Reference case{" "}
           <select value={ref} onChange={(e) => setRef(e.target.value)}>
-            {project.cases.map((c) => <option key={c.id} value={c.id}>{caseName(project, c.id)}
-              {c.id === project.ref_case ? " (project ref)" : ""}</option>)}
+            {project.cases.filter((c) => c.included || c.id === ref).map((c) => <option key={c.id} value={c.id}>{caseName(project, c.id)}
+              {c.id === project.ref_case ? " (project ref)" : ""}{c.included ? "" : " (not selected)"}</option>)}
           </select></label>
         <button onClick={async () => await ui.confirm({ title: "Reset Plots?", ok: "Reset",
           body: <p>All panels, sources, case selections and the reference case go back to the defaults. Plot style and case names are kept.</p> }) && onReset()}>Reset</button>
@@ -485,8 +485,11 @@ function MeansPlots({ project, view, style, active, refCase }: {
     return () => { stale = true; };
   }, [srcs.join("|"), runs]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const allCases = merged?.rows.map((r) => String(r[0])) ?? [];
-  const shown = merged ? merged.rows.filter((r) => !excluded.includes(String(r[0]))) : [];
+  // cases deselected on the Cases tab are left out; cases unknown to the project (e.g. renamed) stay
+  const deselected = new Set(project.cases.filter((c) => !c.included).map((c) => c.id));
+  const allCases = merged?.rows.map((r) => String(r[0])).filter((c) => !deselected.has(c)) ?? [];
+  const nHidden = merged ? merged.rows.length - allCases.length : 0;
+  const shown = merged ? merged.rows.filter((r) => allCases.includes(String(r[0])) && !excluded.includes(String(r[0]))) : [];
   const table = merged && { columns: merged.columns, rows: shown };
   const cases = shown.map((r) => String(r[0]));
   const names = cases.map((c) => caseName(project, c));
@@ -548,6 +551,7 @@ function MeansPlots({ project, view, style, active, refCase }: {
               <b className="small">Cases ({cases.length}/{allCases.length})</b>{" "}
               <button onClick={() => setExcluded([])}>all</button>
               <button onClick={() => setExcluded(allCases)}>none</button>
+              {nHidden > 0 && <span className="small muted"> {nHidden} not selected on the Cases tab</span>}
               <div className="checklist">
                 {allCases.map((c, i) => (
                   <label key={c} className="small" title={`${c}\n${merged.origin[i]}`}><input type="checkbox" checked={!excluded.includes(c)}

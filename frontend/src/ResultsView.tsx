@@ -96,7 +96,7 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
         {runs.map((r) => (
           <div key={r.name} className={`taskcard${r.name === runName ? " active" : ""}`} onClick={() => onRunChange(r.name)}>
             <span className={`status ${r.status}`}>{r.status}</span> <b>{r.label ?? r.task}</b>
-            <div className="small muted">{when(r.created_at)}
+            <div className="small muted">{when(r.created_at)}{r.user && <> &middot; {r.user}</>}
               {Array.isArray(r.params?.cases) && <> &middot; {(r.params.cases as string[]).length} case{(r.params.cases as string[]).length === 1 ? "" : "s"}</>}</div>
           </div>
         ))}
