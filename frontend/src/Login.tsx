@@ -28,10 +28,10 @@ export default function LoginDialog({ onClose, passwordLogin, reason }: {
         <p className="small">Guests can view everything. To select cases, run calculations, edit projects or browse
           files, log in with your <b>server account</b> (the one you use for SSH).</p>
         {passwordLogin ? (
-          <form onSubmit={(e) => { e.preventDefault(); submit(); }}>
-            <label>User name <input className="wide" autoFocus autoComplete="username" value={user}
+          <form className="login-form" onSubmit={(e) => { e.preventDefault(); submit(); }}>
+            <label>User name<input autoFocus autoComplete="username" value={user}
                                     onChange={(e) => setUser(e.target.value)} /></label>
-            <label>Password <input className="wide" type="password" autoComplete="current-password" value={pw}
+            <label>Password<input type="password" autoComplete="current-password" value={pw}
                                    onChange={(e) => setPw(e.target.value)} /></label>
             {error && <div className="error">{error}</div>}
             <div className="modal-actions">

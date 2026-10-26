@@ -18,7 +18,8 @@ export default function DirBrowser({ onSelect, initial }: {
     api.roots().then((r) => {
       const ok = r.filter((x) => x.exists).map((x) => x.path);
       setRoots(ok);
-      if (!path && ok.length) setPath(ok[0]);
+      // fall back to the first root when the initial folder is outside the roots
+      if (!path || !ok.some((x) => path === x || path.startsWith(`${x}/`))) setPath(ok[0] ?? "");
     }).catch((e) => setError(String(e)));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -27,8 +28,12 @@ export default function DirBrowser({ onSelect, initial }: {
     setError(null);
     setLoading(true);
     api.listDir(path).then((l) => { setListing(l); setTyped(l.path); })
-      .catch((e) => setError(e.message)).finally(() => setLoading(false));
-  }, [path]);
+      .catch((e) => {
+        // a missing initial folder falls back to its root instead of showing an error
+        const root = roots.find((r) => path !== r && path.startsWith(`${r}/`));
+        if (path === initial && root) setPath(root); else setError(e.message);
+      }).finally(() => setLoading(false));
+  }, [path]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="dirbrowser">

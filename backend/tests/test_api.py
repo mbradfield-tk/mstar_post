@@ -111,10 +111,11 @@ def snapshot(root: Path) -> list:
     return sorted((p, p.stat().st_mtime_ns) for p in root.rglob("*"))
 
 
-def test_tunnel_identity():
+def test_tunnel_identity(tmp_path, monkeypatch):
     """The owner of a loopback client socket is found in /proc/net/tcp (SSH tunnel login)."""
     import os
     import socket
+    monkeypatch.setattr(config, "SECRET_PATH", tmp_path / "secret.key")
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
     srv.listen(1)
@@ -303,13 +304,15 @@ def test_case_uids(client):
 
 
 def test_project_metadata(client):
-    p = client.post("/api/projects",
-                    json={"name": "meta", "root": str(client.root), "program": " TAK-360 ", "purpose": "pipeline"}).json()
-    assert (p["owner"], p["program"], p["purpose"]) == ("tester", "TAK-360", "pipeline")  # owner defaults to the user
-    p = client.patch(f"/api/projects/{p['id']}", json={"owner": "Bob", "purpose": "x" * 100}).json()
-    assert p["owner"] == "Bob" and len(p["purpose"]) == 80 and p["program"] == "TAK-360"
+    p = client.post("/api/projects", json={"name": "meta", "root": str(client.root), "owner": "someone else",
+                                              "program": " TAK-360 ", "purpose": "pipeline"}).json()
+    assert (p["owner"], p["program"], p["purpose"]) == ("tester", "TAK-360", "pipeline")  # owner = the creating account
+    # the owner is fixed: even its creator (or an admin) cannot change it; same value is a no-op
+    assert client.patch(f"/api/projects/{p['id']}", json={"owner": "Bob"}).status_code == 403
+    p = client.patch(f"/api/projects/{p['id']}", json={"owner": "tester", "purpose": "x" * 100}).json()
+    assert p["owner"] == "tester" and len(p["purpose"]) == 80 and p["program"] == "TAK-360"
     s = next(x for x in client.get("/api/projects").json() if x["id"] == p["id"])
-    assert (s["owner"], s["program"]) == ("Bob", "TAK-360")
+    assert (s["owner"], s["program"]) == ("tester", "TAK-360")
 
 
 def test_project_and_inventory(client):

@@ -65,6 +65,12 @@ export type Browse = { path: string; parent: string | null; is_case: boolean; en
   truncated: boolean; writable: boolean; disk: { total: number; used: number; free: number } };
 export type WhoAmI = { user: string | null; method: "ssh" | "password" | "none"; admin: boolean;
   password_login: boolean; server_account: string };
+export type GpuProcess = { pid: number; memory_used_mib: number | null; name: string; user: string | null;
+  cmdline: string | null; cwd: string | null; started: number | null };
+export type Gpu = { index: number; uuid: string; name: string; memory_total_mib: number | null; memory_used_mib: number | null;
+  memory_free_mib: number | null; memory_free_pct: number | null; utilization_pct: number | null; temperature_c: number | null;
+  power_w: number | null; power_limit_w: number | null; clock_mhz: number | null; processes: GpuProcess[]; users: string[] };
+export type GpuStatus = { available: boolean; error?: string; gpus: Gpu[]; time: number; host?: string };
 export type FileChunk = { path: string; size: number; mtime: number; offset: number; end: number;
   binary: boolean; text: string; image: boolean };
 export type DirUsage = { path: string; bytes: number; apparent: number; files: number; dirs: number;
@@ -101,6 +107,7 @@ export const api = {
   whoami: () => req<WhoAmI>("/api/whoami"),
   login: (user: string, password: string) => req<{ user: string }>("/api/login", json("POST", { user, password })),
   logout: () => req<{ user: null }>("/api/logout", { method: "POST" }),
+  gpus: () => req<GpuStatus>("/api/gpus"),
   roots: () => req<{ path: string; exists: boolean }[]>("/api/fs/roots"),
   listDir: (path: string) => req<{
     path: string; parent: string | null; is_case: boolean;

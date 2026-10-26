@@ -143,7 +143,7 @@ def create_project(body: NewProject, me: Identity = Depends(require_user)) -> di
     p = {"id": pid, "name": body.name.strip() or pid, "root": str(root),
          "single": single, "created": time.time(), "cases": found,
          "ref_case": found[0]["id"], "notes": "",
-         "owner": _meta(body.owner) or me.user, "created_by": me.user,
+         "owner": me.user, "created_by": me.user,
          "program": _meta(body.program), "purpose": _meta(body.purpose)}
     caseid.ensure_uids(p, me.user)
     save(p)
@@ -187,8 +187,10 @@ def patch_project(pid: str, body: ProjectPatch, me: Identity = Depends(require_u
     for k in META_KEYS:
         v = getattr(body, k)
         if v is not None:
-            if k == "owner" and _meta(v) != p.get("owner", ""):
-                require_manage(me, "project owner", p.get("owner"), p.get("created_by"))
+            if k == "owner":
+                if _meta(v) != p.get("owner", ""):
+                    raise HTTPException(403, "the project owner is fixed at creation and cannot be changed")
+                continue
             p[k] = _meta(v)
     if body.ref_case is not None:
         if body.ref_case not in {c["id"] for c in p["cases"]}:

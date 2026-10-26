@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api, type Project, type ProjectMeta, type ProjectSummary } from "./api";
 
 export const META_FIELDS: { key: keyof ProjectMeta; label: string; hint: string }[] = [
-  { key: "owner", label: "Owner", hint: "person responsible for this project" },
+  { key: "owner", label: "Owner", hint: "the account creating the project (fixed afterwards)" },
   { key: "program", label: "Associated project", hint: "e.g. TAK-360" },
   { key: "purpose", label: "Purpose", hint: "e.g. pipeline, development, reactor characterization" },
 ];
@@ -11,7 +11,7 @@ export const META_FIELDS: { key: keyof ProjectMeta; label: string; hint: string 
 export const metaValues = (ps: ProjectSummary[], k: keyof ProjectMeta): string[] =>
   [...new Set(ps.map((p) => (p[k] ?? "").trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
 
-// Editable owner / associated project / purpose of an open project; saved on blur or Enter.
+// Owner (fixed at creation, shown read-only) and editable associated project / purpose; saved on blur or Enter.
 export default function ProjectMetaEditor({ project, onChange, suggestions }: {
   project: Project; onChange: (p: Project) => void; suggestions?: Partial<Record<keyof ProjectMeta, string[]>>;
 }) {
@@ -32,7 +32,8 @@ export default function ProjectMetaEditor({ project, onChange, suggestions }: {
   };
   return (
     <div className="row small meta-row">
-      {META_FIELDS.map(({ key, label, hint }) => (
+      <span title="the account that created the project; cannot be changed"><span className="muted">Owner</span> <b>{project.owner || "\u2014"}</b></span>
+      {META_FIELDS.filter(({ key }) => key !== "owner").map(({ key, label, hint }) => (
         <label key={key} title={hint}>{label}{" "}
           <input value={vals[key]} placeholder={hint} list={suggestions?.[key]?.length ? `meta-${key}` : undefined}
                  onChange={(e) => setVals({ ...vals, [key]: e.target.value })}

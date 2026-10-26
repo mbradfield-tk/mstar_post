@@ -8,6 +8,7 @@ import Dashboard from "./Dashboard";
 import DirBrowser from "./DirBrowser";
 import { useDialog } from "./Dialog";
 import FilesView from "./FilesView";
+import GpuView from "./GpuView";
 import Relocate from "./Relocate";
 import JobsView from "./JobsView";
 import PlotsView from "./PlotsView";
@@ -17,8 +18,8 @@ import RunView from "./RunView";
 import TheoryView from "./TheoryView";
 import ViewerView from "./ViewerView";
 
-const TABS = ["Cases", "Run", "Jobs", "Results", "Plots", "Viewer", "Files", "Theory"] as const;
-const GLOBAL_TABS: readonly string[] = ["Files", "Theory"];  // usable without a project
+const TABS = ["Cases", "Run", "Jobs", "Results", "Plots", "Viewer", "Files", "GPUs", "Theory"] as const;
+const GLOBAL_TABS: readonly string[] = ["Files", "GPUs", "Theory"];  // usable without a project
 type Tab = (typeof TABS)[number];
 
 // number of queued/running jobs of a project, kept live over the jobs WebSocket
@@ -176,7 +177,7 @@ export default function App() {
       <main>
         {showDash && (
           <Dashboard projects={projects} current={pid} lastOpened={lastOpened} onOpen={open} onNew={() => setCreating(true)}
-                     onDelete={del} onFiles={() => go("Files")} onTheory={() => go("Theory")} />
+                     onDelete={del} onFiles={() => go("Files")} onTheory={() => go("Theory")} onGpus={() => go("GPUs")} />
         )}
         {project && showTab && !GLOBAL_TABS.includes(tab) && (
           <Relocate key={project.id} project={project} onChange={(p) => {
@@ -186,6 +187,7 @@ export default function App() {
           }} />
         )}
         {visited.has("Theory") && <Pane show={showTab && tab === "Theory"}><TheoryView /></Pane>}
+        {visited.has("GPUs") && <Pane show={showTab && tab === "GPUs"}><GpuView active={showTab && tab === "GPUs"} /></Pane>}
         {visited.has("Files") && <Pane show={showTab && tab === "Files"}>
           {me.user ? <FilesView key={me.user} /> : (
             <div className="panel">
@@ -235,16 +237,16 @@ function NewProject({ onClose, onCreated, projects }: { onClose: () => void; onC
   const [root, setRoot] = useState("");
   const [name, setName] = useState("");
   const me = useUser();
-  const user = me.user ?? "";
-  const [meta, setMeta] = useState<ProjectMeta>({ owner: user, program: "", purpose: "" });
-  useEffect(() => { setMeta((m) => (m.owner ? m : { ...m, owner: user })); }, [user]);
+  const [meta, setMeta] = useState<ProjectMeta>({ owner: "", program: "", purpose: "" });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const create = async () => {
     setBusy(true);
     setError(null);
     try {
-      onCreated(await api.createProject(name || root.split("/").filter(Boolean).slice(-2).join("_"), root, meta));
+      // the owner is always the logged-in account (the server ignores anything else)
+      onCreated(await api.createProject(name || root.split("/").filter(Boolean).slice(-2).join("_"), root,
+                                        { program: meta.program, purpose: meta.purpose }));
     } catch (e) { setError((e as Error).message); }
     setBusy(false);
   };
@@ -252,13 +254,14 @@ function NewProject({ onClose, onCreated, projects }: { onClose: () => void; onC
     <div className="panel">
       <div className="row"><h2 className="grow">New project</h2><button onClick={onClose}>Close</button></div>
       <p className="muted">Pick a study folder (all cases below it are discovered) or a single case folder.</p>
-      <DirBrowser onSelect={setRoot} />
+      <DirBrowser onSelect={setRoot} initial="/data2/mstar" />
       <div className="row">
         <label>Folder <input className="wide mono" value={root} onChange={(e) => setRoot(e.target.value)} /></label>
         <label>Name <input value={name} placeholder="default: folder name" onChange={(e) => setName(e.target.value)} /></label>
       </div>
       <div className="row small">
-        {META_FIELDS.map(({ key, label, hint }) => (
+        <span title="the project owner is your account and cannot be changed later"><span className="muted">Owner</span> <b>{me.user ?? "\u2014"}</b></span>
+        {META_FIELDS.filter(({ key }) => key !== "owner").map(({ key, label, hint }) => (
           <label key={key} title={hint}>{label}{" "}
             <input value={meta[key]} placeholder={hint} list={`new-meta-${key}`}
                    onChange={(e) => setMeta({ ...meta, [key]: e.target.value })} />

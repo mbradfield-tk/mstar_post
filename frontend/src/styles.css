@@ -278,6 +278,12 @@ fieldset.section.closed { padding-bottom: 0; border-left-color: transparent; bor
 .usagebar > div { height: 100%; background: var(--accent-strong); }
 .usagebar > div.warn { background: #d97706; }
 .usagebar > div.bad { background: #dc2626; }
+.usagebar.thin { height: 5px; margin: 3px 0 0; min-width: 70px; }
+.gpu-table td.free.ok b { color: var(--ok); }
+.gpu-table td.free.warn b { color: #d97706; }
+.gpu-table td.free.bad b { color: var(--bad); }
+.gpu-table tr.gpu-procs > td { background: var(--panel-2); padding: 6px 10px; }
+.gpu-table tr.gpu-procs table { margin: 0; }
 .sharebar { width: 120px; height: 8px; background: var(--control); border-radius: 4px; overflow: hidden; }
 .sharebar > div { height: 100%; background: var(--accent); }
 textarea.paste { width: 100%; background: var(--control); color: var(--text); border: 1px solid var(--control-line);
@@ -294,6 +300,8 @@ input.short-wide { width: 170px; }
 .modal-body p { margin: 6px 0; line-height: 1.45; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .modal > input.wide { width: 100%; }
+.login-form label { display: block; margin: 10px 0; font-weight: 600; }
+.login-form label input { display: block; width: 100%; margin-top: 4px; font-weight: normal; }
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes pop-in { from { opacity: 0; transform: translateY(6px) scale(0.98); } }
 .modal .mono { word-break: break-all; }

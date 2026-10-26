@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import config, jobs
-from app.routers import auth, case, fs, projects
+from app.routers import auth, case, fs, gpus, projects
 from app.routers import jobs as jobs_router
 
 DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="M-Star Post", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=4096)
-for r in (auth.router, fs.router, projects.router, projects.catalog, case.router, jobs_router.router):
+for r in (auth.router, fs.router, projects.router, projects.catalog, case.router, jobs_router.router, gpus.router):
     app.include_router(r)
 
 

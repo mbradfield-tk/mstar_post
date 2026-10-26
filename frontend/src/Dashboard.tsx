@@ -9,7 +9,7 @@ const FILTER_KEY = "mstar_post.dashboard.filters";
 type Filters = Partial<Record<keyof ProjectMeta, string>>;
 
 // Start page: every project as a card; open one, create or delete.
-export default function Dashboard({ projects, current, lastOpened, onOpen, onNew, onDelete, onFiles, onTheory }: {
+export default function Dashboard({ projects, current, lastOpened, onOpen, onNew, onDelete, onFiles, onTheory, onGpus }: {
   projects: ProjectSummary[];
   current: string | null;
   lastOpened: string | null;
@@ -18,6 +18,7 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
   onDelete: (p: ProjectSummary) => void;
   onFiles: () => void;
   onTheory: () => void;
+  onGpus: () => void;
 }) {
   const [filter, setFilter] = useState("");
   const me = useUser();
@@ -64,6 +65,7 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
           </span>
           <span className="grow" />
           <button onClick={onFiles}>Browse files</button>
+          <button onClick={onGpus} title="which GPUs are free and what is running on them">GPUs</button>
           <button onClick={onTheory}>Theory</button>
         </div>
       </div>
