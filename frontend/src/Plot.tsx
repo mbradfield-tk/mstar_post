@@ -61,7 +61,8 @@ export default function Plot({ data, layout, height = 420, exportName = "plot", 
     const el = ref.current;
     if (!el) return;
     const base = (layout ?? {}) as Record<string, unknown>;
-    const lay = themed(flatRanges(data, style ? styleLayout(style, base) : base), theme) as Partial<Plotly.Layout>;
+    const nLegend = (data as Record<string, unknown>[]).filter((tr) => tr.showlegend !== false).length;
+    const lay = themed(flatRanges(data, style ? styleLayout(style, base, nLegend) : base), theme) as Partial<Plotly.Layout>;
     Plotly.react(el, data, {
       margin: { t: 40, r: 20, b: 50, l: 70 },
       height, autosize: true, ...lay,

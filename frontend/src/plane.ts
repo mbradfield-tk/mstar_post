@@ -21,6 +21,11 @@ function evict() {
   }
 }
 
+export function clearPlaneCache(): void {
+  cache.clear();
+  sizes.clear();
+}
+
 export function fetchPlane(url: string): Promise<Plane> {
   const hit = cache.get(url);
   if (hit) {

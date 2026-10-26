@@ -46,6 +46,10 @@ export class CameraSync {
 }
 
 const stlCache = new Map<string, Promise<THREE.BufferGeometry>>();
+export function clearViewerCaches(): void {
+  stlCache.clear();
+  lineCache.clear();
+}
 function loadStl(url: string): Promise<THREE.BufferGeometry> {
   let p = stlCache.get(url);
   if (!p) {

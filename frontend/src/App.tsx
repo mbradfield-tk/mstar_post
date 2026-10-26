@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type Job, type Project, type ProjectMeta, type ProjectSummary } from "./api";
 import { THEME_KEY, ThemeContext, type Theme } from "./theme";
-import { logout, useUser } from "./user";
+import { logout, USER_CHANGED, useUser } from "./user";
 import LoginDialog from "./Login";
+import { clearPlaneCache } from "./plane";
+import { clearLicCache } from "./lic";
+import { clearViewerCaches } from "./Viewer3D";
 import CasesView from "./CasesView";
 import Dashboard from "./Dashboard";
 import DirBrowser from "./DirBrowser";
@@ -43,7 +46,33 @@ function useActiveJobs(pid: string | null): number {
   return jobs.filter((j) => j.status === "queued" || j.status === "running").length;
 }
 
+// A change of account remounts the whole app below the theme provider: every tab,
+// WebSocket, timer and cache starts fresh and nothing of the previous user remains.
 export default function App() {
+  const [session, setSession] = useState(0);
+  const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark"));
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+  useEffect(() => {
+    const on = () => {
+      clearPlaneCache();
+      clearLicCache();
+      clearViewerCaches();
+      setSession((s) => s + 1);
+    };
+    window.addEventListener(USER_CHANGED, on);
+    return () => window.removeEventListener(USER_CHANGED, on);
+  }, []);
+  return (
+    <ThemeContext.Provider value={theme}>
+      <Session key={session} theme={theme} setTheme={setTheme} />
+    </ThemeContext.Provider>
+  );
+}
+
+function Session({ theme, setTheme }: { theme: Theme; setTheme: (t: Theme) => void }) {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   // the app starts on the dashboard; the last project is only pre-selected there
   const [pid, setPid] = useState<string | null>(null);
@@ -67,11 +96,6 @@ export default function App() {
   const doLogout = async () => {
     try { await logout(); } catch (e) { setError((e as Error).message); }
   };
-  const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark"));
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    localStorage.setItem(THEME_KEY, theme);
-  }, [theme]);
   // tabs stay mounted once opened so their state survives switching
   const [visited, setVisited] = useState<Set<Tab>>(() => new Set(["Cases"]));
   const [resets, setResets] = useState<Partial<Record<Tab, number>>>({});
@@ -136,7 +160,6 @@ export default function App() {
   const showDash = home && !creating;
   const showTab = !home && !creating;
   return (
-    <ThemeContext.Provider value={theme}>
     <div className="app">
       <header>
         <b className="brand" onClick={() => setHome(true)} title="all projects" role="button">M-Star Post</b>
@@ -225,7 +248,6 @@ export default function App() {
         })()}
       </main>
     </div>
-    </ThemeContext.Provider>
   );
 }
 

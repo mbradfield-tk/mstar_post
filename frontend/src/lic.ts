@@ -6,6 +6,13 @@ let nextId = 0;
 const pending = new Map<number, (out: Float32Array) => void>();
 const cache = new Map<string, Promise<Float32Array>>();
 
+export function clearLicCache(): void {
+  cache.clear();
+  pending.clear();
+  worker?.terminate();
+  worker = null;
+}
+
 export function runLic(key: string, f: Vec2, scale: number, L: number): Promise<Float32Array> {
   const k = `${key}|${scale}|${L}`;
   const hit = cache.get(k);

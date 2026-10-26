@@ -31,7 +31,7 @@ export type Param = {
 };
 export type TaskDef = {
   id: string; label: string; description: string; params: Param[];
-  presets: { label: string; params: Record<string, unknown> }[]; per_case: boolean;
+  presets: { label: string; params: Record<string, unknown> }[]; per_case: boolean; group?: "base" | "addon";
 };
 export type Job = {
   id: string; project: string; task: string; label: string; user?: string | null;
@@ -126,6 +126,7 @@ export const api = {
   readFile: (path: string, offset = 0, tail = false, limit = 256 << 10) =>
     req<FileChunk>(`/api/fs/read?${qs({ path, offset, tail, limit })}`),
   imageUrl: (path: string) => `/api/fs/image?${qs({ path })}`,
+  meshUrl: (path: string) => `/api/fs/mesh?${qs({ path })}`,
 
   projects: () => req<ProjectSummary[]>("/api/projects"),
   allCases: () => req<CatalogCase[]>("/api/cases"),

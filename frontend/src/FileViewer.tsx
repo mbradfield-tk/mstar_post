@@ -2,8 +2,10 @@ import { useEffect, useState } from "react";
 import { api, type CsvTable, type FileChunk } from "./api";
 import CsvTableView from "./CsvTableView";
 import { fmtBytes } from "./FilesView";
+import MeshPreview from "./MeshPreview";
 
 const CHUNK = 256 << 10;
+const CAD_EXT = ["stl", "step", "stp", "iges", "igs", "brep", "brp"];
 
 const parseCsv = (text: string, sep: string): CsvTable => {
   const lines = text.split(/\r?\n/).filter((l) => l.trim());
@@ -44,8 +46,11 @@ export default function FileViewer({ path, onClose }: { path: string; onClose: (
   const [sniffed, setSniffed] = useState<string | null>(null);
   const sep = extSep ?? sniffed;
   const [asTable, setAsTable] = useState(extSep !== null);
+  const isCad = CAD_EXT.includes(ext);
+  const [as3d, setAs3d] = useState(isCad);
 
   useEffect(() => {
+    if (isCad && as3d) { setChunk(null); setBusy(false); return; }  // the mesh endpoint reads the file
     setBusy(true);
     setError(null);
     api.readFile(path, 0, tail, CHUNK).then((c) => {
@@ -57,7 +62,7 @@ export default function FileViewer({ path, onClose }: { path: string; onClose: (
         if (s) setAsTable(true);
       }
     }).catch((e) => setError(e.message)).finally(() => setBusy(false));
-  }, [path, tail]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [path, tail, isCad && as3d]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const more = () => {
     if (!chunk) return;
@@ -75,6 +80,10 @@ export default function FileViewer({ path, onClose }: { path: string; onClose: (
            onClick={(ev) => ev.stopPropagation()} onKeyDown={(ev) => ev.key === "Escape" && onClose()}>
         <div className="row">
           <h3 className="grow">{name}</h3>
+          {isCad && <span className="seg">
+            <button className={as3d ? "primary" : ""} onClick={() => setAs3d(true)}>3D</button>
+            <button className={!as3d ? "primary" : ""} onClick={() => setAs3d(false)} title="raw file contents">Text</button>
+          </span>}
           {chunk && !chunk.image && !chunk.binary && (
             <>
               <span className="seg">
@@ -98,7 +107,9 @@ export default function FileViewer({ path, onClose }: { path: string; onClose: (
         </div>}
         {error && <div className="error">{error}</div>}
         {busy && !chunk && <div className="muted">loading...</div>}
-        {chunk?.image ? (
+        {isCad && as3d ? (
+          <div className="viewer-body mesh"><MeshPreview url={api.meshUrl(path)} name={name} /></div>
+        ) : chunk?.image ? (
           <div className="viewer-body"><img src={api.imageUrl(path)} alt={name} /></div>
         ) : chunk && sep && asTable && !tail && !chunk.binary ? (
           <div className="viewer-body"><CsvTableView table={parseCsv(text, sep)} name={name} /></div>

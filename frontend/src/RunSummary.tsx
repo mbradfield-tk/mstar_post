@@ -1,56 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
-import { api, caseName, download, fmt, toCsv, type CsvTable, type Project, type Run, type TaskDef } from "./api";
+import { useEffect, useState } from "react";
+import { caseName, download, fmt, toCsv, type Project, type Run, type TaskDef } from "./api";
+import { COND, condOf, fmtPct, loadRunResults, meansFilesOf, pct, pickMetrics, type RunResults } from "./results";
 
-// Key metrics shown in the run overview, in priority order: [column pattern, short label].
-// The unit is taken from the column's "[...]" suffix.
-const KEY_METRICS: [RegExp, string][] = [
-  [/^Mean Energy Dissipation Rate \[/, "Mean eps"],
-  [/^Power per Volume P\/V/, "P/V"],
-  [/^Power Number from Torque/, "Po"],
-  [/^Impeller Power P \(/, "P"],
-  [/^Mean Velocity \[/, "Mean velocity"],
-  [/^Blend Time t95/, "t95 blend"],
-  [/^Kolmogorov Scale at Mean Resolved Dissipation \[/, "Kolmogorov"],
-  [/^Mixing Time/i, "Mixing time"],
-  [/^Specific Interfacial Area \[/, "a"],
-  [/^Interface Enhancement E/, "E = a/a0"],
-  [/^Sauter Diameter d32 \(/, "d32"],
-  [/^Dispersion Time t95/, "t95 disp"],
-  [/^Number of Drops/, "Drops"],
-  [/^Zonal CoV of Phase Fraction \(Fluid 1/, "Zonal CoV"],
-  [/^Segregation Index S \(Fluid 1/, "S"],
-  [/^Homogeneity Time t_S \(Fluid 1/, "t_S"],
-  [/^Continuous Phase/, "Continuous phase"],
-  [/^UA \[/, "UA"],
-  [/^U \[/, "U"],
-  [/^Q_wall/, "Q wall"],
-];
-const MAX_METRICS = 10;
-// case operating conditions (keys of case_info.settings) shown in front of the key results
-const COND = [{ key: "Volume [L]", label: "Volume", unit: "L" }, { key: "Agitator speed [rpm]", label: "Speed", unit: "rpm" }];
-const unitOf = (col: string) => col.match(/\[([^\]]*)\]\s*$/)?.[1] ?? "";
-const shortName = (col: string) => col.replace(/\s*\[[^\]]*\]\s*$/, "");
-
-type Metric = { col: string; label: string; unit: string; source: string };
-type Cell = string | number | null;
-
-const pickMetrics = (columns: { col: string; source: string }[]): Metric[] => {
-  const out: Metric[] = [];
-  for (const [re, label] of KEY_METRICS) {
-    const hit = columns.find((c) => re.test(c.col) && !out.some((m) => m.col === c.col));
-    if (hit) out.push({ col: hit.col, label, unit: unitOf(hit.col), source: hit.source });
-    if (out.length >= MAX_METRICS) break;
-  }
-  if (!out.length) {  // unknown task: first numeric-looking columns
-    columns.slice(0, MAX_METRICS).forEach((c) =>
-      out.push({ col: c.col, label: shortName(c.col), unit: unitOf(c.col), source: c.source }));
-  }
-  return out;
-};
-
-const pct = (v: Cell, r: Cell) =>
-  typeof v === "number" && typeof r === "number" && r !== 0 ? ((v - r) / Math.abs(r)) * 100 : null;
-const fmtPct = (p: number) => `${p > 0 ? "+" : ""}${p.toFixed(Math.abs(p) < 10 ? 1 : 0)}%`;
 const dur = (a: number | null, b: number | null) => {
   if (!a || !b) return "";
   const s = Math.round(b - a);
@@ -61,80 +12,29 @@ const dur = (a: number | null, b: number | null) => {
 export default function RunSummary({ project, run, task, onOpenFile }: {
   project: Project; run: Run; task: TaskDef | undefined; onOpenFile: (file: string) => void;
 }) {
-  const [tables, setTables] = useState<Record<string, CsvTable>>({});
-  const [finals, setFinals] = useState<{ cols: { col: string; source: string }[]; rows: Map<string, Record<string, Cell>> } | null>(null);
+  const [res, setRes] = useState<RunResults | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showPct, setShowPct] = useState(true);
   const prm = (run.params?.params ?? {}) as Record<string, unknown>;
   const caseIds: string[] = Array.isArray(run.params?.cases) ? (run.params.cases as string[]) : project.cases.map((c) => c.id);
   const ref = project.ref_case && caseIds.includes(project.ref_case) ? project.ref_case : null;
-  const meansFiles = run.csvs.filter((f) => !f.includes("/") && /_means\.csv$/.test(f));
+  const meansFiles = meansFilesOf(run);
   const multi = caseIds.length > 1;
 
-  // one row per case merged over all *_means.csv files (first file wins per column)
   useEffect(() => {
-    setTables({});
+    setRes(null);
     setError(null);
     let live = true;
-    Promise.all(meansFiles.map((f) => api.csv(project.id, `${run.path}/${f}`).then((t) => [f, t] as const)))
-      .then((ts) => live && setTables(Object.fromEntries(ts)))
-      .catch((e) => live && setError(e.message));
+    loadRunResults(project, run).then((r) => live && setRes(r)).catch((e) => live && setError(e.message));
     return () => { live = false; };
-  }, [run.path, meansFiles.join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [run.path, run.csvs.join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // no means table (per-case tasks such as calc_ua): final values of the per-case time series
-  useEffect(() => {
-    setFinals(null);
-    if (meansFiles.length) return;
-    let live = true;
-    api.runTimeseries(project.id, run.name).then(async (files) => {
-      const cols: { col: string; source: string }[] = [];
-      const rows = new Map<string, Record<string, Cell>>();
-      for (const f of files) {
-        const want = pickMetrics(f.columns.map((c) => ({ col: c, source: f.file }))).map((m) => m.col);
-        if (!want.length) continue;
-        const s = await api.runSeries(project.id, run.name, f.file, want);
-        for (const [cid, d] of Object.entries(s)) {
-          const row = rows.get(cid) ?? {};
-          for (const c of want) {
-            const v = (d.columns[c] ?? []).filter((x): x is number => x !== null);
-            if (v.length) row[c] = v[v.length - 1];
-          }
-          rows.set(cid, row);
-        }
-        want.forEach((c) => cols.push({ col: c, source: f.file }));
-      }
-      if (live) setFinals({ cols, rows });
-    }).catch((e) => live && setError(e.message));
-    return () => { live = false; };
-  }, [run.name, meansFiles.length]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const { metrics, rows, valueNote } = useMemo(() => {
-    if (meansFiles.length) {
-      const columns: { col: string; source: string }[] = [];
-      const rows = new Map<string, Record<string, Cell>>();
-      for (const f of meansFiles) {
-        const t = tables[f];
-        if (!t || t.columns[0] !== "case") continue;
-        t.columns.slice(1).forEach((c) => !columns.some((x) => x.col === c) && columns.push({ col: c, source: f }));
-        for (const r of t.rows) {
-          const row = rows.get(String(r[0])) ?? {};
-          t.columns.forEach((c, i) => { if (i && row[c] === undefined) row[c] = r[i]; });
-          rows.set(String(r[0]), row);
-        }
-      }
-      return { metrics: pickMetrics(columns), rows, valueNote: "steady-state means" };
-    }
-    return { metrics: finals ? pickMetrics(finals.cols) : [], rows: finals?.rows ?? new Map(), valueNote: "final values" };
-  }, [tables, finals, meansFiles.join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
-
+  const metrics = res ? pickMetrics(res.columns) : [];
+  const rows = res?.rows ?? new Map<string, Record<string, string | number | null>>();
+  const valueNote = res?.valueNote ?? "";
   const ordered = caseIds.filter((c) => rows.has(c));
   const refRow = ref ? rows.get(ref) : undefined;
-  // operating conditions of each case from the project's case info (input.xml), shown before the results
-  const cond = (c: string, key: string): number | string | null => {
-    const v = project.cases.find((x) => x.id === c)?.info?.settings?.[key];
-    return typeof v === "number" || typeof v === "string" ? v : null;
-  };
+  const cond = (c: string, key: string) => condOf(project, c, key);
   const condCols = COND.filter((k) => ordered.some((c) => cond(c, k.key) !== null));
 
   // non-default settings
@@ -211,9 +111,9 @@ export default function RunSummary({ project, run, task, onOpenFile }: {
         </div>
         {error && <div className="error">{error}</div>}
         {!error && !ordered.length && (
-          <div className="muted">{meansFiles.length || finals === null
-            ? (Object.keys(tables).length || finals ? "No per-case results found in this run." : "Loading...")
-            : "This run has no summary table or per-case time series; browse its files instead."}</div>
+          <div className="muted">{res === null ? "Loading..." : res.valueNote === "none"
+            ? "This run has no summary table or per-case time series; browse its files instead."
+            : "No per-case results found in this run."}</div>
         )}
         {ordered.length > 0 && (
           <div className="scroll-x">

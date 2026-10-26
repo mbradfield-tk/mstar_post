@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import type Plotly from "plotly.js-dist-min";
 import { api, caseName, download, fmt, toCsv, type CsvTable, type Project, type Run, type RunSeriesFile,
-         type StatsFile } from "./api";
+         type StatsFile, type TaskDef } from "./api";
 import CaseNames from "./CaseNames";
 import { useDialog } from "./Dialog";
 import Plot from "./Plot";
 import { caseColor, PlotStyleEditor, usePlotStyle, type PlotStyle } from "./PlotStyle";
 import StatsSeries from "./StatsSeries";
+import { loadRunResults, type Cell } from "./results";
 
 type Mode = "series" | "single" | "bars" | "scatter" | "detail";
 const MODE_LABEL: Record<Mode, string> = { series: "Time series", single: "Case time series",
@@ -373,7 +374,7 @@ function SeriesPlot({ project, style, active, refCase }: { project: Project; sty
         <label>Steady from [s] <input type="number" step="any" value={tss}
                                       onChange={(e) => setTss(e.target.value === "" ? "" : Number(e.target.value))} /></label>
         <button onClick={exportCsv}>Export CSV</button>
-        {!runs.some((r) => runFiles[r.name]?.length) && <span className="muted">No app script outputs yet: run a task (e.g. stats summary with dispersion, heat transfer UA) to plot its time series.</span>}
+        {!runs.some((r) => runFiles[r.name]?.length) && <span className="muted">No app script outputs yet: run an add-on (Liquid-liquid dispersion, Heat transfer UA) to plot its time series.</span>}
       </div>
       {error && <div className="error">{error}</div>}
       {panels.some((p) => (p.rel ?? "none") !== "none") && !cases.some((c) => c.id === refCase) &&
@@ -430,6 +431,10 @@ function MeansPlots({ project, view, style, active, refCase }: {
     try { return JSON.parse(localStorage.getItem(store) ?? "{}"); } catch { return {}; }
   }, [store]);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [tasks, setTasks] = useState<TaskDef[]>([]);
+  // sources: "files" = chosen *_means/_settings CSVs; "task" = all finished runs of one job type merged (newest run per case)
+  const [srcMode, setSrcMode] = useState<"task" | "files">(saved.srcMode ?? "task");
+  const [taskId, setTaskId] = useState<string>(saved.taskId ?? "");
   const [srcs, setSrcs] = useState<string[]>(saved.srcs ?? []);  // "<run path>/<csv>"
   const [excluded, setExcluded] = useState<string[]>(saved.excluded ?? []);
   const [pctMode, setPctMode] = useState<"value" | "both" | "pct">(saved.pctMode ?? "value");
@@ -444,8 +449,15 @@ function MeansPlots({ project, view, style, active, refCase }: {
   const [logAxes, setLogAxes] = useState(false);
 
   useEffect(() => {
+    api.tasks().then(setTasks).catch(() => undefined);
+  }, []);
+  useEffect(() => {
     api.runs(project.id).then((rs) => {
       setRuns(rs);
+      if (!taskId || !rs.some((r) => r.task === taskId)) {
+        const first = rs.find((r) => r.status === "done" && (r.csvs.some((c) => c.endsWith("_means.csv")) || r.task === "calc_ua")) ?? rs[0];
+        if (first?.task) setTaskId(first.task);
+      }
       const all = new Set(rs.flatMap((r) => r.csvs.map((c) => `${r.path}/${c}`)));
       const kept = srcs.filter((s) => all.has(s));
       if (kept.length) { if (kept.length !== srcs.length) setSrcs(kept); return; }
@@ -459,13 +471,41 @@ function MeansPlots({ project, view, style, active, refCase }: {
   }, [active]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    localStorage.setItem(store, JSON.stringify({ srcs, excluded, pctMode, heat, focus }));
-  }, [store, srcs, excluded, pctMode, heat, focus]);
+    localStorage.setItem(store, JSON.stringify({ srcs, excluded, pctMode, heat, focus, srcMode, taskId }));
+  }, [store, srcs, excluded, pctMode, heat, focus, srcMode, taskId]);
+
+  const byTask = runs.reduce((m, r) => m.set(r.task ?? "", [...(m.get(r.task ?? "") ?? []), r]), new Map<string, Run[]>());
+  const taskLabel = (id: string) => tasks.find((t) => t.id === id)?.label ?? id ?? "unknown job type";
+  const taskRuns = (byTask.get(taskId) ?? []).filter((r) => r.status === "done" || r.status === "unknown");
 
   const options = runs.flatMap((r) => r.csvs.filter((c) => c.endsWith("_means.csv") || c.endsWith("_settings.csv"))
     .map((c) => ({ value: `${r.path}/${c}`, label: `${r.label ?? r.name} (${r.name.slice(0, 15)}): ${c}` })));
 
   useEffect(() => {
+    if (srcMode === "task") {
+      if (!taskRuns.length) { setMerged(null); return; }
+      let stale = false;
+      // newest run first: a case keeps the first run that has it, like the Results comparison
+      Promise.all(taskRuns.map((r) => loadRunResults(project, r).then((res) => ({ r, res })))).then((all) => {
+        if (stale) return;
+        const columns = ["case"];
+        const rows = new Map<string, Record<string, Cell>>();
+        const origin = new Map<string, string>();
+        for (const { r, res } of all) {
+          res.columns.forEach((c) => { if (!columns.includes(c.col)) columns.push(c.col); });
+          for (const [cid, row] of res.rows) if (!rows.has(cid)) { rows.set(cid, row); origin.set(cid, r.label ?? r.name); }
+        }
+        const cs = [...rows.keys()];
+        const t: Merged = { columns, rows: cs.map((c) => [c, ...columns.slice(1).map((k) => rows.get(c)![k] ?? null)]),
+                            origin: cs.map((c) => origin.get(c)!) };
+        setMerged(t);
+        const num = t.columns.slice(1);
+        setSel((s) => s.filter((c) => num.includes(c)).length ? s.filter((c) => num.includes(c)) : num.slice(0, 4));
+        if (!num.includes(xCol)) setXCol(num.find((c) => /speed|rpm/i.test(c)) ?? num[0] ?? "");
+        if (!num.includes(yCol)) setYCol(num.find((c) => /power number|^UA/i.test(c)) ?? num[1] ?? "");
+      }).catch(() => !stale && setMerged(null));
+      return () => { stale = true; };
+    }
     if (!srcs.length) { setMerged(null); return; }
     // keep the dropdown order so precedence does not depend on click order
     const ordered = options.map((o) => o.value).filter((v) => srcs.includes(v));
@@ -483,7 +523,7 @@ function MeansPlots({ project, view, style, active, refCase }: {
       if (!num.includes(yCol)) setYCol(num.find((c) => /power number/i.test(c)) ?? num[1] ?? "");
     });
     return () => { stale = true; };
-  }, [srcs.join("|"), runs]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [srcMode, taskId, srcs.join("|"), runs]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // cases deselected on the Cases tab are left out; cases unknown to the project (e.g. renamed) stay
   const deselected = new Set(project.cases.filter((c) => !c.included).map((c) => c.id));
@@ -519,12 +559,31 @@ function MeansPlots({ project, view, style, active, refCase }: {
   return (
     <>
       <div className="row">
-        {!options.length && <span className="muted">Run "M-Star Stats summary" first.</span>}
+        {!runs.length && <span className="muted">Run a calculation first (e.g. "M-Star Stats summary").</span>}
       </div>
-      {options.length > 0 && (
+      {runs.length > 0 && (
         <div className="split">
           <div className="side">
-            <b className="small">Sources</b>
+            <div className="row small">
+              <b>Sources</b>
+              <span className="seg">
+                <button className={srcMode === "task" ? "primary" : ""} onClick={() => setSrcMode("task")}
+                        title="all finished runs of one job type merged: each case from the newest run that includes it">by job type</button>
+                <button className={srcMode === "files" ? "primary" : ""} onClick={() => setSrcMode("files")}
+                        title="pick individual result tables">files</button>
+              </span>
+            </div>
+            {srcMode === "task" ? (
+              <>
+                <div className="checklist">
+                  {[...byTask.entries()].map(([tid, rs]) => (
+                    <label key={tid} className="small"><input type="radio" checked={taskId === tid} onChange={() => setTaskId(tid)} />
+                      <b>{taskLabel(tid)}</b> <span className="muted">{rs.length} run{rs.length === 1 ? "" : "s"}</span></label>))}
+                </div>
+                <span className="muted small">{taskRuns.length} finished run{taskRuns.length === 1 ? "" : "s"} merged; a case takes its values from the newest run that includes it (hover a case for the run).</span>
+              </>
+            ) : (
+              <>
             <div className="checklist">
               {runs.map((r) => {
                 const opts = options.filter((o) => o.value.startsWith(`${r.path}/`));
@@ -545,6 +604,8 @@ function MeansPlots({ project, view, style, active, refCase }: {
               })}
             </div>
             <span className="muted small">A case in several sources uses the first listed one.</span>
+              </>
+            )}
           </div>
           {merged && (
             <div className="side">
@@ -560,17 +621,19 @@ function MeansPlots({ project, view, style, active, refCase }: {
               </div>
             </div>
           )}
+          {table && view === "bars" && (
+            <div className="side grow">
+              <b className="small">Variables ({sel.length}/{numeric.length})</b>
+              {varList}
+              <button onClick={() => download("means_selection.csv", toCsv(["case", ...sel, ...sel.map((s) => `% vs ${refName}: ${s}`)],
+                cases.map((c, i) => [names[i], ...sel.map((s) => colVals(s)[i]), ...sel.map((s) => pctDiff(colVals(s)[i], refVal(s)))])))}>
+                Export selection CSV</button>
+            </div>
+          )}
         </div>
       )}
       {table && view === "bars" && (
-        <div className="split">
-          <div className="side">
-            {varList}
-            <button onClick={() => download("means_selection.csv", toCsv(["case", ...sel, ...sel.map((s) => `% vs ${refName}: ${s}`)],
-              cases.map((c, i) => [names[i], ...sel.map((s) => colVals(s)[i]), ...sel.map((s) => pctDiff(colVals(s)[i], refVal(s)))])))}>
-              Export selection CSV</button>
-          </div>
-          <div className="main">
+        <div>
             <div className="row small">
               <label>Show <select value={pctMode} onChange={(e) => setPctMode(e.target.value as typeof pctMode)}>
                 <option value="value">values</option><option value="both">values + % vs ref</option>
@@ -607,7 +670,6 @@ function MeansPlots({ project, view, style, active, refCase }: {
                 );
               })}
             </div>
-          </div>
         </div>
       )}
       {merged && view === "detail" && (

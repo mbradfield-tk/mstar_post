@@ -30,8 +30,10 @@ for r in (auth.router, fs.router, projects.router, projects.catalog, case.router
 
 @app.get("/api/health")
 def health() -> dict:
+    from app import fsops
     return {"ok": True, "roots": [str(r) for r in config.ROOTS],
-            "data_dir": str(config.DATA_DIR)}
+            "data_dir": str(config.DATA_DIR), "helper_mode": config.HELPER_MODE,
+            "helpers_stale": fsops.helper_stale()}
 
 
 if DIST.is_dir():

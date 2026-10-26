@@ -361,7 +361,7 @@ def delete_run(pid: str, name: str, me: Identity = Depends(require_user)) -> dic
 # ------------------------------------------------------------------ run time series
 
 # time_s-first CSVs with several rows per time (profiles, per-drop lists)
-_NOT_SERIES = {"holdup_profile.csv", "vof_dsd.csv"}
+_NOT_SERIES = {"holdup_profile.csv", "vof_dsd.csv", "profiles.csv"}
 _TIME_COLS = ("time [s]", "time_s")  # current and pre-unit-label headers, compared lower-case
 
 

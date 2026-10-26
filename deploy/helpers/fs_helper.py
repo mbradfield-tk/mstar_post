@@ -33,6 +33,9 @@ MAX_TEXT = 1 << 20
 IMAGES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
           ".webp": "image/webp", ".bmp": "image/bmp", ".svg": "image/svg+xml"}
 MARKER = "mstar_post_case.json"
+MESH_MAX = 200 << 20       # largest STL returned (bytes)
+STEP_EXT = {".step", ".stp", ".iges", ".igs", ".brep", ".brp"}
+FREECAD = ["/usr/bin/freecadcmd", "/usr/bin/FreeCADCmd", "freecadcmd"]
 
 
 class Fail(Exception):
@@ -357,6 +360,61 @@ def op_kill(ctx: Ctx, req: dict) -> dict:
     return {"signalled": True}
 
 
+def op_mesh(ctx: Ctx, req: dict) -> dict:
+    """A CAD file as binary STL (base64): STL files as they are; STEP/IGES/BREP are
+    tessellated with FreeCAD (freecadcmd) into a cache file next to the request's
+    cache_dir (keyed by path, size and mtime) so the conversion runs once."""
+    p = _regular_file(ctx, req["path"])
+    ext = p.suffix.lower()
+    st = p.stat()
+    if ext == ".stl":
+        if st.st_size > MESH_MAX:
+            raise Fail(413, "STL larger than 200 MB")
+        try:
+            data = p.read_bytes()
+        except PermissionError:
+            raise Fail(403, f"permission denied: {req['path']}")
+        return {"b64": base64.b64encode(data).decode(), "source": "stl", "bytes": len(data)}
+    if ext not in STEP_EXT:
+        raise Fail(422, "not a CAD file (stl, step, stp, iges, igs, brep)")
+    import hashlib
+    import shutil as _sh
+    import subprocess
+    cache_dir = Path(req.get("cache_dir") or (Path.home() / ".cache" / "mstar_post"))
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(cache_dir, 0o2775)  # shared between the service account and the users (group mstar)
+    except OSError:
+        pass
+    if not os.access(cache_dir, os.W_OK):  # not shared: fall back to a private cache
+        cache_dir = Path.home() / ".cache" / "mstar_post"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha1(f"{p}|{st.st_size}|{st.st_mtime_ns}|{req.get('deflection', 0.5)}".encode()).hexdigest()[:20]
+    out = cache_dir / f"cad_{key}.stl"
+    if not out.is_file():
+        exe = next((e for e in FREECAD if _sh.which(e) or Path(e).is_file()), None)
+        if exe is None:
+            raise Fail(501, "STEP preview needs FreeCAD (freecadcmd) on the server")
+        # LinearDeflection is absolute (model units, usually mm): 0.5 mm keeps parts crisp and small
+        script = ("import FreeCAD, Part, MeshPart\n"
+                  f"s = Part.Shape(); s.read({str(p)!r})\n"
+                  f"m = MeshPart.meshFromShape(Shape=s, LinearDeflection={float(req.get('deflection', 0.5))}, AngularDeflection=0.35, Relative=False)\n"
+                  f"m.write({str(out) + '.tmp.stl'!r})\n")
+        try:
+            r = subprocess.run([exe, "-c", script], capture_output=True, text=True, timeout=float(req.get("timeout", 240)),
+                               env={"HOME": str(cache_dir), "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "QT_QPA_PLATFORM": "offscreen"})
+        except subprocess.TimeoutExpired:
+            raise Fail(504, "STEP conversion timed out")
+        tmp = Path(str(out) + ".tmp.stl")
+        if r.returncode != 0 or not tmp.is_file():
+            raise Fail(500, f"STEP conversion failed: {(r.stderr or r.stdout).strip()[-600:]}")
+        tmp.replace(out)
+    data = out.read_bytes()
+    if len(data) > MESH_MAX:
+        raise Fail(413, "tessellated mesh larger than 200 MB; the part is too detailed to preview")
+    return {"b64": base64.b64encode(data).decode(), "source": "freecad", "bytes": len(data)}
+
+
 def op_whoami(ctx: Ctx, req: dict) -> dict:
     import pwd
     return {"uid": os.getuid(), "user": pwd.getpwuid(os.getuid()).pw_name}
@@ -364,7 +422,7 @@ def op_whoami(ctx: Ctx, req: dict) -> dict:
 
 OPS = {"list": op_list, "browse": op_browse, "du": op_du, "read": op_read, "image": op_image,
        "mkdirs": op_mkdirs, "newfile": op_newfile, "delete": op_delete, "rename": op_rename,
-       "write_marker": op_write_marker, "kill": op_kill, "whoami": op_whoami}
+       "write_marker": op_write_marker, "kill": op_kill, "whoami": op_whoami, "mesh": op_mesh}
 
 
 def handle(req: dict) -> dict:

@@ -63,6 +63,15 @@ def image(path: str, me: Identity = Depends(require_user)) -> Response:
         "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox; script-src 'none'"})
 
 
+@router.get("/mesh")
+def mesh(path: str, me: Identity = Depends(require_user)) -> Response:
+    """A CAD file (stl, step, stp, iges, brep) as binary STL for the 3D preview;
+    STEP/IGES are tessellated with FreeCAD and cached."""
+    r = fsops.run_as(me.user, "mesh", timeout=300, path=path, cache_dir=str(config.CACHE_DIR / "cad"))
+    return Response(base64.b64decode(r["b64"]), media_type="model/stl",
+                    headers={"X-Mesh-Source": r["source"], "Cache-Control": "private, max-age=600"})
+
+
 class MkdirsRequest(BaseModel):
     parent: str
     names: list[str]

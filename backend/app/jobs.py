@@ -58,9 +58,13 @@ def make_shared_dir(d: Path) -> None:
 
 def launcher_argv(task: str, argv: list[str], user: str) -> list[str]:
     """`sudo -n -u user run --task <task> -- <args>`: the launcher supplies the
-    interpreter and script of the task itself (custom_script passes both)."""
+    interpreter and script of the task itself (custom_script passes both). Tasks
+    sharing a script (dispersion -> stats_summary) use that task's launcher id."""
+    from app import tasks as _tasks
+    t = _tasks.TASKS.get(task)
+    lid = (t.launcher if t and t.launcher else task)
     args = argv if task == "custom_script" else argv[2:]
-    return [*config.SUDO, "-u", user, str(config.HELPER_DIR / "run"), "--task", task, "--", *args]
+    return [*config.SUDO, "-u", user, str(config.HELPER_DIR / "run"), "--task", lid, "--", *args]
 
 
 def _conn() -> sqlite3.Connection:

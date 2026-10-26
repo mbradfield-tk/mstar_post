@@ -26,10 +26,13 @@ class Task:
     build: Callable[[dict, list[dict], dict, Path], list[dict]]
     per_case: bool = False
     presets: list[dict] = field(default_factory=list)
+    group: str = "addon"          # "base" = run first on every simulation; "addon" = optional extras
+    launcher: str | None = None   # task id the root-installed launcher knows (same script); default = id
 
     def public(self) -> dict:
         return {"id": self.id, "label": self.label, "description": self.description,
-                "params": self.params, "presets": self.presets, "per_case": self.per_case}
+                "params": self.params, "presets": self.presets, "per_case": self.per_case,
+                "group": self.group}
 
 
 def P(name, label, type="number", default=None, help="", group="", **kw) -> dict:
@@ -88,7 +91,10 @@ def default_label(task: Task, prm: dict, n_cases: int) -> str:
 
 # ------------------------------------------------------------------ tasks
 
-def _stats_build(project: dict, cases: list[dict], prm: dict, run: Path) -> list[dict]:
+_STEADY = ("time", "--time"), ("window", "--window"), ("tol", "--tol")
+
+
+def _stats_argv(project: dict, cases: list[dict], run: Path) -> list[str]:
     argv = [config.STATS_SUMMARY_PY, str(config.STATS_SUMMARY)]
     if project["single"]:
         argv += [project["root"], "--output-root", str(run)]
@@ -96,20 +102,13 @@ def _stats_build(project: dict, cases: list[dict], prm: dict, run: Path) -> list
         argv += [project["root"], "--batch", "--output-root", str(run),
                  "--cases", *[c["id"] for c in cases]]
         _opt(argv, "--ref-case", project.get("ref_case"))
-    for name, flag in (("time", "--time"), ("window", "--window"), ("tol", "--tol"),
-                       ("mix_rsd", "--mix-rsd"), ("means_vars", "--means-vars"),
-                       ("dispersion", "--dispersion"), ("uniformity", "--uniformity"),
-                       ("disp_time", "--disp-time"), ("sigma", "--sigma"),
-                       ("rho_continuous", "--rho-continuous"),
-                       ("dispersed_fraction", "--dispersed-fraction"),
-                       ("vessel_diameter", "--vessel-diameter"),
-                       ("min_d_dx", "--min-d-dx"), ("min_voxels", "--min-voxels"),
-                       ("eps_ratio", "--eps-ratio"), ("k_phi", "--k-phi"),
-                       ("zone_scales", "--zone-scales"),
-                       ("vertical_axis", "--vertical-axis")):
+    return argv
+
+
+def _stats_build(project: dict, cases: list[dict], prm: dict, run: Path) -> list[dict]:
+    argv = _stats_argv(project, cases, run)
+    for name, flag in (*_STEADY, ("mix_rsd", "--mix-rsd"), ("means_vars", "--means-vars")):
         _opt(argv, flag, prm.get(name))
-    if prm.get("plot"):
-        argv += ["--plot", *(prm.get("plot_vars") or [])]
     cmds = [{"argv": argv}]
     if prm.get("canon_body", True):
         cmds.append({"argv": rename_body_argv(run, project.get("ref_case"))})
@@ -124,52 +123,91 @@ def rename_body_argv(run: Path, ref_case: str | None = None) -> list[str]:
     return argv
 
 
+_STEADY_PARAMS = [
+    P("time", "Steady-state start [s]", help="blank = auto-detect from the mean velocity plateau",
+      group="Steady state"),
+    P("window", "Detection window [s]", default=1.0, group="Steady state"),
+    P("tol", "Drift tolerance [-]", default=0.02, group="Steady state"),
+]
+
 STATS = Task(
-    id="stats_summary", label="M-Star Stats summary",
-    description="Steady-state mean/std of every Stats variable, mixing times, "
-                "optional phase dispersion and uniformity metrics "
-                "(mstar_stats_summary.py). Writes batch_summary*.csv, per-case "
-                "stats_summary*.csv and HTML plots.",
+    id="stats_summary", label="M-Star Stats summary", group="base",
+    description="The base post-processing of any M-Star run: steady-state mean/std of "
+                "every Stats variable, mixing times, impeller power, Po, P/V, Kolmogorov "
+                "scale and the blend-time correlation, plus the case settings "
+                "(mstar_stats_summary.py). Writes batch_summary*.csv and per-case "
+                "stats_summary*.csv; all plotting is done in the app. Run this first; add "
+                "dispersion, heat transfer or zoning on top.",
     params=[
-        P("time", "Steady-state start [s]", help="blank = auto-detect from mean velocity",
-          group="Steady state"),
-        P("window", "Detection window [s]", default=1.0, group="Steady state"),
-        P("tol", "Drift tolerance [-]", default=0.02, group="Steady state"),
-        P("mix_rsd", "Mixing RSD threshold [%]", default=5.0, group="Steady state"),
-        P("plot", "HTML plots per Stats file", "bool", True, group="Outputs"),
+        *_STEADY_PARAMS,
+        P("mix_rsd", "Mixing RSD threshold [%]", default=5.0, group="Steady state",
+          help="a tracer counts as mixed when its RSD stays below this"),
+        P("means_vars", "Means-table variables", "list",
+          help="blank = default list (dissipation, velocity, power number, ...); the All results "
+               "view offers every variable regardless",
+          group="Outputs"),
         P("canon_body", "Impeller body name = Agitator", "bool", True,
           help="M-Star's 'Moving Body' and 'agitator' are the same impeller: rename both to "
                "'Agitator' in every output so cases share columns", group="Outputs"),
-        P("plot_vars", "Variables to plot", "list", help="blank = all", group="Outputs"),
-        P("means_vars", "Means-table variables", "list",
-          help="blank = default list (dissipation, velocity, power number, ...)",
-          group="Outputs"),
-        P("dispersion", "Phase dispersion metrics", "bool", False,
-          help="interfacial area, a(t) kinetics, drop statistics (two-fluid)",
-          group="Dispersion"),
+    ],
+    build=_stats_build,
+)
+
+
+def _dispersion_build(project: dict, cases: list[dict], prm: dict, run: Path) -> list[dict]:
+    argv = _stats_argv(project, cases, run) + ["--dispersion", "--addons-only"]
+    if prm.get("uniformity", True):
+        argv.append("--uniformity")
+    for name, flag in (*_STEADY, ("disp_time", "--disp-time"), ("sigma", "--sigma"),
+                       ("rho_continuous", "--rho-continuous"),
+                       ("dispersed_fraction", "--dispersed-fraction"),
+                       ("vessel_diameter", "--vessel-diameter"),
+                       ("min_d_dx", "--min-d-dx"), ("min_voxels", "--min-voxels"),
+                       ("eps_ratio", "--eps-ratio"), ("k_phi", "--k-phi"),
+                       ("zone_scales", "--zone-scales"), ("vertical_axis", "--vertical-axis")):
+        _opt(argv, flag, prm.get(name))
+    cmds = [{"argv": argv}]
+    if prm.get("canon_body", True):
+        cmds.append({"argv": rename_body_argv(run, project.get("ref_case"))})
+    return cmds
+
+
+DISPERSION = Task(
+    id="dispersion", label="Liquid-liquid dispersion", launcher="stats_summary",
+    description="Add-on for immiscible two-fluid runs: interfacial area a(t) and its "
+                "kinetics (a0, a_ss, E, t90/t95, tau), drop statistics from the VOF "
+                "surface (n_drops, d32, F_disp, coverage), the Hinze resolution check "
+                "and, optionally, phase uniformity (zonal CoV, segregation index, "
+                "continuity). Writes batch_summary_dispersion*.csv / _uniformity*.csv "
+                "and per-case time series (dispersion_timeseries, vof_structures, "
+                "phase_uniformity, phase_continuity); the base Stats summary is not repeated.",
+    params=[
+        *_STEADY_PARAMS,
         P("disp_time", "Dispersion start time [s]", help="blank = a(t) plateau",
           group="Dispersion"),
         P("sigma", "Interfacial tension [N/m]", help="for the Hinze check",
           group="Dispersion"),
         P("rho_continuous", "Continuous-phase density [kg/m3]", group="Dispersion"),
-        P("dispersed_fraction", "Dispersed fraction [-]", group="Dispersion"),
-        P("vessel_diameter", "Vessel diameter [m]", group="Dispersion"),
+        P("dispersed_fraction", "Dispersed fraction [-]", help="blank = minority fraction from Fluid.txt",
+          group="Dispersion"),
+        P("vessel_diameter", "Vessel diameter [m]", help="checks a0 against the flat interface",
+          group="Dispersion"),
         P("min_d_dx", "Min drop size [dx]", default=4.0, group="Dispersion"),
         P("min_voxels", "Min drop volume [voxels]", default=8.0, group="Dispersion"),
         P("eps_ratio", "Local/mean eps ratio", default=1.0, group="Dispersion"),
         P("k_phi", "Holdup correction k_phi", default=0.0, group="Dispersion"),
-        P("uniformity", "Phase uniformity metrics", "bool", False,
-          help="zonal CoV, segregation index, holdup profile (.vti)", group="Uniformity"),
+        P("uniformity", "Phase uniformity metrics", "bool", True,
+          help="zonal CoV, segregation index, holdup profile, continuity (.vti)", group="Uniformity"),
         P("zone_scales", "Zone scales NZxNR", "list", "10x3", group="Uniformity"),
         P("vertical_axis", "Vertical axis", "select", "y", group="Uniformity",
           options=[{"value": a, "label": a} for a in "xyz"]),
+        P("canon_body", "Impeller body name = Agitator", "bool", True, group="Outputs",
+          help="normalise 'Moving Body' / 'agitator' to 'Agitator' in the outputs"),
     ],
-    build=_stats_build,
+    build=_dispersion_build,
     presets=[
-        {"label": "All Stats means", "params": {}},
-        {"label": "Means + dispersion", "params": {"dispersion": True}},
-        {"label": "Means + dispersion + uniformity",
-         "params": {"dispersion": True, "uniformity": True}},
+        {"label": "Dispersion + uniformity", "params": {}},
+        {"label": "Dispersion only", "params": {"uniformity": False}},
     ],
 )
 
@@ -187,15 +225,15 @@ def _per_case_dirs(cases: list[dict], run: Path) -> list[Path]:
 def _zoner_build(project: dict, cases: list[dict], prm: dict, run: Path) -> list[dict]:
     cmds = []
     for c, d in zip(cases, _per_case_dirs(cases, run)):
-        argv = [config.ZONER_PY, str(config.ZONER), c["path"], "--output-dir", str(d)]
+        argv = [config.ZONER_PY, str(config.ZONER), c["path"], "--output-dir", str(d),
+                "--no-plots", "--no-render"]  # CSVs + zones.vti only; the app draws the figures
         for name, flag in (("variable", "--variable"), ("n_zones", "--n-zones"),
                            ("time", "--time"), ("steady_on", "--steady-on"),
                            ("tol", "--tol"), ("window", "--window"),
                            ("linear", "--linear"), ("log_bins", "--log-bins"),
                            ("instantaneous", "--instantaneous"),
                            ("min_zone_frac", "--min-zone-frac"),
-                           ("no_impeller_zone", "--no-impeller-zone"),
-                           ("no_render", "--no-render"), ("html", "--html")):
+                           ("no_impeller_zone", "--no-impeller-zone")):
             _opt(argv, flag, prm.get(name))
         cmds.append({"argv": argv, "cwd": str(d), "continue_on_error": True})
     return cmds
@@ -203,8 +241,10 @@ def _zoner_build(project: dict, cases: list[dict], prm: dict, run: Path) -> list
 
 ZONER = Task(
     id="cfd_zoner", label="CFD zoner", per_case=True,
-    description="Value-based zoning of a Volume .vti field (k-means), per-zone "
-                "statistics and heterogeneity metrics (cfd_zoner.py), run per case.",
+    description="Add-on: value-based zoning of a Volume .vti field (k-means), per-zone "
+                "statistics and heterogeneity metrics (cfd_zoner.py), run per case. Writes "
+                "zones.csv, heterogeneity.csv, the plot data (histogram, exposure CDF, "
+                "profiles, zone weights, time trace) as CSVs and zones.vti for the Viewer.",
     params=[
         P("variable", "Variables", "list", "edr",
           help="aliases: edr, tke, velocity, shear, tracer, kolmogorov, micromixing"),
@@ -220,8 +260,6 @@ ZONER = Task(
         P("instantaneous", "Instantaneous field", "bool", False),
         P("min_zone_frac", "Min sub-zone fraction", default=0.005),
         P("no_impeller_zone", "No impeller zone", "bool", False),
-        P("no_render", "Skip 3D render (headless)", "bool", True),
-        P("html", "Interactive 3D HTML", "bool", False),
     ],
     build=_zoner_build,
 )
@@ -230,8 +268,7 @@ ZONER = Task(
 def _ua_build(project: dict, cases: list[dict], prm: dict, run: Path) -> list[dict]:
     cmds = []
     for c, d in zip(cases, _per_case_dirs(cases, run)):
-        argv = [config.CALC_UA_PY, str(config.CALC_UA), c["path"],
-                "--csv", str(d / "ua.csv"), "--html", str(d / "ua.html")]
+        argv = [config.CALC_UA_PY, str(config.CALC_UA), c["path"], "--csv", str(d / "ua.csv")]
         for name, flag in (("body", "--body"), ("wall_temp", "--wall-temp"),
                            ("t_start", "--t-start"), ("t_end", "--t-end")):
             _opt(argv, flag, prm.get(name))
@@ -241,9 +278,12 @@ def _ua_build(project: dict, cases: list[dict], prm: dict, run: Path) -> list[di
 
 UA = Task(
     id="calc_ua", label="Heat transfer U / UA", per_case=True,
-    description="Heat transfer coefficient and conductance from Stats "
-                "(heat_transfer/calc_ua.py), run per case.",
-    params=[P("body", "Body name", "string"), P("wall_temp", "Wall temperature [K]"),
+    description="Add-on for runs with a heated or cooled wall: overall UA and U from "
+                "the wall heat flux and a lumped energy balance, with the film "
+                "coefficient when the wall conducts (heat_transfer/calc_ua.py), run per case. "
+                "Writes ua.csv (time series of T, Q, UA, U and the lumped model).",
+    params=[P("body", "Body name", "string", help="blank = the static body with a thermal boundary condition"),
+            P("wall_temp", "Wall temperature [K]", help="blank = from input.xml / the body's Stats file"),
             P("t_start", "Start time [s]", default=0.0), P("t_end", "End time [s]")],
     build=_ua_build,
 )
@@ -287,4 +327,4 @@ CUSTOM = Task(
     build=_custom_build,
 )
 
-TASKS: dict[str, Task] = {t.id: t for t in (STATS, ZONER, UA, CUSTOM)}
+TASKS: dict[str, Task] = {t.id: t for t in (STATS, DISPERSION, UA, ZONER, CUSTOM)}

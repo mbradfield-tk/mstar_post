@@ -7,6 +7,8 @@ import { useDialog } from "./Dialog";
 import { useUser } from "./user";
 import RunSummary from "./RunSummary";
 import StatsSeries from "./StatsSeries";
+import TaskComparison from "./TaskComparison";
+import AllResults from "./AllResults";
 
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : "");
 // stats_plots/<stem>.html name of a Stats file, as written by mstar_stats_summary.make_plots
@@ -16,11 +18,18 @@ const canonBody = (s: string) => s.replace(/Moving[ _]Body|(?<![A-Za-z])agitator
 
 // Prefer the cross-case means table when a run is opened.
 const PREFERRED = ["batch_summary_means.csv", "stats_summary_means.csv"];
-type Section = "overview" | "files" | "series";
+type Section = "overview" | "all" | "files" | "series";
 const SECTIONS: [Section, string, string][] = [
   ["overview", "Overview", "what was run, which cases were compared and the key results"],
-  ["files", "Files", "every table, HTML plot and image of the run"],
+  ["all", "All results", "pick any steady-state mean: M-Star Stats variables, summary means and derived values per case"],
+  ["files", "Files", "every table (and legacy HTML plot or image) of the run"],
   ["series", "Case time series", "any variable of one case over time"],
+];
+type CmpSection = "key" | "all" | "series";
+const CMP_SECTIONS: [CmpSection, string, string][] = [
+  ["key", "Key results", "the headline metrics of every case, merged over all runs of this job type"],
+  ["all", "All results", "pick any steady-state mean across all cases: M-Star Stats variables, summary means and derived values"],
+  ["series", "Case time series", "any variable over time, several cases on one figure"],
 ];
 
 export default function ResultsView({ project, runName, onRunChange, onProjectChange, active, onReset }: {
@@ -38,12 +47,20 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
   const [table, setTable] = useState<CsvTable | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [seriesSel, setSeriesSel] = useState<{ caseId: string; file: string; src: string } | null>(null);
-  const run = runs.find((r) => r.name === runName) ?? null;
+  // sidebar: runs listed by date, or grouped by job type with a project-wide comparison per type
+  const [groupBy, setGroupBy] = useState<"date" | "task">(() => (localStorage.getItem(`mstar_post.results.group.${project.id}`) as "task" | null) ?? "task");
+  useEffect(() => localStorage.setItem(`mstar_post.results.group.${project.id}`, groupBy), [groupBy, project.id]);
+  const [compareTask, setCompareTask] = useState<string | null>(null);
+  const [cmpSection, setCmpSection] = useState<CmpSection>("key");
+  const run = compareTask ? null : runs.find((r) => r.name === runName) ?? null;
   const ui = useDialog();
   const me = useUser();
   const runIds = run?.params?.cases;
   const runCases = Array.isArray(runIds) ? project.cases.filter((c) => runIds.includes(c.id)) : [];
   const openFile = (f: string) => { setFile(f); setSection("files"); };
+  const openRun = (name: string) => { setCompareTask(null); onRunChange(name); };
+  const taskLabel = (id: string | null) => tasks.find((t) => t.id === id)?.label ?? id ?? "unknown job type";
+  const byTask = runs.reduce((m, r) => m.set(r.task ?? "", [...(m.get(r.task ?? "") ?? []), r]), new Map<string, Run[]>());
 
   useEffect(() => { api.tasks().then(setTasks).catch(() => undefined); }, []);
 
@@ -117,17 +134,33 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
       {ui.dialog}
       <div className="side">
         <div className="row"><h3 className="grow">Runs</h3><button onClick={reload}>Refresh</button>
-          <button onClick={onReset} title="newest run, default file, no table filters">Reset</button></div>
+          <button onClick={() => { setCompareTask(null); onReset(); }} title="newest run, default file, no table filters">Reset</button></div>
+        {runs.length > 1 && <div className="row small">
+          <span className="muted">group</span>
+          <span className="seg">
+            <button className={groupBy === "task" ? "primary" : ""} onClick={() => setGroupBy("task")} title="runs grouped by job type, with a comparison of all cases per type">by job type</button>
+            <button className={groupBy === "date" ? "primary" : ""} onClick={() => setGroupBy("date")}>by date</button>
+          </span></div>}
         {runs.length > 0 && me.user && <div className="row small">
           <button disabled={renaming} onClick={() => renameBody(true)}
                   title="rename M-Star's 'Moving Body' / 'agitator' to 'Agitator' in the result files of every run">
             {renaming ? "Renaming..." : "Moving Body \u2192 Agitator (all runs)"}</button></div>}
         {renameNote && <div className="note small" onClick={() => setRenameNote(null)}>{renameNote}</div>}
-        {runs.map((r) => (
-          <div key={r.name} className={`taskcard${r.name === runName ? " active" : ""}`} onClick={() => onRunChange(r.name)}>
-            <span className={`status ${r.status}`}>{r.status}</span> <b>{r.label ?? r.task}</b>
-            <div className="small muted">{when(r.created_at)}{r.user && <> &middot; {r.user}</>}
-              {Array.isArray(r.params?.cases) && <> &middot; {(r.params.cases as string[]).length} case{(r.params.cases as string[]).length === 1 ? "" : "s"}</>}</div>
+        {(groupBy === "task" ? [...byTask.entries()] : [["", runs] as [string, Run[]]]).map(([tid, rs]) => (
+          <div key={tid || "all"} className="run-group">
+            {groupBy === "task" && (
+              <div className={`taskcard compare${compareTask === tid ? " active" : ""}`} onClick={() => setCompareTask(tid)}
+                   title="all cases of the project compared on the outputs of this job type (newest run per case)">
+                <b>{taskLabel(tid)}</b> <span className="muted small">&middot; {rs.length} run{rs.length === 1 ? "" : "s"}</span>
+                <div className="small">Compare all cases &rarr;</div>
+              </div>)}
+            {rs.map((r) => (
+              <div key={r.name} className={`taskcard${groupBy === "task" ? " nested" : ""}${run?.name === r.name ? " active" : ""}`} onClick={() => openRun(r.name)}>
+                <span className={`status ${r.status}`}>{r.status}</span> <b>{r.label ?? r.task}</b>
+                <div className="small muted">{when(r.created_at)}{r.user && <> &middot; {r.user}</>}
+                  {Array.isArray(r.params?.cases) && <> &middot; {(r.params.cases as string[]).length} case{(r.params.cases as string[]).length === 1 ? "" : "s"}</>}</div>
+              </div>
+            ))}
           </div>
         ))}
         {!runs.length && <div className="muted">No runs yet: start a calculation on the Run tab.</div>}
@@ -150,7 +183,32 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
         )}
       </div>
       <div className="main panel">
-        {run ? (
+        {compareTask !== null ? (
+          <>
+            <div className="row">
+              <h2 className="grow plain">{taskLabel(compareTask)} <span className="muted">across the project</span></h2>
+            </div>
+            <div className="row section-bar">
+              <span className="seg">
+                {CMP_SECTIONS.map(([k, label, help]) => (
+                  <button key={k} className={cmpSection === k ? "primary" : ""} title={help} onClick={() => setCmpSection(k)}>{label}</button>))}
+              </span>
+              <span className="small muted">{CMP_SECTIONS.find(([k]) => k === cmpSection)?.[2]}</span>
+            </div>
+            {cmpSection === "key" && (
+              <TaskComparison key={compareTask} project={project} task={tasks.find((t) => t.id === compareTask)}
+                              runs={byTask.get(compareTask) ?? []} onOpenRun={openRun} />)}
+            {cmpSection === "all" && (
+              <div className="card">
+                <AllResults key={compareTask} project={project} runs={byTask.get(compareTask) ?? []} storeKey={`task.${compareTask}`} />
+              </div>)}
+            {cmpSection === "series" && (
+              <div className="card">
+                <StatsSeries key={compareTask} project={project} multi storeKey={`task.${compareTask}`}
+                             runs={(byTask.get(compareTask) ?? []).filter((r) => r.status === "done" || r.status === "unknown")} />
+              </div>)}
+          </>
+        ) : run ? (
           <>
             <div className="row">
               <h2 className="grow plain">{run.label ?? run.name} <span className={`status ${run.status}`}>{run.status}</span></h2>
@@ -189,14 +247,18 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
               </>
             )}
 
+            {section === "all" && (
+              <div className="card">
+                <AllResults key={run.name} project={project} runs={[run]} storeKey={`run.${run.task ?? "x"}`} />
+              </div>
+            )}
+
             {section === "series" && (
               <div className="card">
                 <StatsSeries project={project} onSelect={(caseId, f, src) => setSeriesSel({ caseId, file: f, src })} />
-                {seriesSel && (
+                {seriesSel && seriesHtml && (
                   <div className="small muted">
-                    {seriesHtml ? <>The run's HTML plot of all variables of {seriesSel.file} for this case: <a onClick={() => openFile(seriesHtml)}>{seriesHtml}</a></>
-                      : seriesSel.src === "stats" ? <>This run has no plot of {seriesSel.file} for this case (run the Stats summary with HTML plots on it).</>
-                      : <>Select that job in the run list to open its own plot of {seriesSel.file}.</>}
+                    Legacy HTML plot of all variables of {seriesSel.file} for this case in this run: <a onClick={() => openFile(seriesHtml)}>{seriesHtml}</a>
                   </div>
                 )}
               </div>
@@ -221,7 +283,7 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
               </>
             )}
           </>
-        ) : <div className="muted">{runs.length ? "Select a run on the left." : "Results of finished jobs appear here: an overview of each run, its tables, HTML plots and images."}</div>}
+        ) : <div className="muted">{runs.length ? "Select a run on the left, or a job type to compare all cases on its outputs." : "Results of finished jobs appear here: an overview of each run, its key results, every table and the case time series."}</div>}
       </div>
     </div>
   );

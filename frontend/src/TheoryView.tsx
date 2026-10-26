@@ -376,8 +376,9 @@ const SECTIONS: Section[] = [
              T`\text{valid for } \mathrm{Po}^{1/3}\,\mathrm{Re} > 6370`],
         vars: [[T`t_{95}`, "95 % blend time [s]"], [T`\mathrm{Po},\ \mathrm{Re}`, "power number [W/W] and Reynolds number [N/N]"],
                [T`N,\ D`, "rotational speed [1/s] and impeller diameter [m]"], [T`T,\ H`, "tank diameter and liquid height [m] (see Tank geometry)"]],
-        where: "power_metrics ('Blend Time t95 Correlation'); compare with the RSD mixing time", refs: ["HIM-9"],
-        cite: "HIM eqs. (9-1) and (9-2), p. 509; turbulent limit p. 510" },
+        where: "power_metrics ('Blend Time t95 Correlation HIM eq. 9-1'); shown as 't95 blend (correlation)' in the result tables", refs: ["HIM-9"],
+        cite: "HIM eqs. (9-1) and (9-2), p. 509; turbulent limit p. 510",
+        note: "An empirical estimate from Po, N, D, T and H only: it is not a blend time measured in the simulation. A simulated mixing time comes from the RSD of a tracer (Mixing Time / 'mixed time' variables of the M-Star Stats, if a scalar was tracked); compare the two to check the correlation for the geometry." },
     ],
   },
   {

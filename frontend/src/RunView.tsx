@@ -21,6 +21,13 @@ export default function RunView({ project, onSubmitted }: {
   const task = tasks.find((t) => t.id === sel);
   const included = project.cases.filter((c) => c.included);
   const me = useUser();
+  // has the base summary been run on the selected cases yet? (add-ons build on it)
+  const [baseDone, setBaseDone] = useState<Set<string> | null>(null);
+  useEffect(() => {
+    api.runs(project.id).then((rs) => setBaseDone(new Set(rs.filter((r) => r.task === "stats_summary" && r.status === "done")
+      .flatMap((r) => (Array.isArray(r.params?.cases) ? (r.params.cases as string[]) : []))))).catch(() => undefined);
+  }, [project.id]);
+  const missingBase = baseDone ? included.filter((c) => !baseDone.has(c.id)) : [];
 
   useEffect(() => { api.tasks().then(setTasks).catch((e) => setError(e.message)); }, []);
   useEffect(() => { if (task) setValues(initial(task)); }, [task]);
@@ -47,22 +54,37 @@ export default function RunView({ project, onSubmitted }: {
       <div className="side">
         <h3>Calculations</h3>
         {!tasks.length && !error && <div className="muted">Loading...</div>}
-        {tasks.map((t) => (
-          <div key={t.id} className={`taskcard${t.id === sel ? " active" : ""}`} onClick={() => setSel(t.id)}>
-            <b>{t.label}</b>
-            <div className="small muted">{t.description}</div>
-          </div>
-        ))}
-        <div className="taskcard disabled">
-          <b>kLa from scalar dissolution</b>
-          <div className="small muted">planned</div>
-        </div>
+        {([["base", "Base", "run on every simulation first"], ["addon", "Add-ons", "extra physics on top of the base summary"]] as const).map(([g, title, hint]) => {
+          const ts = tasks.filter((t) => (t.group ?? "addon") === g);
+          if (!ts.length) return null;
+          return (
+            <div key={g} className="run-group">
+              <div className="small muted task-group" title={hint}>{title}</div>
+              {ts.map((t) => (
+                <div key={t.id} className={`taskcard${t.id === sel ? " active" : ""}`} onClick={() => setSel(t.id)}>
+                  <b>{t.label}</b>
+                  <div className="small muted">{t.description.split(/(?<=\.)\s/)[0]}</div>
+                </div>
+              ))}
+              {g === "addon" && <div className="taskcard disabled">
+                <b>kLa from scalar dissolution</b>
+                <div className="small muted">planned</div>
+              </div>}
+            </div>);
+        })}
       </div>
       <div className="main panel">
         {task && (
           <>
-            <h2>{task.label}</h2>
+            <h2>{task.label} <span className="tag">{(task.group ?? "addon") === "base" ? "base" : "add-on"}</span></h2>
             <p className="muted">{task.description}</p>
+            {(task.group ?? "addon") !== "base" && missingBase.length > 0 && (
+              <div className="note small" title={missingBase.map((c) => c.id).join("\n")}>
+                The base <b>M-Star Stats summary</b> has not been run yet for {missingBase.length === included.length ? "the selected cases" : `${missingBase.length} of the selected cases`}.
+                Add-ons work on their own, but the Results comparisons are most useful with the base summary present.
+                {" "}<a onClick={() => setSel("stats_summary")}>Run it first</a>
+              </div>
+            )}
             {!!task.presets.length && (
               <div className="row">
                 <span className="muted">Presets:</span>

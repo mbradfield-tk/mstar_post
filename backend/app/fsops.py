@@ -35,6 +35,16 @@ def _request(op: str, args: dict) -> dict:
             "protected": [str(config.DATA_DIR), str(_APP_DIR)]}
 
 
+def helper_stale() -> bool:
+    """True when the installed fs helper differs from the repo copy (needs deploy/update_helpers.sh)."""
+    if config.HELPER_MODE != "sudo":
+        return False
+    try:
+        return (config.HELPER_DIR / "fs").read_bytes() != (config.HELPER_SRC / "fs_helper.py").read_bytes()
+    except OSError:
+        return False
+
+
 def run_as(user: str | None, op: str, timeout: float = 90, **args) -> dict:
     """Result of one helper op, or HTTPException with the helper's status."""
     req = _request(op, args)
@@ -50,6 +60,9 @@ def run_as(user: str | None, op: str, timeout: float = 90, **args) -> dict:
             reply = {}
         if not reply:
             raise HTTPException(500, f"file helper failed as {user}: {(r.stderr or '').strip()[-400:] or r.returncode}")
+        if not reply.get("ok") and "unknown op" in str(reply.get("error", "")) and helper_stale():
+            raise HTTPException(501, "the installed file helper is older than the app: an admin must run "
+                                     "`sudo deploy/update_helpers.sh` on the server")
     else:
         reply = _module().handle(req)
     if not reply.get("ok"):

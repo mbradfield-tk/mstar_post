@@ -33,9 +33,9 @@ cd /data/mstar/python_tools/mstar_post/frontend && npm run build   # build the U
 sudo systemctl start mstar-post && systemctl status mstar-post
 ```
 
-Requirements: `mstar_user` exists (no sudo rights needed; the installer adds the narrow rule), accounts that run jobs are in group `mstar` (needed so the service and the user can both write the run folders), and `mstar_user` can read the case folders (for the viewer and case tables).
+Requirements: `mstar_user` exists (no sudo rights needed; the installer adds the narrow rule), accounts that run jobs are in group `mstar` (needed so the service and the user can both write the run folders), and `mstar_user` can read the case folders (for the viewer and case tables). Optional: FreeCAD (`freecadcmd`, `apt install freecad`) for the 3D preview of STEP/IGES files in the Files tab (STL needs nothing).
 
-Updating: `git pull`, `npm run build` in `frontend/`, `sudo systemctl restart mstar-post`. Re-run `install.sh` after changing the helpers or the tool paths.
+Updating: `git pull`, `npm run build` in `frontend/`, `sudo systemctl restart mstar-post`. After a change to `deploy/helpers/` also run `sudo deploy/update_helpers.sh` (the service uses the root-owned copies in `/usr/local/libexec/mstar_post`, not the repo files); `curl localhost:5045/api/health` shows `helpers_stale: true` when that is due. Re-run `install.sh` after changing the tool paths or the sudoers rule.
 
 Troubleshooting: `systemctl status mstar-post` and the log in `<data folder>/service.log` (readable by group `mstar`; also `sudo journalctl -u mstar-post`). *activating (auto-restart)* with exit code 1 usually means port 5045 is already taken, typically by a personal `./run.sh`: stop it (`pkill -f 'uvicorn app.main:app'`). If the service runs but the URL does not answer from other machines, open port 5045 in the server firewall (`sudo ufw allow 5045/tcp`).
 

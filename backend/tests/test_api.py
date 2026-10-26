@@ -162,7 +162,7 @@ def test_helpers_as_user(client, tmp_path, monkeypatch):
     p = client.post("/api/projects", json={"name": "hosted", "root": str(client.root)}).json()
     assert all(c["id_written"] for c in p["cases"])  # marker written through the helper
     run_dir = config.PROJECTS_DIR / p["id"] / "runs"
-    j = client.post(f"/api/projects/{p['id']}/run", json={"task": "stats_summary", "params": {"time": 1.5, "plot": False}}).json()
+    j = client.post(f"/api/projects/{p['id']}/run", json={"task": "stats_summary", "params": {"time": 1.5}}).json()
     j = wait(client, j["id"])
     log = client.get(f"/api/jobs/{j['id']}/log").json()["text"]
     assert j["status"] == "done", log
@@ -172,6 +172,24 @@ def test_helpers_as_user(client, tmp_path, monkeypatch):
     # a guest never triggers helper calls
     logout(client)
     assert client.get(f"/api/projects/{p['id']}").status_code == 200
+
+
+def test_task_registry_base_and_addons(client):
+    from app import tasks as T
+    ts = {t["id"]: t for t in client.get("/api/tasks").json()}
+    assert ts["stats_summary"]["group"] == "base" and ts["dispersion"]["group"] == "addon"
+    assert not any(p["name"] in ("dispersion", "uniformity") for p in ts["stats_summary"]["params"])
+    p = {"id": "x", "single": False, "root": "/r", "ref_case": "a"}
+    cases = [{"id": "a", "path": "/r/a"}]
+    base = T.STATS.build(p, cases, T.coerce(T.STATS, {}), Path("/tmp/run"))
+    assert "--dispersion" not in base[0]["argv"] and "--addons-only" not in base[0]["argv"] and "--plot" not in base[0]["argv"]
+    disp = T.DISPERSION.build(p, cases, T.coerce(T.DISPERSION, {"sigma": 0.03}), Path("/tmp/run"))
+    a = disp[0]["argv"]
+    assert {"--dispersion", "--uniformity", "--addons-only"} <= set(a) and "--plot" not in a and a[a.index("--sigma") + 1] == "0.03"
+    only = T.DISPERSION.build(p, cases, T.coerce(T.DISPERSION, {"uniformity": False}), Path("/tmp/run"))
+    assert "--uniformity" not in only[0]["argv"]
+    # the dispersion add-on runs the stats script, so the root launcher uses that task id
+    assert "stats_summary" in jobs.launcher_argv("dispersion", a, "bob") and "dispersion" not in jobs.launcher_argv("dispersion", a, "bob")[:8]
 
 
 def test_guest_and_login(client):
@@ -249,6 +267,11 @@ def test_fs_read(client):
     r = client.get("/api/fs/image", params={"path": str(d / "p.png")})
     assert r.status_code == 200 and r.headers["content-type"] == "image/png"
     assert client.get("/api/fs/image", params={"path": str(d / "log.txt")}).status_code == 422
+    # CAD preview: STL files come back as they are; other extensions are refused
+    r = client.get("/api/fs/mesh", params={"path": str(client.root / "R1" / "caseA" / "Vessel.stl")})
+    assert r.status_code == 200 and r.headers["content-type"].startswith("model/stl") and r.headers["x-mesh-source"] == "stl"
+    assert len(r.content) == (client.root / "R1" / "caseA" / "Vessel.stl").stat().st_size
+    assert client.get("/api/fs/mesh", params={"path": str(d / "log.txt")}).status_code == 422
     assert client.get("/api/fs/read", params={"path": "/etc/passwd"}).status_code == 403
     assert client.get("/api/fs/read", params={"path": str(d)}).status_code == 422
 
@@ -447,7 +470,7 @@ def test_stats_job_leaves_cases_untouched(client):
     assert {f.name for f, _ in before} >= {"mstar_post_case.json"}
     client.patch(f"/api/projects/{p['id']}", json={"included": {"R1/caseB": False}})
     j = client.post(f"/api/projects/{p['id']}/run",
-                    json={"task": "stats_summary", "params": {"time": 1.5, "plot": False}}).json()
+                    json={"task": "stats_summary", "params": {"time": 1.5}}).json()
     j = wait(client, j["id"])
     log = client.get(f"/api/jobs/{j['id']}/log").json()["text"]
     assert j["status"] == "done", log
@@ -526,7 +549,7 @@ def test_run_timeseries_single_case(client):
 def test_job_rerun_and_delete(client):
     p = client.post("/api/projects", json={"name": "rr", "root": str(client.root)}).json()
     j = client.post(f"/api/projects/{p['id']}/run",
-                    json={"task": "stats_summary", "params": {"time": 1.5, "plot": False}}).json()
+                    json={"task": "stats_summary", "params": {"time": 1.5}}).json()
     assert j["user"] == "tester"  # the logged-in account
     j = wait(client, j["id"])
     assert j["status"] == "done"
@@ -585,10 +608,10 @@ def test_case_aliases(client):
 def test_job_labels_unique_and_rename(client):
     p = client.post("/api/projects", json={"name": "lb", "root": str(client.root)}).json()
     body = {"task": "stats_summary", "cases": ["R2/caseA"],
-            "params": {"time": 1.5, "plot": False, "dispersion": True}}
+            "params": {"time": 1.5, "canon_body": False}}
     j1 = client.post(f"/api/projects/{p['id']}/run", json=body).json()
     j2 = client.post(f"/api/projects/{p['id']}/run", json=body).json()
-    assert j1["label"] == "M-Star Stats summary + dispersion, 1 case"
+    assert j1["label"] == "M-Star Stats summary, 1 case"
     assert j2["label"] == j1["label"] + " #2"
     wait(client, j1["id"]), wait(client, j2["id"])
     r = client.patch(f"/api/jobs/{j2['id']}", json={"label": " low rpm "})
