@@ -175,10 +175,11 @@ STATS = Task(
 
 
 def _per_case_dirs(cases: list[dict], run: Path) -> list[Path]:
+    from app.jobs import make_shared_dir
     dirs = []
     for c in cases:
         d = run / c["id"]
-        d.mkdir(parents=True, exist_ok=True)
+        make_shared_dir(d)
         dirs.append(d)
     return dirs
 

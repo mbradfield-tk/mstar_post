@@ -1,24 +1,48 @@
 import { useEffect, useState } from "react";
+import { api, type WhoAmI } from "./api";
 
-// Name of the person using this browser; sent as X-User with every request and
-// recorded on the jobs they start. Stored per browser (the app has no login).
-export const USER_KEY = "mstar_post.user";
+// Who is using the app: the server account behind the SSH tunnel, the account that
+// logged in with its password, or nobody (guest: read-only). Fetched once from
+// /api/whoami and shared by every component through a tiny store.
 const EVENT = "mstar_post:user";
+const GUEST: WhoAmI = { user: null, method: "none", admin: false, password_login: false, server_account: "" };
+let current: WhoAmI | null = null;
+let pending: Promise<WhoAmI> | null = null;
 
-export const getUser = (): string => localStorage.getItem(USER_KEY) ?? "";
-export function setUser(name: string): void {
-  const n = name.trim().slice(0, 64);
-  if (n) localStorage.setItem(USER_KEY, n);
-  else localStorage.removeItem(USER_KEY);
-  window.dispatchEvent(new Event(EVENT));
+export function refreshUser(): Promise<WhoAmI> {
+  pending = api.whoami().catch(() => GUEST).then((w) => {
+    current = w;
+    pending = null;
+    window.dispatchEvent(new Event(EVENT));
+    return w;
+  });
+  return pending;
 }
-export function useUser(): string {
-  const [u, setU] = useState(getUser);
+
+export function useUser(): WhoAmI & { loading: boolean; canManage: (...owners: (string | null | undefined)[]) => boolean } {
+  const [w, setW] = useState<WhoAmI | null>(current);
   useEffect(() => {
-    const on = () => setU(getUser());
+    const on = () => setW(current);
     window.addEventListener(EVENT, on);
-    window.addEventListener("storage", on);
-    return () => { window.removeEventListener(EVENT, on); window.removeEventListener("storage", on); };
+    if (!current && !pending) refreshUser();
+    return () => window.removeEventListener(EVENT, on);
   }, []);
-  return u;
+  const me = w ?? GUEST;
+  return {
+    ...me, loading: w === null,
+    canManage: (...owners) => !!me.user && (me.admin || owners.some((o) => o && o === me.user)),
+  };
 }
+
+export async function login(user: string, password: string): Promise<void> {
+  await api.login(user, password);
+  await refreshUser();
+}
+
+export async function logout(): Promise<void> {
+  await api.logout();
+  await refreshUser();
+}
+
+// a 401 from the API means the session expired or a guest tried to edit: let the header offer a login
+export const LOGIN_NEEDED = "mstar_post:login-needed";

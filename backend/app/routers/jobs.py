@@ -1,12 +1,26 @@
 """Job listing, logs, cancel and live status over WebSocket."""
 from pathlib import Path
 
-from fastapi import APIRouter, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-from app import jobs, tasks
+from app import config, jobs, tasks
+from app.auth import Identity, require_manage, require_user
 
 router = APIRouter(prefix="/api", tags=["jobs"])
+
+
+def _project_owners(pid: str) -> tuple[str | None, str | None]:
+    import json
+    try:
+        p = json.loads((config.PROJECTS_DIR / pid / "project.json").read_text())
+        return p.get("owner"), p.get("created_by")
+    except (OSError, ValueError):
+        return None, None
+
+
+def _manage(me: Identity, j: dict, what: str) -> None:
+    require_manage(me, what, j.get("user"), *_project_owners(j["project"]))
 
 
 class RenameRequest(BaseModel):
@@ -36,15 +50,15 @@ def get_job(jid: str) -> dict:
 
 
 @router.post("/jobs/{jid}/cancel")
-async def cancel(jid: str) -> dict:
-    _job(jid)
+async def cancel(jid: str, me: Identity = Depends(require_user)) -> dict:
+    _manage(me, _job(jid), "job")
     return await jobs.manager.cancel(jid)
 
 
 @router.delete("/jobs/{jid}")
-async def delete(jid: str) -> dict:
+async def delete(jid: str, me: Identity = Depends(require_user)) -> dict:
     """Delete a finished job and all its results (run folder)."""
-    _job(jid)
+    _manage(me, _job(jid), "job")
     try:
         await jobs.manager.delete(jid)
     except RuntimeError as e:
@@ -55,7 +69,7 @@ async def delete(jid: str) -> dict:
 
 
 @router.patch("/jobs/{jid}")
-async def rename(jid: str, body: RenameRequest) -> dict:
+async def rename(jid: str, body: RenameRequest, me: Identity = Depends(require_user)) -> dict:
     _job(jid)
     try:
         return await jobs.manager.rename(jid, body.label)
@@ -66,11 +80,11 @@ async def rename(jid: str, body: RenameRequest) -> dict:
 
 
 @router.post("/jobs/{jid}/rerun")
-async def rerun(jid: str, x_user: str | None = Header(None)) -> dict:
-    """Delete a finished job's results and run its commands again."""
-    _job(jid)
+async def rerun(jid: str, me: Identity = Depends(require_user)) -> dict:
+    """Delete a finished job's results and run its commands again (as the re-running user)."""
+    _manage(me, _job(jid), "job")
     try:
-        return await jobs.manager.rerun(jid, x_user)
+        return await jobs.manager.rerun(jid, me.user)
     except RuntimeError as e:
         raise HTTPException(409, str(e))
     except ValueError as e:

@@ -18,7 +18,7 @@ export type CatalogCase = {
 export type ProjectMeta = { owner: string; program: string; purpose: string };
 export type Project = {
   id: string; name: string; root: string; single: boolean; created: number; root_missing?: boolean;
-  cases: ProjectCase[]; ref_case: string | null; notes: string; aliases?: Record<string, string>;
+  cases: ProjectCase[]; ref_case: string | null; notes: string; aliases?: Record<string, string>; created_by?: string;
 } & Partial<ProjectMeta>;
 export const caseName = (p: Project, id: string) => p.aliases?.[id] || id;
 export type ProjectSummary = {
@@ -63,22 +63,22 @@ export type BrowseEntry = { name: string; path: string; dir: boolean; link: bool
   mtime: number; is_case: boolean };
 export type Browse = { path: string; parent: string | null; is_case: boolean; entries: BrowseEntry[];
   truncated: boolean; writable: boolean; disk: { total: number; used: number; free: number } };
+export type WhoAmI = { user: string | null; method: "ssh" | "password" | "none"; admin: boolean;
+  password_login: boolean; server_account: string };
 export type FileChunk = { path: string; size: number; mtime: number; offset: number; end: number;
   binary: boolean; text: string; image: boolean };
 export type DirUsage = { path: string; bytes: number; apparent: number; files: number; dirs: number;
   truncated: boolean; seconds: number; cached: boolean };
 
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
-  const user = localStorage.getItem("mstar_post.user");
-  const headers = new Headers(init?.headers);
-  if (user) headers.set("X-User", user);
-  const r = await fetch(url, { ...init, headers });
+  const r = await fetch(url, { ...init, credentials: "same-origin" });
   if (!r.ok) {
     let msg = `${r.status} ${r.statusText}`;
     try {
       const j = await r.json();
       msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail ?? j);
     } catch { /* not JSON */ }
+    if (r.status === 401 && !url.startsWith("/api/login")) window.dispatchEvent(new Event("mstar_post:login-needed"));
     throw new Error(msg);
   }
   return r.json() as Promise<T>;
@@ -98,6 +98,9 @@ const qs = (o: Record<string, string | number | boolean | string[] | undefined |
 };
 
 export const api = {
+  whoami: () => req<WhoAmI>("/api/whoami"),
+  login: (user: string, password: string) => req<{ user: string }>("/api/login", json("POST", { user, password })),
+  logout: () => req<{ user: null }>("/api/logout", { method: "POST" }),
   roots: () => req<{ path: string; exists: boolean }[]>("/api/fs/roots"),
   listDir: (path: string) => req<{
     path: string; parent: string | null; is_case: boolean;

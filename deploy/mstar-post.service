@@ -1,0 +1,31 @@
+[Unit]
+Description=M-Star Post (CFD post-processing web app)
+After=network.target
+
+[Service]
+Type=simple
+User=mstar_user
+Group=mstar
+# run outputs must stay writable by the service group (jobs run as other users)
+UMask=0002
+WorkingDirectory=/data/mstar/python_tools/mstar_post
+Environment=HOST=0.0.0.0
+Environment=PORT=5045
+Environment=MSTAR_POST_DATA=/data/mstar/mstar_post_data
+Environment=MSTAR_POST_ROOTS=/data:/data2
+Environment=MSTAR_POST_WRITE_ROOTS=/data:/data2
+Environment=MSTAR_POST_MAX_JOBS=1
+# comma-separated accounts that may manage everyone's projects and jobs
+Environment=MSTAR_POST_ADMINS=
+Environment=TMPDIR=/data/mstar/.tmp
+ExecStart=/data/mstar/python_tools/mstar_post/run.sh
+# also in `journalctl -u mstar-post`; the file is readable by group mstar without root
+StandardOutput=append:/data/mstar/mstar_post_data/service.log
+StandardError=append:/data/mstar/mstar_post_data/service.log
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

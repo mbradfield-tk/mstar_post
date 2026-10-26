@@ -4,6 +4,7 @@ import CaseNames from "./CaseNames";
 import { SimTimeTable, simTimeSummary } from "./CasesView";
 import CsvTableView from "./CsvTableView";
 import { useDialog } from "./Dialog";
+import { useUser } from "./user";
 import RunSummary from "./RunSummary";
 import StatsSeries from "./StatsSeries";
 
@@ -39,6 +40,7 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
   const [seriesSel, setSeriesSel] = useState<{ caseId: string; file: string; src: string } | null>(null);
   const run = runs.find((r) => r.name === runName) ?? null;
   const ui = useDialog();
+  const me = useUser();
   const runIds = run?.params?.cases;
   const runCases = Array.isArray(runIds) ? project.cases.filter((c) => runIds.includes(c.id)) : [];
   const openFile = (f: string) => { setFile(f); setSection("files"); };
@@ -116,7 +118,7 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
       <div className="side">
         <div className="row"><h3 className="grow">Runs</h3><button onClick={reload}>Refresh</button>
           <button onClick={onReset} title="newest run, default file, no table filters">Reset</button></div>
-        {runs.length > 0 && <div className="row small">
+        {runs.length > 0 && me.user && <div className="row small">
           <button disabled={renaming} onClick={() => renameBody(true)}
                   title="rename M-Star's 'Moving Body' / 'agitator' to 'Agitator' in the result files of every run">
             {renaming ? "Renaming..." : "Moving Body \u2192 Agitator (all runs)"}</button></div>}
@@ -153,9 +155,10 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
             <div className="row">
               <h2 className="grow plain">{run.label ?? run.name} <span className={`status ${run.status}`}>{run.status}</span></h2>
               <a className="button" href={api.zipUrl(project.id, run.path)}>Download run (.zip)</a>
-              <button disabled={renaming} onClick={() => renameBody(false)}
-                      title="rename M-Star's 'Moving Body' / 'agitator' to 'Agitator' in this run's result files">Moving Body {"\u2192"} Agitator</button>
-              <button className="danger" onClick={del} title="delete this run and all its outputs">Delete run</button>
+              {me.user && <button disabled={renaming} onClick={() => renameBody(false)}
+                      title="rename M-Star's 'Moving Body' / 'agitator' to 'Agitator' in this run's result files">Moving Body {"\u2192"} Agitator</button>}
+              {me.user && <button className="danger" disabled={!me.canManage(run.user, project.owner, project.created_by)} onClick={del}
+                      title={me.canManage(run.user, project.owner, project.created_by) ? "delete this run and all its outputs" : `only ${run.user ?? "the owner"}, the project owner or an admin can delete this run`}>Delete run</button>}
             </div>
             <div className="row small muted">
               <span>{tasks.find((t) => t.id === run.task)?.label ?? run.task}</span>

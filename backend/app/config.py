@@ -33,6 +33,25 @@ ZONER_PY = os.environ.get("MSTAR_ZONER_PY", _tool_python("cfd_zoner"))
 CALC_UA = Path(os.environ.get("MSTAR_CALC_UA", TOOLS_DIR / "heat_transfer" / "calc_ua.py"))
 CALC_UA_PY = os.environ.get("MSTAR_CALC_UA_PY", _tool_python("heat_transfer"))
 
+# --- multi-user hosting -------------------------------------------------------------
+# Root-installed helpers (deploy/install.sh) let the service act as the logged-in user:
+# fs = file operations, run = job launcher, auth = PAM password check. HELPER_MODE
+# "sudo" uses them via `sudo -n -u <user>`; "direct" (no helpers installed, tests, dev)
+# runs file operations in-process and jobs as the server account.
+HELPER_DIR = Path(os.environ.get("MSTAR_POST_HELPER_DIR", "/usr/local/libexec/mstar_post"))
+HELPER_MODE = os.environ.get("MSTAR_POST_HELPER_MODE") or (
+    "sudo" if (HELPER_DIR / "fs").is_file() and (HELPER_DIR / "run").is_file() else "direct")
+# the repo copies of the helpers, imported in direct mode
+HELPER_SRC = Path(__file__).resolve().parents[2] / "deploy" / "helpers"
+# how helpers are invoked as another user (tests replace this with a fake sudo)
+SUDO = os.environ.get("MSTAR_POST_SUDO", "sudo -n").split()
+# accounts allowed to manage everyone's projects/jobs (the server account always is)
+ADMINS = {a.strip() for a in os.environ.get("MSTAR_POST_ADMINS", "").split(",") if a.strip()}
+# system accounts below this uid never count as logged-in users
+MIN_UID = int(os.environ.get("MSTAR_POST_MIN_UID", "1000"))
+SESSION_HOURS = float(os.environ.get("MSTAR_POST_SESSION_HOURS", "12"))
+SECRET_PATH = DATA_DIR / "secret.key"
+
 
 def ensure_dirs() -> None:
     for d in (PROJECTS_DIR, CACHE_DIR):

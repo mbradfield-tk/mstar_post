@@ -103,6 +103,9 @@ header .user-btn { border-color: rgba(255, 255, 255, 0.2); max-width: 180px; ove
 header .user-btn::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--ok); vertical-align: 1px; }
 header .user-btn.unset { color: #fcd34d; }
 header .user-btn.unset::before { background: #f59e0b; }
+header .user-badge { display: inline-flex; align-items: center; gap: 6px; color: #e2e8f0; padding: 0 6px; white-space: nowrap; max-width: 240px; }
+header .user-badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex-shrink: 0; }
+header .user-badge button { padding: 2px 8px; }
 main { padding: 12px; flex: 1; }
 
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; box-shadow: var(--shadow); }

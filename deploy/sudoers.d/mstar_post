@@ -1,0 +1,8 @@
+# sudo rules for the M-Star Post service account (installed by deploy/install.sh).
+# mstar_user is NOT a general sudoer: it may run exactly these root-owned helpers.
+#   auth  (as root)            verify a server account's password with PAM
+#   fs    (as any user, !root) file operations with that user's permissions
+#   run   (as any user, !root) start a whitelisted post-processing job as that user
+Defaults!/usr/local/libexec/mstar_post/auth, /usr/local/libexec/mstar_post/fs, /usr/local/libexec/mstar_post/run !requiretty, env_reset, !lecture
+mstar_user ALL=(root) NOPASSWD: /usr/local/libexec/mstar_post/auth
+mstar_user ALL=(ALL, !root) NOPASSWD: /usr/local/libexec/mstar_post/fs, /usr/local/libexec/mstar_post/run

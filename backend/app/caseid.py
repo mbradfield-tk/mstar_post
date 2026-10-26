@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import secrets
-import time
 from pathlib import Path
 
 from app import config
@@ -26,24 +25,13 @@ def read_marker(case: Path) -> str | None:
 
 
 def write_marker(case: Path, uid: str, user: str | None) -> bool:
-    """Write (or refresh) the marker; False if the folder is not writable."""
-    try:
-        old = json.loads((case / MARKER).read_text())
-        if not isinstance(old, dict):
-            old = {}
-    except (OSError, ValueError):
-        old = {}
-    if old.get("uid") == uid:
-        return True
-    d = {**old, "uid": uid, "app": "mstar_post", "created": old.get("created") or time.time(),
-         "created_by": old.get("created_by") or user or "", "case_folder": case.name}
-    try:
-        tmp = case / (MARKER + ".tmp")
-        tmp.write_text(json.dumps(d, indent=2))
-        tmp.replace(case / MARKER)
-        return True
-    except OSError:
+    """Write (or refresh) the marker as `user` (fs helper); False if not writable or
+    when there is no acting user on a server with helpers (guests never write)."""
+    from app import config, fsops
+    if config.HELPER_MODE == "sudo" and not user:
         return False
+    r = fsops.try_run_as(user, "write_marker", path=str(case), uid=uid, created_by=user or "")
+    return bool(r and r.get("written"))
 
 
 def known_uids() -> set[str]:
@@ -79,7 +67,8 @@ def ensure_uids(p: dict, user: str | None = None, taken: set[str] | None = None)
             uid = new_uid(taken)
         if uid != c.get("uid"):
             c["uid"], changed = uid, True
-        written = write_marker(folder, uid, user) if folder.is_dir() else False
-        if written != c.get("id_written"):
-            c["id_written"], changed = written, True
+        if folder.is_dir() and (not c.get("id_written") or marker != uid):
+            written = write_marker(folder, uid, user)
+            if written != c.get("id_written"):
+                c["id_written"], changed = written, True
     return changed

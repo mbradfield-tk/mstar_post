@@ -20,7 +20,7 @@ export default function RunView({ project, onSubmitted }: {
   const [busy, setBusy] = useState(false);
   const task = tasks.find((t) => t.id === sel);
   const included = project.cases.filter((c) => c.included);
-  const user = useUser();
+  const me = useUser();
 
   useEffect(() => { api.tasks().then(setTasks).catch((e) => setError(e.message)); }, []);
   useEffect(() => { if (task) setValues(initial(task)); }, [task]);
@@ -86,15 +86,15 @@ export default function RunView({ project, onSubmitted }: {
               <div className="small mono muted">{included.map((c) => c.id).join(", ") || "none: include cases on the Cases tab first"}</div>
               {project.ref_case && <div className="small">reference case: <span className="mono">{project.ref_case}</span></div>}
               <div className="small muted">Outputs go to the project folder; case folders are only read.
-                {" "}The job is recorded as started by <b>{user || "the server account"}</b>{!user && " (set your name in the header to be named instead)"}.</div>
+                {me.user ? <> The job runs as and is recorded for <b>{me.user}</b>.</> : <> <b>Guests cannot start jobs:</b> log in with your server account (header).</>}</div>
             </div>
             {error && <div className="error">{error}</div>}
             <div className="row">
               <label>Job name <input className="wide" value={name} onChange={(e) => setName(e.target.value)}
                 placeholder="default: task + options + case count" /></label>
             </div>
-            <button className="primary big" disabled={busy || !included.length} onClick={submit}
-                    title={included.length ? undefined : "include at least one case on the Cases tab"}>
+            <button className="primary big" disabled={busy || !included.length || !me.user} onClick={submit}
+                    title={!me.user ? "log in to run calculations" : included.length ? undefined : "include at least one case on the Cases tab"}>
               {busy ? "Submitting..." : "Run"}
             </button>
           </>

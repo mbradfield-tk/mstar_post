@@ -11,7 +11,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 pv = pytest.importorskip("pyvista")
 vtk = pytest.importorskip("vtk")
 
-from app import config, jobs  # noqa: E402
+from app import auth, config, jobs  # noqa: E402
+
+PASSWORD = "pw"  # the patched password check accepts any user with this password
+
+
+def login(c, user: str) -> None:
+    r = c.post("/api/login", json={"user": user, "password": PASSWORD})
+    assert r.status_code == 200, r.text
+
+
+def logout(c) -> None:
+    c.post("/api/logout")
+    c.cookies.clear()
 
 FLUID_HEADER = ["Time [s]", "Fluid Volume [m^3]", "Mean Velocity [m/s]",
                 "Mean Energy Dissipation Rate [W/kg]"]
@@ -80,6 +92,10 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "PROJECTS_DIR", tmp_path / "app" / "projects")
     monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "app" / "cache")
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "app" / "jobs.db")
+    monkeypatch.setattr(config, "SECRET_PATH", tmp_path / "app" / "secret.key")
+    monkeypatch.setattr(config, "HELPER_MODE", "direct")
+    monkeypatch.setattr(auth, "verify_password", lambda u, p: (p == PASSWORD, "" if p == PASSWORD else "bad password"))
+    auth._fail_log.clear()
     (tmp_path / "app").mkdir()
     from fastapi.testclient import TestClient
 
@@ -87,11 +103,109 @@ def client(tmp_path, monkeypatch):
     jobs.manager.__init__()
     with TestClient(app) as c:
         c.root = root.resolve()
+        login(c, "tester")
         yield c
 
 
 def snapshot(root: Path) -> list:
     return sorted((p, p.stat().st_mtime_ns) for p in root.rglob("*"))
+
+
+def test_tunnel_identity():
+    """The owner of a loopback client socket is found in /proc/net/tcp (SSH tunnel login)."""
+    import os
+    import socket
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    cli = socket.create_connection(srv.getsockname())
+    conn, _ = srv.accept()
+    try:
+        ip, port = cli.getsockname()
+        assert auth._socket_uid(ip, port, srv.getsockname()[1]) == os.getuid()
+        assert auth._socket_uid(ip, port, srv.getsockname()[1] + 1 if srv.getsockname()[1] < 65535 else 1) is None
+    finally:
+        conn.close(); cli.close(); srv.close()
+    assert auth.read_token(auth.make_token("ann")) == "ann"
+    assert auth.read_token(auth.make_token("ann")[:-2] + "zz") is None
+
+
+def test_helpers_as_user(client, tmp_path, monkeypatch):
+    """Hosted mode: file operations and jobs go through the helpers as the logged-in
+    user. A fake sudo (drops "-u <user>", runs the helper as us) exercises the protocol."""
+    import os
+    import stat as st
+    hd = tmp_path / "helpers"
+    hd.mkdir()
+    for src, dst in (("fs_helper.py", "fs"), ("run_helper.py", "run")):
+        (hd / dst).write_text((config.HELPER_SRC / src).read_text())
+        os.chmod(hd / dst, 0o755)
+    fake = tmp_path / "fakesudo"
+    fake.write_text("#!/bin/sh\nshift 2\nexec \"$@\"\n")  # sudo -u USER cmd... -> cmd...
+    os.chmod(fake, 0o755)
+    conf = tmp_path / "helper.conf"
+    conf.write_text(json.dumps({"tasks": {"stats_summary": [config.STATS_SUMMARY_PY, str(config.STATS_SUMMARY)]},
+                                "interpreters": [sys.executable]}))
+    monkeypatch.setenv("MSTAR_POST_HELPER_CONF", str(conf))
+    monkeypatch.setattr(config, "HELPER_DIR", hd)
+    monkeypatch.setattr(config, "HELPER_MODE", "sudo")
+    monkeypatch.setattr(config, "SUDO", [str(fake)])
+    # "tester" is not the server account -> helper path
+    assert client.get("/api/fs/whoami").json() == {"uid": os.getuid(), "user": auth.server_account(), "mode": "sudo"}
+    b = client.get("/api/fs/browse", params={"path": str(client.root)}).json()
+    assert [e["name"] for e in b["entries"]] == ["R1", "R2"]
+    assert client.post("/api/fs/mkdirs", json={"parent": str(client.root / "R2"), "names": ["viahelper"]}).json()["created"] == ["viahelper"]
+    assert (client.root / "R2" / "viahelper").is_dir()
+    assert client.get("/api/fs/read", params={"path": str(client.root / "R1" / "caseA" / "input.xml")}).json()["text"].startswith("<input>")
+    assert client.get("/api/fs/browse", params={"path": "/etc"}).status_code == 403
+    p = client.post("/api/projects", json={"name": "hosted", "root": str(client.root)}).json()
+    assert all(c["id_written"] for c in p["cases"])  # marker written through the helper
+    run_dir = config.PROJECTS_DIR / p["id"] / "runs"
+    j = client.post(f"/api/projects/{p['id']}/run", json={"task": "stats_summary", "params": {"time": 1.5, "plot": False}}).json()
+    j = wait(client, j["id"])
+    log = client.get(f"/api/jobs/{j['id']}/log").json()["text"]
+    assert j["status"] == "done", log
+    assert "/run --task stats_summary --" in log and (Path(j["run_dir"]) / "batch_summary_means.csv").is_file()
+    assert st.S_IMODE(Path(j["run_dir"]).stat().st_mode) == 0o2775
+    assert run_dir.is_dir()
+    # a guest never triggers helper calls
+    logout(client)
+    assert client.get(f"/api/projects/{p['id']}").status_code == 200
+
+
+def test_guest_and_login(client):
+    p = client.post("/api/projects", json={"name": "g", "root": str(client.root)}).json()
+    assert client.get("/api/whoami").json()["user"] == "tester"
+    logout(client)
+    w = client.get("/api/whoami").json()
+    assert w["user"] is None and w["method"] == "none"
+    # guests read everything but change nothing
+    assert client.get("/api/projects").status_code == 200
+    assert client.get(f"/api/projects/{p['id']}").status_code == 200
+    assert client.get("/api/cases").status_code == 200
+    assert client.get("/api/fs/browse", params={"path": str(client.root)}).status_code == 401
+    assert client.post("/api/projects", json={"name": "x", "root": str(client.root)}).status_code == 401
+    assert client.patch(f"/api/projects/{p['id']}", json={"included": {"R1/caseA": False}}).status_code == 401
+    assert client.post(f"/api/projects/{p['id']}/run", json={"task": "stats_summary"}).status_code == 401
+    assert client.delete(f"/api/projects/{p['id']}").status_code == 401
+    # wrong password, throttling, then a good login
+    assert client.post("/api/login", json={"user": "tester", "password": "nope"}).status_code == 401
+    for _ in range(4):
+        client.post("/api/login", json={"user": "tester", "password": "nope"})
+    assert client.post("/api/login", json={"user": "tester", "password": PASSWORD}).status_code == 429
+    auth._fail_log.clear()
+    login(client, "bob")
+    assert client.get("/api/whoami").json() == {"user": "bob", "method": "password", "admin": False,
+                                                 "password_login": False, "server_account": auth.server_account()}
+    # bob may edit but not delete tester's project; the server account is an admin
+    assert client.patch(f"/api/projects/{p['id']}", json={"included": {"R1/caseA": False}}).status_code == 200
+    assert client.delete(f"/api/projects/{p['id']}").status_code == 403
+    assert client.patch(f"/api/projects/{p['id']}", json={"owner": "bob"}).status_code == 403
+    logout(client)
+    login(client, auth.server_account())
+    assert client.get("/api/whoami").json()["admin"]
+    assert client.delete(f"/api/projects/{p['id']}").status_code == 200
+    assert client.get("/api/fs/whoami").json()["mode"] == "direct"
 
 
 def test_path_guard(client, tmp_path):
@@ -168,11 +282,11 @@ def test_fs_create_and_delete(client, monkeypatch):
 
 
 def test_case_uids(client):
-    p = client.post("/api/projects", headers={"X-User": "Ada"}, json={"name": "u1", "root": str(client.root)}).json()
+    p = client.post("/api/projects", json={"name": "u1", "root": str(client.root)}).json()
     uids = {c["id"]: c["uid"] for c in p["cases"]}
     assert len(set(uids.values())) == 3 and all(len(u) == 12 for u in uids.values())
     marker = json.loads((client.root / "R1" / "caseA" / "mstar_post_case.json").read_text())
-    assert marker["uid"] == uids["R1/caseA"] and marker["created_by"] == "Ada"
+    assert marker["uid"] == uids["R1/caseA"] and marker["created_by"] == "tester"
     assert all(c["id_written"] for c in p["cases"])
     # the same folder in a second project keeps its uid (read from the marker)
     p2 = client.post("/api/projects", json={"name": "u2", "root": str(client.root / "R1")}).json()
@@ -189,9 +303,9 @@ def test_case_uids(client):
 
 
 def test_project_metadata(client):
-    p = client.post("/api/projects", headers={"X-User": "Ada"},
+    p = client.post("/api/projects",
                     json={"name": "meta", "root": str(client.root), "program": " TAK-360 ", "purpose": "pipeline"}).json()
-    assert (p["owner"], p["program"], p["purpose"]) == ("Ada", "TAK-360", "pipeline")  # owner defaults to the user
+    assert (p["owner"], p["program"], p["purpose"]) == ("tester", "TAK-360", "pipeline")  # owner defaults to the user
     p = client.patch(f"/api/projects/{p['id']}", json={"owner": "Bob", "purpose": "x" * 100}).json()
     assert p["owner"] == "Bob" and len(p["purpose"]) == 80 and p["program"] == "TAK-360"
     s = next(x for x in client.get("/api/projects").json() if x["id"] == p["id"])
@@ -408,18 +522,24 @@ def test_run_timeseries_single_case(client):
 
 def test_job_rerun_and_delete(client):
     p = client.post("/api/projects", json={"name": "rr", "root": str(client.root)}).json()
-    j = client.post(f"/api/projects/{p['id']}/run", headers={"X-User": "  Ada <L>  "},
+    j = client.post(f"/api/projects/{p['id']}/run",
                     json={"task": "stats_summary", "params": {"time": 1.5, "plot": False}}).json()
-    assert j["user"] == "Ada L"  # X-User header, cleaned
+    assert j["user"] == "tester"  # the logged-in account
     j = wait(client, j["id"])
     assert j["status"] == "done"
     run = Path(j["run_dir"])
-    assert json.loads((run / "job.json").read_text())["user"] == "Ada L"
-    assert client.get(f"/api/projects/{p['id']}/runs").json()[0]["user"] == "Ada L"
+    assert json.loads((run / "job.json").read_text())["user"] == "tester"
+    assert client.get(f"/api/projects/{p['id']}/runs").json()[0]["user"] == "tester"
     marker = run / "stale.txt"
     marker.write_text("old")
-    j2 = client.post(f"/api/jobs/{j['id']}/rerun", headers={"X-User": "Bob"}).json()
-    assert j2["id"] == j["id"] and j2["status"] in ("queued", "running") and j2["user"] == "Bob"
+    logout(client)
+    login(client, "bob")  # neither the job's user nor the project owner
+    assert client.post(f"/api/jobs/{j['id']}/rerun").status_code == 403
+    assert client.delete(f"/api/jobs/{j['id']}").status_code == 403
+    logout(client)
+    login(client, auth.server_account())  # admin
+    j2 = client.post(f"/api/jobs/{j['id']}/rerun").json()
+    assert j2["id"] == j["id"] and j2["status"] in ("queued", "running") and j2["user"] == auth.server_account()
     assert not marker.exists()
     j2 = wait(client, j["id"])
     assert j2["status"] == "done" and (run / "batch_summary.csv").is_file()

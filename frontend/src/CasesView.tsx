@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { api, caseName, download, fmt, toCsv, type Project, type ProjectCase } from "./api";
 import ProjectMetaEditor from "./ProjectMeta";
+import { useUser } from "./user";
 
 // Key settings shown as columns (matched by prefix).
 const KEY_SETTINGS = ["Volume [L]", "Agitator speed [rpm]", "Simulated time (input runtime)", "Wall time", "Iterations",
@@ -97,19 +98,28 @@ export default function CasesView({ project, onChange }: {
       ...cols.map((k) => c.info?.settings?.[k] ?? "")])));
 
   const nIncl = project.cases.filter((c) => c.included).length;
+  const me = useUser();
+  const ro = !me.user;  // guests see the table but change nothing
   return (
     <div className="panel">
       <div className="row">
         <h2 className="grow">Cases <span className="muted">({nIncl} of {project.cases.length} selected)</span></h2>
         <input placeholder="filter cases" value={filter} onChange={(e) => setFilter(e.target.value)} />
-        <button onClick={() => setIncluded(shown.map((c) => c.id), true)}>Select shown</button>
-        <button onClick={() => setIncluded(shown.map((c) => c.id), false)}>Deselect shown</button>
+        <button disabled={ro} onClick={() => setIncluded(shown.map((c) => c.id), true)}>Select shown</button>
+        <button disabled={ro} onClick={() => setIncluded(shown.map((c) => c.id), false)}>Deselect shown</button>
         <button onClick={() => setShowDiff(!showDiff)}>{showDiff ? "Hide" : "Compare"} settings</button>
         <button onClick={exportTable}>Export CSV</button>
-        <button disabled={busy} onClick={rediscover}>{busy ? "Scanning..." : "Rediscover"}</button>
+        <button disabled={busy || ro} onClick={rediscover}>{busy ? "Scanning..." : "Rediscover"}</button>
       </div>
       <div className="muted small mono">{project.root}</div>
-      <ProjectMetaEditor project={project} onChange={onChange} />
+      {ro ? (
+        <div className="row small meta-row">
+          {project.owner && <span><span className="muted">Owner</span> {project.owner}</span>}
+          {project.program && <span><span className="muted">Associated project</span> {project.program}</span>}
+          {project.purpose && <span><span className="muted">Purpose</span> {project.purpose}</span>}
+          <span className="muted">Viewing as guest: log in to select cases or edit the project.</span>
+        </div>
+      ) : <ProjectMetaEditor project={project} onChange={onChange} />}
       <div className="small">
         <span className="muted">Tick the cases to work on: only selected cases are used by Run, Plots, Viewer and the case time series until you change the selection. </span>
         Selected cases: {simTimeSummary(project.cases.filter((c) => c.included))}
@@ -131,16 +141,16 @@ export default function CasesView({ project, onChange }: {
           {[...groups].map(([g, cs]) => [
             g && (
               <tr key={`g-${g}`} className="group">
-                <td><input type="checkbox" checked={cs.every((c) => c.included)}
+                <td><input type="checkbox" checked={cs.every((c) => c.included)} disabled={ro}
                            onChange={(e) => setIncluded(cs.map((c) => c.id), e.target.checked)} /></td>
                 <td colSpan={5 + cols.length}><b>{g}</b> <span className="muted">({cs.length})</span></td>
               </tr>
             ),
             ...cs.map((c) => (
               <tr key={c.id} className={c.included ? "" : "excluded"}>
-                <td><input type="checkbox" checked={c.included}
+                <td><input type="checkbox" checked={c.included} disabled={ro}
                            onChange={(e) => setIncluded([c.id], e.target.checked)} /></td>
-                <td><input type="radio" checked={project.ref_case === c.id}
+                <td><input type="radio" checked={project.ref_case === c.id} disabled={ro}
                            onChange={() => patch({ ref_case: c.id })} /></td>
                 <td className="mono" title={c.path}>{g ? c.id.slice(g.length + 1) : c.id}
                   {c.info?.error && <span className="error"> {c.info.error}</span>}</td>

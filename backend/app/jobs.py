@@ -28,8 +28,8 @@ _KILL_GRACE_S = 10.0
 
 
 def clean_user(name: str | None) -> str:
-    """Display name of the person who started a job: the browser's X-User header
-    (printable, <= 64 chars) or, without one, the account running the server."""
+    """Display name of the person who started a job (printable, <= 64 chars) or,
+    without one, the account running the server."""
     n = re.sub(r"[^\w .@'\-]", "", (name or "").strip())[:64].strip()
     if n:
         return n
@@ -37,6 +37,30 @@ def clean_user(name: str | None) -> str:
         return getpass.getuser()
     except Exception:
         return "unknown"
+
+
+def runs_as_user(user: str | None) -> bool:
+    """True when this job's processes must be started as `user` through the
+    root-installed launcher (hosted mode, user other than the service account)."""
+    return config.HELPER_MODE == "sudo" and bool(user) and user != clean_user(None)
+
+
+def make_shared_dir(d: Path) -> None:
+    """Create a run folder that both the service account and the job's user can
+    write to: group-writable with setgid (the service runs with group `mstar`)."""
+    d.mkdir(parents=True, exist_ok=True)
+    if config.HELPER_MODE == "sudo":
+        try:
+            os.chmod(d, 0o2775)
+        except OSError:
+            pass
+
+
+def launcher_argv(task: str, argv: list[str], user: str) -> list[str]:
+    """`sudo -n -u user run --task <task> -- <args>`: the launcher supplies the
+    interpreter and script of the task itself (custom_script passes both)."""
+    args = argv if task == "custom_script" else argv[2:]
+    return [*config.SUDO, "-u", user, str(config.HELPER_DIR / "run"), "--task", task, "--", *args]
 
 
 def _conn() -> sqlite3.Connection:
@@ -111,11 +135,11 @@ def _clear_run_dir(j: dict, recreate: bool) -> Path:
         raise ValueError(f"run folder {run} is not inside {base}")
     shutil.rmtree(run, ignore_errors=True)
     if recreate:
-        run.mkdir(parents=True)
+        make_shared_dir(run)
         for cmd in j["commands"]:
             cwd = cmd.get("cwd")
             if cwd and under(Path(cwd).resolve(), run):
-                Path(cwd).mkdir(parents=True, exist_ok=True)
+                make_shared_dir(Path(cwd))
     return run
 
 
@@ -272,9 +296,13 @@ class JobManager:
         p = self._procs.get(jid)
         if p is not None and p.returncode is None:
             try:
-                os.killpg(p.pid, sig)
+                os.killpg(p.pid, sig)  # reaches sudo (same real uid), which relays to the job
             except OSError:
                 pass
+            j = get_job(jid)
+            if j and runs_as_user(j.get("user")):  # the user's own processes in the group
+                from app import fsops
+                fsops.try_run_as(j["user"], "kill", pgid=p.pid, sig=int(sig))
 
     async def _kill_later(self, jid: str) -> None:
         await asyncio.sleep(_KILL_GRACE_S)
@@ -291,11 +319,13 @@ class JobManager:
                 if jid in self._cancel:
                     break
                 _update(jid, step=i)
+                argv = launcher_argv(j["task"], cmd["argv"], j["user"]) \
+                    if runs_as_user(j.get("user")) else cmd["argv"]
                 with open(log, "ab") as fh:
-                    fh.write(f"\n$ {' '.join(cmd['argv'])}\n".encode())
+                    fh.write(f"\n$ {' '.join(argv)}\n".encode())
                     fh.flush()
                     p = await asyncio.create_subprocess_exec(
-                        *cmd["argv"], cwd=cmd.get("cwd") or j["run_dir"],
+                        *argv, cwd=cmd.get("cwd") or j["run_dir"],
                         stdout=fh, stderr=asyncio.subprocess.STDOUT,
                         stdin=asyncio.subprocess.DEVNULL, start_new_session=True,
                         env={**os.environ, "PYTHONUNBUFFERED": "1",

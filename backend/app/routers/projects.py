@@ -11,7 +11,7 @@ import time
 import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import numpy as np
@@ -19,6 +19,7 @@ import numpy as np
 from app import cases, config, jobs, tasks
 from app import caseid
 from app import cases as cases_mod
+from app.auth import Identity, current_user, require_manage, require_user
 from app.paths import safe_child, safe_path
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -27,17 +28,18 @@ _ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 @catalog.get("")
-def all_cases(details: bool = True, x_user: str | None = Header(None)) -> list[dict]:
+def all_cases(details: bool = True, me: Identity | None = Depends(current_user)) -> list[dict]:
     """Every case of every project, one row per case uid (a folder used by several
     projects appears once with all of them), with its marker status and case info."""
     rows: dict[str, dict] = {}
     taken = caseid.known_uids()
+    user = me.user if me else None
     for f in sorted(config.PROJECTS_DIR.glob("*/project.json")):
         try:
             p = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
-        if caseid.ensure_uids(p, x_user, taken):
+        if caseid.ensure_uids(p, user, taken):
             save(p)
         for c in p["cases"]:
             r = rows.setdefault(c["uid"], {
@@ -127,7 +129,7 @@ def list_projects() -> list[dict]:
 
 
 @router.post("")
-def create_project(body: NewProject, x_user: str | None = Header(None)) -> dict:
+def create_project(body: NewProject, me: Identity = Depends(require_user)) -> dict:
     root = safe_path(body.root)
     if not root.is_dir():
         raise HTTPException(422, "root must be a directory")
@@ -141,18 +143,18 @@ def create_project(body: NewProject, x_user: str | None = Header(None)) -> dict:
     p = {"id": pid, "name": body.name.strip() or pid, "root": str(root),
          "single": single, "created": time.time(), "cases": found,
          "ref_case": found[0]["id"], "notes": "",
-         "owner": _meta(body.owner) or jobs.clean_user(x_user),
+         "owner": _meta(body.owner) or me.user, "created_by": me.user,
          "program": _meta(body.program), "purpose": _meta(body.purpose)}
-    caseid.ensure_uids(p, x_user)
+    caseid.ensure_uids(p, me.user)
     save(p)
     return p
 
 
 @router.get("/{pid}")
 def get_project(pid: str, details: bool = True, refresh: bool = False,
-                x_user: str | None = Header(None)) -> dict:
+                me: Identity | None = Depends(current_user)) -> dict:
     p = load(pid)
-    if caseid.ensure_uids(p, x_user):  # projects created before case ids existed
+    if caseid.ensure_uids(p, me.user if me else None):  # projects created before case ids existed
         save(p)
     if refresh:
         for c in p["cases"]:
@@ -176,7 +178,7 @@ def _safe_info(c: dict) -> dict | None:
 
 
 @router.patch("/{pid}")
-def patch_project(pid: str, body: ProjectPatch) -> dict:
+def patch_project(pid: str, body: ProjectPatch, me: Identity = Depends(require_user)) -> dict:
     p = load(pid)
     if body.name is not None:
         p["name"] = body.name
@@ -185,6 +187,8 @@ def patch_project(pid: str, body: ProjectPatch) -> dict:
     for k in META_KEYS:
         v = getattr(body, k)
         if v is not None:
+            if k == "owner" and _meta(v) != p.get("owner", ""):
+                require_manage(me, "project owner", p.get("owner"), p.get("created_by"))
             p[k] = _meta(v)
     if body.ref_case is not None:
         if body.ref_case not in {c["id"] for c in p["cases"]}:
@@ -210,7 +214,7 @@ class Relocate(BaseModel):
 
 
 @router.post("/{pid}/relocate")
-def relocate(pid: str, body: Relocate) -> dict:
+def relocate(pid: str, body: Relocate, me: Identity = Depends(require_user)) -> dict:
     """Point a project at moved/renamed data: a new root moves every case that was
     under the old root along with it; cases maps case ids to new case folders. Case
     ids are kept, so runs, aliases and the reference case stay valid."""
@@ -235,25 +239,27 @@ def relocate(pid: str, body: Relocate) -> dict:
         if stats is None:
             raise HTTPException(422, f"{path}: no M-Star case (Stats folder) found")
         by_id[cid]["path"], by_id[cid]["stats_dir"] = str(d), str(Path(stats).resolve())
-    caseid.ensure_uids(p)
+    caseid.ensure_uids(p, me.user)
     save(p)
     for c in p["cases"]:
         cases.forget(Path(c["path"]), Path(c["stats_dir"]))
-    return get_project(pid)
+    return get_project(pid, me=me)
 
 
 @router.post("/{pid}/rediscover")
-def rediscover(pid: str, x_user: str | None = Header(None)) -> dict:
+def rediscover(pid: str, me: Identity = Depends(require_user)) -> dict:
     p = load(pid)
     p["single"], p["cases"] = _discover(safe_path(p["root"]), p)
-    caseid.ensure_uids(p, x_user)
+    caseid.ensure_uids(p, me.user)
     save(p)
     return _status(p)
 
 
 @router.delete("/{pid}")
-def delete_project(pid: str) -> dict:
+def delete_project(pid: str, me: Identity = Depends(require_user)) -> dict:
     d = _dir(pid)
+    p = load(pid)
+    require_manage(me, "project", p.get("owner"), p.get("created_by"))
     if any(j["status"] in ("queued", "running") for j in jobs.list_jobs(pid)):
         raise HTTPException(409, "project has active jobs")
     shutil.rmtree(d)
@@ -270,7 +276,7 @@ class RunRequest(BaseModel):
 
 
 @router.post("/{pid}/run")
-async def run_task(pid: str, body: RunRequest, x_user: str | None = Header(None)) -> dict:
+async def run_task(pid: str, body: RunRequest, me: Identity = Depends(require_user)) -> dict:
     p = load(pid)
     task = tasks.TASKS.get(body.task)
     if task is None:
@@ -286,7 +292,7 @@ async def run_task(pid: str, body: RunRequest, x_user: str | None = Header(None)
     i = 2
     while run.exists():
         run, i = run.with_name(f"{stamp}_{task.id}_{i}"), i + 1
-    run.mkdir(parents=True)
+    jobs.make_shared_dir(run)
     try:
         cmds = task.build(p, sel, prm, run)
     except Exception:
@@ -295,7 +301,7 @@ async def run_task(pid: str, body: RunRequest, x_user: str | None = Header(None)
     label = (body.label or "").strip() or tasks.default_label(task, prm, len(sel))
     label = jobs.unique_label(pid, label)
     return await jobs.manager.submit(pid, task.id, label, cmds, run,
-                                     {"params": prm, "cases": [c["id"] for c in sel]}, x_user)
+                                     {"params": prm, "cases": [c["id"] for c in sel]}, me.user)
 
 
 @router.get("/{pid}/runs")
@@ -331,12 +337,22 @@ def list_runs(pid: str) -> list[dict]:
 
 
 @router.delete("/{pid}/runs/{name}")
-def delete_run(pid: str, name: str) -> dict:
+def delete_run(pid: str, name: str, me: Identity = Depends(require_user)) -> dict:
     r = safe_child(_dir(pid) / "runs", name)
+    p = load(pid)
     j = next((j for j in jobs.list_jobs(pid) if j["run_dir"] == str(r)), None)
     if j and j["status"] in ("queued", "running"):
         raise HTTPException(409, "run is still active")
+    meta = {}
+    try:
+        meta = json.loads((r / "job.json").read_text())
+    except (OSError, ValueError):
+        pass
+    require_manage(me, "run", (j or {}).get("user"), meta.get("user"), p.get("owner"), p.get("created_by"))
     shutil.rmtree(r)
+    if j:
+        with jobs._conn() as c:
+            c.execute("DELETE FROM jobs WHERE id=?", (j["id"],))
     return {"deleted": name}
 
 
@@ -420,7 +436,7 @@ def run_series(pid: str, name: str, file: str, columns: list[str] = Query(...),
 # ------------------------------------------------------------------ files
 
 @router.post("/{pid}/rename-body")
-def rename_body(pid: str, run: str | None = Query(None)) -> dict:
+def rename_body(pid: str, run: str | None = Query(None), me: Identity = Depends(require_user)) -> dict:
     """Rename the impeller body ('Moving Body', 'agitator') to 'Agitator' in the
     result files of one run or of every finished run of the project (CSV headers
     and cells with merged columns, HTML, file names; case folders untouched)."""

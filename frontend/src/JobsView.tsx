@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type Job } from "./api";
 import { useDialog } from "./Dialog";
+import { useUser } from "./user";
 
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : "");
 const dur = (j: Job) => {
@@ -10,12 +11,14 @@ const dur = (j: Job) => {
 };
 
 // Live job list (WebSocket updates) and a tailing log view.
-export default function JobsView({ project, selected, onSelect, onOpenResults }: {
+export default function JobsView({ project, selected, onSelect, onOpenResults, owner }: {
   project: string;
   selected: string | null;
   onSelect: (id: string) => void;
   onOpenResults: () => void;
+  owner?: string | null;  // project owner: may manage every job of the project
 }) {
+  const me = useUser();
   const [jobs, setJobs] = useState<Job[]>([]);
   const [log, setLog] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -121,11 +124,17 @@ export default function JobsView({ project, selected, onSelect, onOpenResults }:
           <>
             <div className="row">
               <h2 className="grow plain">{job.label} <span className={`status ${job.status}`}>{job.status}</span></h2>
-              {active && <button onClick={() => api.cancelJob(job.id).catch((e) => setError(e.message))}>Cancel</button>}
-              {job.status === "done" && <button className="primary" onClick={onOpenResults}>Open results</button>}
-              <button onClick={() => rename(job)}>Rename</button>
-              {!active && <button onClick={() => rerun(job)} title="delete the results and run again with the same settings">Re-run</button>}
-              {!active && <button className="danger" onClick={() => remove(job)} title="delete the job and all its results">Delete</button>}
+              {(() => {
+                const mine = me.canManage(job.user, owner);
+                const why = !me.user ? "log in to manage jobs" : `only ${job.user ?? "the owner"}, the project owner or an admin`;
+                return <>
+                  {active && <button disabled={!mine} title={mine ? undefined : why} onClick={() => api.cancelJob(job.id).catch((e) => setError(e.message))}>Cancel</button>}
+                  {job.status === "done" && <button className="primary" onClick={onOpenResults}>Open results</button>}
+                  {me.user && <button onClick={() => rename(job)}>Rename</button>}
+                  {!active && <button disabled={!mine} title={mine ? "delete the results and run again with the same settings" : why} onClick={() => rerun(job)}>Re-run</button>}
+                  {!active && <button className="danger" disabled={!mine} title={mine ? "delete the job and all its results" : why} onClick={() => remove(job)}>Delete</button>}
+                </>;
+              })()}
             </div>
             {error && <div className="error">{error}</div>}
             <div className="small muted">

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type Job, type Project, type ProjectMeta, type ProjectSummary } from "./api";
 import { THEME_KEY, ThemeContext, type Theme } from "./theme";
-import { setUser, useUser } from "./user";
+import { logout, useUser } from "./user";
+import LoginDialog from "./Login";
 import CasesView from "./CasesView";
 import Dashboard from "./Dashboard";
 import DirBrowser from "./DirBrowser";
@@ -55,11 +56,15 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const ui = useDialog();
   const activeJobs = useActiveJobs(pid);
-  const user = useUser();
-  const askUser = async () => {
-    const n = await ui.prompt({ title: "Your name", input: user, ok: "Save",
-      body: <p className="small muted">Recorded on every job you start so others can see who ran what. Stored in this browser only.</p> });
-    if (n !== null) setUser(n);
+  const me = useUser();
+  const [loginOpen, setLoginOpen] = useState<false | { reason?: string }>(false);
+  useEffect(() => {
+    const on = () => setLoginOpen({ reason: "That needs a login (your session may have expired)." });
+    window.addEventListener("mstar_post:login-needed", on);
+    return () => window.removeEventListener("mstar_post:login-needed", on);
+  }, []);
+  const doLogout = async () => {
+    try { await logout(); } catch (e) { setError((e as Error).message); }
   };
   const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark"));
   useEffect(() => {
@@ -140,22 +145,29 @@ export default function App() {
             <option value="">{project ? "Switch project..." : "Open a project..."}</option>
             {projects.map((p) => <option key={p.id} value={p.id}>{p.name} ({p.n_included}/{p.n_cases})</option>)}
           </select>
-          <button onClick={() => setCreating(true)} title="create a project from a study or case folder">New</button>
+          {me.user && <button onClick={() => setCreating(true)} title="create a project from a study or case folder">New</button>}
         </div>
         <nav>
           {TABS.map((t) => (
             <button key={t} className={showTab && t === tab ? "tab active" : "tab"} disabled={!project && !GLOBAL_TABS.includes(t)}
-                    title={!project && !GLOBAL_TABS.includes(t) ? "open a project first" : undefined}
+                    title={!project && !GLOBAL_TABS.includes(t) ? "open a project first" : t === "Files" && !me.user ? "log in to browse files" : undefined}
                     onClick={() => go(t)}>{t}{t === "Jobs" && activeJobs > 0 && <span className="badge pulse" title={`${activeJobs} running or queued`}>{activeJobs}</span>}</button>
           ))}
         </nav>
-        <button className={`tab user-btn${user ? "" : " unset"}`} onClick={askUser}
-                title={user ? "change your name (recorded on the jobs you start)" : "set your name so jobs are attributed to you"}>
-          {user || "Set your name"}</button>
+        {me.user ? (
+          <span className="user-badge" title={me.method === "ssh" ? "logged in through your SSH tunnel" : "logged in with your password"}>
+            <span className="dot" />{me.user}{me.admin && <span className="small muted"> admin</span>}
+            {me.method === "password" && <button className="tab small" onClick={doLogout}>Log out</button>}
+          </span>
+        ) : (
+          <button className="tab user-btn unset" onClick={() => setLoginOpen({})} disabled={me.loading}
+                  title="guests can view; log in with your server account to run and edit">{me.loading ? "..." : "Guest \u00b7 Log in"}</button>
+        )}
         <button className="tab theme-toggle" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
                 title="switch between dark and light mode">{theme === "dark" ? "Light" : "Dark"}</button>
       </header>
       {ui.dialog}
+      {loginOpen && <LoginDialog passwordLogin={me.password_login} reason={loginOpen.reason} onClose={() => setLoginOpen(false)} />}
       {error && <div className="error banner" onClick={() => setError(null)}>{error} <span className="dismiss">(click to dismiss)</span></div>}
       {creating && <NewProject projects={projects} onClose={() => setCreating(false)} onCreated={(p) => {
         reloadList();
@@ -174,14 +186,21 @@ export default function App() {
           }} />
         )}
         {visited.has("Theory") && <Pane show={showTab && tab === "Theory"}><TheoryView /></Pane>}
-        {visited.has("Files") && <Pane show={showTab && tab === "Files"}><FilesView /></Pane>}
+        {visited.has("Files") && <Pane show={showTab && tab === "Files"}>
+          {me.user ? <FilesView key={me.user} /> : (
+            <div className="panel">
+              <h2>Files</h2>
+              <p className="muted">File browsing runs with your own server permissions, so it needs a login.</p>
+              <button className="primary" onClick={() => setLoginOpen({})}>Log in</button>
+            </div>)}
+        </Pane>}
         {project && (() => {
           const pane = (t: Tab, el: JSX.Element) => visited.has(t) && (
             <Pane key={`${t}|${project.id}|${resets[t] ?? 0}`} show={showTab && tab === t}>{el}</Pane>);
           return <>
             {pane("Cases", <CasesView project={project} onChange={setProject} />)}
             {pane("Run", <RunView project={project} onSubmitted={onSubmitted} />)}
-            {pane("Jobs", <JobsView project={project.id} selected={job} onSelect={setJob} onOpenResults={() => {
+            {pane("Jobs", <JobsView project={project.id} selected={job} onSelect={setJob} owner={project.owner} onOpenResults={() => {
               setRun(null);
               go("Results");
             }} />)}
@@ -215,7 +234,8 @@ function Pane({ show, children }: { show: boolean; children: React.ReactNode }) 
 function NewProject({ onClose, onCreated, projects }: { onClose: () => void; onCreated: (p: Project) => void; projects: ProjectSummary[] }) {
   const [root, setRoot] = useState("");
   const [name, setName] = useState("");
-  const user = useUser();
+  const me = useUser();
+  const user = me.user ?? "";
   const [meta, setMeta] = useState<ProjectMeta>({ owner: user, program: "", purpose: "" });
   useEffect(() => { setMeta((m) => (m.owner ? m : { ...m, owner: user })); }, [user]);
   const [busy, setBusy] = useState(false);

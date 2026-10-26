@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, type ProjectMeta, type ProjectSummary } from "./api";
 import CaseCatalog from "./CaseCatalog";
 import { META_FIELDS, metaValues } from "./ProjectMeta";
+import { useUser } from "./user";
 
 const when = (t: number) => new Date(t * 1000).toLocaleDateString();
 const FILTER_KEY = "mstar_post.dashboard.filters";
@@ -19,6 +20,7 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
   onTheory: () => void;
 }) {
   const [filter, setFilter] = useState("");
+  const me = useUser();
   const [view, setView] = useState<"projects" | "cases">("projects");
   const [meta, setMeta] = useState<Filters>(() => {
     try { return JSON.parse(localStorage.getItem(FILTER_KEY) ?? "{}"); } catch { return {}; }
@@ -54,7 +56,8 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
             .map(([t, d]) => <div key={t} className="feature"><b>{t}</b><div className="small muted">{d}</div></div>)}
         </div>
         <div className="row">
-          <button className="primary big" onClick={onNew}>New project</button>
+          {me.user ? <button className="primary big" onClick={onNew}>New project</button>
+            : <span className="muted">You are viewing as a guest: open any project to look at its results. Log in (header) to create projects, select cases and run calculations.</span>}
           <span className="seg">
             <button className={view === "projects" ? "primary" : ""} onClick={() => setView("projects")}>Projects</button>
             <button className={view === "cases" ? "primary" : ""} onClick={() => setView("cases")} title="every case of every project with its unique case ID">All cases</button>
@@ -107,7 +110,7 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
               <div className="row">
                 <button className="primary" onClick={(e) => { e.stopPropagation(); onOpen(p.id); }}>{p.id === current ? "Continue" : "Open"}</button>
                 <span className="grow" />
-                <button className="danger small" onClick={(e) => { e.stopPropagation(); onDelete(p); }} title="delete the project and its run outputs; case folders are not touched">Delete</button>
+                {me.canManage(p.owner) && <button className="danger small" onClick={(e) => { e.stopPropagation(); onDelete(p); }} title="delete the project and its run outputs; case folders are not touched">Delete</button>}
               </div>
             </div>
           ))}
