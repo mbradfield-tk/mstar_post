@@ -7,17 +7,19 @@ import { useDialog } from "./Dialog";
 import Plot from "./Plot";
 import { caseColor, PlotStyleEditor, usePlotStyle, type PlotStyle } from "./PlotStyle";
 import StatsSeries from "./StatsSeries";
+import ZonesPlot from "./ZonesPlot";
 import { loadRunResults, type Cell } from "./results";
 
-type Mode = "series" | "single" | "bars" | "scatter" | "detail";
+type Mode = "series" | "single" | "bars" | "scatter" | "detail" | "zones";
 const MODE_LABEL: Record<Mode, string> = { series: "Time series", single: "Case time series",
-  bars: "Compare means", scatter: "Trend (x-y)", detail: "Case detail" };
+  bars: "Compare means", scatter: "Trend (x-y)", detail: "Case detail", zones: "Zones" };
 const MODE_HELP: Record<Mode, string> = {
   series: "M-Star Stats variables (or run metrics) over time for several cases in stacked panels",
   single: "one case: pick a Stats file or a job's time-series CSV (e.g. ua.csv) and its variables to plot over time",
   bars: "steady-state means per case as bars",
   scatter: "one mean against another across cases, with a power-law fit",
   detail: "every mean of one case against the reference case",
+  zones: "CFD zoner results compared across cases: zone maps side by side, zone and heterogeneity bars, exposure curves",
 };
 
 export default function PlotsView({ project, onProjectChange, active, onReset }: {
@@ -26,7 +28,8 @@ export default function PlotsView({ project, onProjectChange, active, onReset }:
   active: boolean;
   onReset: () => void;
 }) {
-  const [mode, setMode] = useState<Mode>("series");
+  const [mode, setMode] = useState<Mode>(() => (localStorage.getItem(`mstar_post.plotmode.${project.id}`) as Mode | null) ?? "series");
+  useEffect(() => localStorage.setItem(`mstar_post.plotmode.${project.id}`, mode), [project.id, mode]);
   const [style, setStyle] = usePlotStyle(project.id);
   const ui = useDialog();
   const refKey = `mstar_post.plotref.${project.id}`;
@@ -37,7 +40,7 @@ export default function PlotsView({ project, onProjectChange, active, onReset }:
     <div className="panel">
       <div className="row">
         <h2 className="grow">Plots</h2>
-        {(["series", "single", "bars", "scatter", "detail"] as Mode[]).map((m) => (
+        {(["series", "single", "bars", "scatter", "detail", "zones"] as Mode[]).map((m) => (
           <button key={m} className={mode === m ? "primary" : ""} title={MODE_HELP[m]} onClick={() => setMode(m)}>{MODE_LABEL[m]}</button>
         ))}
         <label title="baseline for '% vs ref' in all plot modes (the project reference case is set on the Cases tab)">Reference case{" "}
@@ -55,7 +58,8 @@ export default function PlotsView({ project, onProjectChange, active, onReset }:
       <div className="small muted">{MODE_LABEL[mode]}: {MODE_HELP[mode]}.</div>
       {mode === "series" && <SeriesPlot project={project} style={style} active={active} refCase={ref} />}
       {mode === "single" && <StatsSeries project={project} style={style} />}
-      {mode !== "series" && mode !== "single" && <MeansPlots project={project} view={mode} style={style} active={active} refCase={ref} />}
+      {mode === "zones" && <ZonesPlot project={project} style={style} active={active} refCase={ref} />}
+      {mode !== "series" && mode !== "single" && mode !== "zones" && <MeansPlots project={project} view={mode} style={style} active={active} refCase={ref} />}
     </div>
   );
 }

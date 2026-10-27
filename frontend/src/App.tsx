@@ -223,7 +223,7 @@ function Session({ theme, setTheme }: { theme: Theme; setTheme: (t: Theme) => vo
           const pane = (t: Tab, el: JSX.Element) => visited.has(t) && (
             <Pane key={`${t}|${project.id}|${resets[t] ?? 0}`} show={showTab && tab === t}>{el}</Pane>);
           return <>
-            {pane("Cases", <CasesView project={project} onChange={setProject} />)}
+            {pane("Cases", <CasesView project={project} onChange={setProject} active={tab === "Cases"} />)}
             {pane("Run", <RunView project={project} onSubmitted={onSubmitted} />)}
             {pane("Jobs", <JobsView project={project.id} selected={job} onSelect={setJob} owner={project.owner} onOpenResults={() => {
               setRun(null);
@@ -240,10 +240,8 @@ function Session({ theme, setTheme }: { theme: Theme; setTheme: (t: Theme) => vo
                 localStorage.removeItem(`mstar_post.plots.hidden.${project.id}`);
                 reset("Plots");
               }} />)}
-            {pane("Viewer", <ViewerView project={project} onRefresh={() => {
-              api.project(project.id, true).then((p) => { setProject(p); reset("Viewer"); })
-                .catch((e) => setError(e.message));
-            }} />)}
+            {pane("Viewer", <ViewerView project={project} active={tab === "Viewer"}
+              onRefresh={() => api.project(project.id, true).then(setProject)} />)}
           </>;
         })()}
       </main>

@@ -246,6 +246,14 @@ th.sortable { cursor: pointer; }
 .chip.ref { outline: 1px solid var(--accent); font-weight: 600; }
 .chip.gone { text-decoration: line-through; opacity: 0.6; }
 .overview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 8px; }
+/* Plots > Zones */
+.zone-chips { align-items: flex-start; }
+.zone-chips .card { margin: 4px 0; }
+.swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: -1px; border: 1px solid var(--line); }
+.plot-grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 8px; }
+details.inline { display: inline-block; }
+details.inline summary { cursor: pointer; }
+details.inline[open] { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
 .overview .card { margin: 8px 0; }
 .overview .card h3 { margin-top: 0; }
 .overview ul.kv { margin: 2px 0 0; padding-left: 18px; }
@@ -263,6 +271,7 @@ input[type="number"].short { width: 70px; }
 .slice.empty { padding: 30px; text-align: center; }
 .slice-title { font-weight: 600; margin-bottom: 4px; font-family: ui-monospace, monospace; font-size: 13px; }
 .slice-canvas { image-rendering: pixelated; display: block; background: var(--canvas-bg); }
+.slice-canvas.smooth { image-rendering: auto; }
 .slice-canvas.crosshair { cursor: crosshair; }
 .slice-box { position: relative; display: flex; align-items: center; justify-content: center; background: var(--panel-2); border-radius: 6px; overflow: hidden; }
 .slice-stack { position: relative; flex-shrink: 0; }
@@ -347,6 +356,9 @@ input.short-wide { width: 170px; }
 .mesh-canvas { flex: 1; min-height: 360px; border-radius: 4px; overflow: hidden; }
 .mesh-canvas canvas { display: block; }
 tr.selected td { background: var(--panel-2); }
+tr.checked td { background: var(--accent-bg); }
+.files tr[draggable="true"] { cursor: grab; }
+.files .droptarget, .files tr.droptarget td { outline: 2px dashed var(--accent); outline-offset: -2px; background: var(--accent-bg); }
 .theory .refs li { margin: 3px 0; font-size: 14px; scroll-margin-top: 56px; }
 .seg { display: inline-flex; }
 .pane-bar { display: flex; align-items: center; gap: 4px; flex-wrap: nowrap; overflow-x: auto;

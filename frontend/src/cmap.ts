@@ -55,6 +55,61 @@ export function colorize(data: Float32Array, w: number, h: number, lut: Uint8Cla
   return out;
 }
 
+/** In-plane [1 2 1]/4 tent filter over fluid neighbours (NaN cells stay NaN): the in-plane
+ *  part of VTK's cell-to-point averaging sampled back at the cell centres. */
+export function tent(data: Float32Array, w: number, h: number): Float32Array {
+  const out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const c = data[y * w + x];
+    if (!Number.isFinite(c)) { out[y * w + x] = NaN; continue; }
+    let s = 0, n = 0;
+    for (let dy = -1; dy <= 1; dy++) {
+      const yy = y + dy;
+      if (yy < 0 || yy >= h) continue;
+      const wy = dy ? 1 : 2;
+      for (let dx = -1; dx <= 1; dx++) {
+        const xx = x + dx;
+        if (xx < 0 || xx >= w) continue;
+        const v = data[yy * w + xx];
+        if (Number.isFinite(v)) { const wt = wy * (dx ? 1 : 2); s += v * wt; n += wt; }
+      }
+    }
+    out[y * w + x] = s / n;
+  }
+  return out;
+}
+
+/** Bilinear upsample of a plane by an integer factor between cell centres; masked (NaN)
+ *  cells stay NaN at their own pixels and are left out of the neighbour average, so
+ *  solid edges stay crisp while the field is smooth. */
+export function upsample(data: Float32Array, w: number, h: number, scale: number, filter = true): Float32Array {
+  if (filter) data = tent(data, w, h);
+  if (scale <= 1) return data;
+  const W = w * scale, H = h * scale;
+  const out = new Float32Array(W * H);
+  for (let Y = 0; Y < H; Y++) {
+    const gy = (Y + 0.5) / scale - 0.5;
+    const y0 = Math.max(0, Math.min(h - 1, Math.floor(gy))), y1 = Math.min(h - 1, y0 + 1);
+    const fy = Math.min(1, Math.max(0, gy - y0));
+    const ny = Math.min(h - 1, Math.max(0, Math.round(gy)));
+    for (let X = 0; X < W; X++) {
+      const gx = (X + 0.5) / scale - 0.5;
+      const x0 = Math.max(0, Math.min(w - 1, Math.floor(gx))), x1 = Math.min(w - 1, x0 + 1);
+      const fx = Math.min(1, Math.max(0, gx - x0));
+      const nx = Math.min(w - 1, Math.max(0, Math.round(gx)));
+      if (!Number.isFinite(data[ny * w + nx])) { out[Y * W + X] = NaN; continue; }
+      let s = 0, n = 0;
+      const add = (v: number, wgt: number) => { if (Number.isFinite(v) && wgt > 0) { s += v * wgt; n += wgt; } };
+      add(data[y0 * w + x0], (1 - fx) * (1 - fy));
+      add(data[y0 * w + x1], fx * (1 - fy));
+      add(data[y1 * w + x0], (1 - fx) * fy);
+      add(data[y1 * w + x1], fx * fy);
+      out[Y * W + X] = n ? s / n : data[ny * w + nx];
+    }
+  }
+  return out;
+}
+
 /** Colorized image (w x h, from colorize with the same flip) shaded by a LIC
  *  texture at `scale` x resolution: field colors darkened by LIC, or grey LIC. */
 export function shadeLic(base: Uint8ClampedArray, w: number, h: number, lic: Float32Array, scale: number,

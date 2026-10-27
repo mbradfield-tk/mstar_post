@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { fmt } from "./api";
 import ColorLegend, { drawLegend, savePng, type LegendInfo } from "./ColorLegend";
-import { cmapLut, colorize, hexRgb, luminance, shadeLic } from "./cmap";
+import { cmapLut, colorize, hexRgb, luminance, shadeLic, upsample } from "./cmap";
 import type { Plane } from "./plane";
 
 const AX = "xyz";
+const MAX_SMOOTH_PX = 4e6;  // cap on upsampled pixels per plane
 
 export type Overlay = {
   lines?: Float32Array[] | null;   // streamlines in grid coordinates (see flow.ts)
@@ -19,7 +20,7 @@ export type Overlay = {
 // wheel zoom at the cursor and drag to pan, hover readout, two-click line
 // selection (world coordinates) and PNG export of the full plane.
 export default function SliceCanvas({ plane, cmap, range, log, title, onLine, lineMode, height = 480,
-                                      legend, overlay, exportName = "slice", background = "#f8fafc" }: {
+                                      legend, overlay, exportName = "slice", background = "#f8fafc", smooth = false }: {
   plane: Plane | null;
   cmap: string;
   range: [number, number];
@@ -32,6 +33,7 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, li
   overlay?: Overlay;
   exportName?: string;
   background?: string;
+  smooth?: boolean;  // bilinear between cell centres instead of one flat block per cell
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const over = useRef<HTMLCanvasElement>(null);
@@ -79,25 +81,36 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, li
 
   const lic = overlay?.lic && plane && overlay.lic.length === plane.w * plane.h * overlay.licScale ** 2
     ? overlay.lic : null;
+  // upsample factor: the LIC scale when LIC is shown, else enough to reach the display size (capped)
+  const aspect = plane ? (plane.w * plane.du) / (plane.h * plane.dv) : 1;
+  const cw = Math.max(1, Math.min(boxW || height * aspect, height * aspect));
+  const ch = cw / aspect;
+  const smoothScale = !plane || !smooth ? 1 : lic ? overlay!.licScale
+    : Math.max(1, Math.min(4, Math.ceil(Math.max(cw / plane.w, ch / plane.h)), Math.floor(Math.sqrt(MAX_SMOOTH_PX / (plane.w * plane.h)))));
   useEffect(() => {
     let live = true;
     if (!plane || !ref.current) return;
     cmapLut(cmap).then((lut) => {
       if (!live || !ref.current) return;
       const cv = ref.current;
+      const s = lic ? overlay!.licScale : smoothScale;
+      if (smooth) {
+        // field colours already at s x the grid; LIC then shades pixel by pixel (scale 1)
+        const px = colorize(upsample(plane.data, plane.w, plane.h, s), plane.w * s, plane.h * s, lut, range[0], range[1], log, true, hexRgb(background));
+        cv.width = plane.w * s;
+        cv.height = plane.h * s;
+        const img = lic ? shadeLic(px, plane.w * s, plane.h * s, lic, 1, overlay!.licMode) : px;
+        cv.getContext("2d")!.putImageData(new ImageData(img, cv.width, cv.height), 0, 0);
+        return;
+      }
       const px = colorize(plane.data, plane.w, plane.h, lut, range[0], range[1], log, true, hexRgb(background));
-      const s = lic ? overlay!.licScale : 1;
       cv.width = plane.w * s;
       cv.height = plane.h * s;
       const img = lic ? shadeLic(px, plane.w, plane.h, lic, s, overlay!.licMode) : px;
       cv.getContext("2d")!.putImageData(new ImageData(img, cv.width, cv.height), 0, 0);
     });
     return () => { live = false; };
-  }, [plane, cmap, range, log, lic, overlay?.licMode, background]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const aspect = plane ? (plane.w * plane.du) / (plane.h * plane.dv) : 1;
-  const cw = Math.max(1, Math.min(boxW || height * aspect, height * aspect));
-  const ch = cw / aspect;
+  }, [plane, cmap, range, log, lic, overlay?.licMode, background, smooth, smoothScale]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const cv = over.current;
@@ -140,7 +153,7 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, li
     ctx.textBaseline = "middle";
     ctx.fillText(`${title ?? exportName}   ${AX[plane.axis]} = ${fmt(plane.pos)} m`
       + (plane.time !== null ? `   t = ${fmt(plane.time)} s` : ""), 10 * k, titleH / 2);
-    ctx.imageSmoothingEnabled = false;
+    ctx.imageSmoothingEnabled = smooth;
     ctx.drawImage(ref.current!, 0, titleH, W, H);
     ctx.save();
     ctx.translate(0, titleH);
@@ -180,13 +193,13 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, li
                if (d) setZv((v) => ({ ...v, tx: d.tx + e.clientX - d.x, ty: d.ty + e.clientY - d.y }));
              }}
              onPointerUp={() => { drag.current = null; }}>
-          <canvas ref={ref} className={`slice-canvas${lineMode ? " crosshair" : zv.s !== 1 ? " grab" : ""}`}
+          <canvas ref={ref} className={`slice-canvas${smooth ? " smooth" : ""}${lineMode ? " crosshair" : zv.s !== 1 ? " grab" : ""}`}
                   style={{ width: cw, height: ch }}
                   onMouseMove={(e) => {
                     const { c, rr, p } = world(e);
                     if (c < 0 || rr < 0 || c >= plane.w || rr >= plane.h) return;
                     const v = plane.data[rr * plane.w + c];
-                    setHover(`${AX[plane.uAxis]}=${fmt(p[plane.uAxis])} ${AX[plane.vAxis]}=${fmt(p[plane.vAxis])} m : ${Number.isFinite(v) ? fmt(v) : "solid"} ${plane.unit}`);
+                    setHover(`${AX[plane.uAxis]}=${fmt(p[plane.uAxis])} ${AX[plane.vAxis]}=${fmt(p[plane.vAxis])} m : ${Number.isFinite(v) ? fmt(v) : "solid"} ${plane.unit}${smooth && Number.isFinite(v) ? " (smoothed)" : ""}`);
                   }}
                   onClick={(e) => {
                     if (!lineMode) return;

@@ -1,5 +1,6 @@
 """API tests on a synthetic M-Star layout (run: python3 -m pytest -q backend/tests)."""
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -297,6 +298,18 @@ def test_fs_create_and_delete(client, monkeypatch):
     assert client.post("/api/fs/rename", json={"path": str(d / "new"), "name": "taken"}).status_code == 409
     assert client.post("/api/fs/rename", json={"path": str(d / "new"), "name": "a/b"}).status_code == 422
     assert client.post("/api/fs/rename", json={"path": str(client.root), "name": "x"}).status_code == 403
+    # move: into an existing folder, never overwriting, not into itself, roots refused
+    (d / "new" / "f.txt").write_text("x")
+    (d / "taken" / "new").mkdir()
+    r = client.post("/api/fs/move", json={"paths": [str(d / "new" / "f.txt"), str(d / "new"), str(d / "missing")],
+                                          "dest": str(d / "taken")}).json()
+    assert r["moved"] == [str(d / "taken" / "f.txt")] and (d / "taken" / "f.txt").is_file()
+    assert [s["reason"][:10] for s in r["skipped"]] == ["already ex", "not found:"]
+    r = client.post("/api/fs/move", json={"paths": [str(d / "new")], "dest": str(d / "new")}).json()
+    assert "into itself" in r["skipped"][0]["reason"]
+    r = client.post("/api/fs/move", json={"paths": [str(client.root)], "dest": str(d / "taken")}).json()
+    assert r["moved"] == [] and r["skipped"][0]["reason"].startswith(("refusing", "outside"))
+    assert client.post("/api/fs/move", json={"paths": [str(d / "new")], "dest": "/etc"}).status_code == 403
     assert client.post("/api/fs/delete", json={"path": str(client.root), "recursive": True}).status_code == 403
     assert client.post("/api/fs/delete", json={"path": str(d / ".." / "R1")}).status_code == 422
     assert client.post("/api/fs/mkdirs", json={"parent": "/etc", "names": ["x"]}).status_code == 403
@@ -392,6 +405,20 @@ def test_planes(client, case_id):
     d = np.frombuffer(r.content, "<f4").reshape(hh, w)
     assert np.isnan(d[0, :5]).all()  # no fluid in the first five cells -> masked
     np.testing.assert_array_equal(d[1:], expect[0, 1:])
+    # smooth: 1-2-1 over the neighbouring layers; interior layer 1 of a linear field is unchanged,
+    # the edge layer 0 (only layer 1 as neighbour) moves towards it; masked cells stay NaN
+    r = client.get("/api/case/plane", params={
+        "path": case, "file": vol, "array": "Velocity Vector (m/s)", "comp": "0",
+        "axis": 2, "pos": 0.015, "smooth": True})
+    d = np.frombuffer(r.content, "<f4").reshape(hh, w)
+    np.testing.assert_allclose(d[1:], expect[1, 1:], rtol=1e-6)
+    np.testing.assert_allclose(d[0, :5], (2 * expect[1, 0, :5] + expect[2, 0, :5]) / 3, rtol=1e-6)  # solid below excluded
+    r = client.get("/api/case/plane", params={
+        "path": case, "file": vol, "array": "Velocity Vector (m/s)", "comp": "0",
+        "axis": 2, "pos": 0.0, "smooth": True})
+    d = np.frombuffer(r.content, "<f4").reshape(hh, w)
+    assert np.isnan(d[0, :5]).all()
+    np.testing.assert_allclose(d[1:], (2 * expect[0, 1:] + expect[1, 1:]) / 3, rtol=1e-6)
     r = client.get("/api/case/plane", params={
         "path": case, "file": vol, "array": "Velocity Vector (m/s)", "axis": 0,
         "pos": 0.0, "mask": False})
@@ -508,9 +535,19 @@ def test_run_timeseries(client):
         (d / "stats_summary.csv").write_text("file,variable\n")
     (run / "R1" / "caseA" / "phase_uniformity.csv").write_text("time_s,cov_10x3\n0,0.5\n")
     (run / "R1" / "caseA" / "ua.csv").write_text("Time [s],UA [W/K],Momentum steady state [bool]\n0,1.5,False\n1,2.5,True\n")
+    # cfd_zoner data: a time trace (series) and the slice tables (not series, nested per variable)
+    (run / "R1" / "caseA" / "time_trace.csv").write_text("time [s],Mean Velocity [m/s],steady_start_s,analysis_time_s\n0,1,0.5,1\n1,2,,\n")
+    z = run / "R1" / "caseA" / "velocity"
+    z.mkdir()
+    (z / "zone_slices.csv").write_text("view,title,u_label,v_label,u0 [m],du [m],nu [count],v0 [m],dv [m],nv [count],plane_coordinate [m],variable,unit\n"
+                                     "side,side view,x [m],y [m],0,0.1,2,0,0.1,1,0,Velocity Magnitude (m/s),m/s\n")
+    (z / "zone_slice_side.csv").write_text("y \\ x [m],0,0.1\n0,1,2\n")
+    (z / "profiles.csv").write_text("profile,coordinate [m],v,cells [count]\naxial (y),0,1,3\n")
     base = f"/api/projects/{p['id']}/runs/r1"
     files = {f["file"]: f for f in client.get(f"{base}/timeseries").json()}
-    assert set(files) == {"dispersion_timeseries.csv", "phase_uniformity.csv", "ua.csv"}
+    assert set(files) == {"dispersion_timeseries.csv", "phase_uniformity.csv", "ua.csv", "time_trace.csv"}
+    runs = {r["name"]: r for r in client.get(f"/api/projects/{p['id']}/runs").json()}
+    assert {"R1/caseA/velocity/zone_slices.csv", "R1/caseA/velocity/zone_slice_side.csv"} <= set(runs["r1"]["csvs"])
     s = client.get(f"{base}/series", params={"file": "ua.csv", "columns": ["UA [W/K]"], "cases": ["R1/caseA"]}).json()
     assert s["R1/caseA"] == {"t": [0, 1], "columns": {"UA [W/K]": [1.5, 2.5]}}
     assert files["dispersion_timeseries.csv"]["cases"] == ["R1/caseA", "R2/caseA"]
@@ -647,3 +684,48 @@ def test_custom_script_and_cancel(client, tmp_path):
     bad = client.post(f"/api/projects/{p['id']}/run", json={
         "task": "custom_script", "params": {"script": "/etc/passwd"}})
     assert bad.status_code == 403
+
+
+_LOG_HEAD = ("Export directory: /x\nStarted process with PID = {pid}\nM-Star CFD (4.5.47)\n"
+             'Process 0 | Running on GPU "NVIDIA RTX 6000 Ada Generation" with UUID abc-1\n\n')
+_LOG_BLOCK = ("--------------------------------------------------\nTime (s) = {t}\nIterations = {it}\n\n"
+              "Performance:\nLattice (MUPS) = 424.8\n\nProgress:\nTime (s) = {t}\nCompletion (%) = {pct}\n"
+              "Runtime (s) = 100\nElapsed Wall Time (hr) = 15.24\nEstimated Time Remaining (hr) = {eta}\n"
+              "--------------------------------------------------\n\n")
+
+
+def test_solver_status(client, tmp_path):
+    from app import solver
+    case = client.root / "R1" / "caseA"
+    assert solver.solve_status(case)["state"] == "no log"
+    me = os.getpid()  # alive, but not an M-Star process
+    (case / "mstar-run-2026_10_22_2205.txt").write_text(
+        _LOG_HEAD.format(pid=me) + _LOG_BLOCK.format(t=50, it=1000, pct=50, eta=15.2))
+    s = solver.solve_status(case)
+    assert s["state"] == "failed" and s["pid"] == me and s["completion_pct"] == 50 and s["time_s"] == 50 \
+        and s["runtime_s"] == 100 and s["iterations"] == 1000 and s["gpu"].startswith("NVIDIA") and s["version"] == "4.5.47"
+    with monkeypatch_alive(solver, True):
+        assert solver.solve_status(case)["state"] == "running"
+        assert solver.solve_status(case, now=time.time() + 3600)["state"] == "stalled"
+    # a newer log wins; its end marker decides
+    newer = case / "mstar-run-2026_10_23_0900.txt"
+    newer.write_text(_LOG_HEAD.format(pid=1) + _LOG_BLOCK.format(t=100, it=2000, pct=100, eta=-0)
+                     + "Writing checkpoint at time 100\nDone writing checkpoint\n\n\nSimulation Complete\n")
+    os.utime(newer, (time.time() + 10, time.time() + 10))
+    s = solver.solve_status(case)
+    assert s["state"] == "complete" and s["log"] == newer.name and s["n_logs"] == 2 and s["last_lines"][-1] == "Simulation Complete"
+    newer.write_text(_LOG_HEAD.format(pid=1) + "Found command to stop simulation\n\nSimulation Stopped\n")
+    assert solver.solve_status(case)["state"] == "stopped"
+    p = client.post("/api/projects", json={"name": "s", "root": str(client.root)}).json()
+    r = client.get(f"/api/projects/{p['id']}/solves").json()
+    assert r["R1/caseA"]["state"] == "stopped" and r["R2/caseA"]["state"] == "no log"
+
+
+class monkeypatch_alive:
+    def __init__(self, mod, value):
+        self.mod, self.value = mod, value
+    def __enter__(self):
+        self.old = self.mod.pid_alive
+        self.mod.pid_alive = lambda pid: self.value
+    def __exit__(self, *a):
+        self.mod.pid_alive = self.old

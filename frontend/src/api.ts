@@ -56,6 +56,12 @@ export type Inventory = {
   case: string; kinds: OutputKind[]; geometry: { name: string; file: string }[];
 };
 export type StatsFile = { file: string; columns: string[] };
+export type SolveState = {
+  state: "running" | "stalled" | "complete" | "stopped" | "failed" | "no log";
+  log?: string; log_mtime?: number; log_age_s?: number; n_logs: number; pid?: number | null; alive?: boolean;
+  version?: string; gpu?: string; started?: number; time_s?: number; completion_pct?: number; runtime_s?: number;
+  wall_h?: number; eta_h?: number; iterations?: number; mups?: number; last_lines?: string[]; note?: string; error?: string;
+};
 export type RunSeriesFile = { file: string; columns: string[]; cases: string[] };
 export type Series = { t: number[]; columns: Record<string, (number | null)[]> };
 export type CsvTable = { columns: string[]; rows: (string | number | null)[][]; truncated: boolean };
@@ -123,6 +129,8 @@ export const api = {
     req<{ deleted: string }>("/api/fs/delete", json("POST", { path, recursive })),
   renamePath: (path: string, name: string) =>
     req<{ path: string }>("/api/fs/rename", json("POST", { path, name })),
+  movePaths: (paths: string[], dest: string) =>
+    req<{ dest: string; moved: string[]; skipped: { path: string; reason: string }[] }>("/api/fs/move", json("POST", { paths, dest })),
   readFile: (path: string, offset = 0, tail = false, limit = 256 << 10) =>
     req<FileChunk>(`/api/fs/read?${qs({ path, offset, tail, limit })}`),
   imageUrl: (path: string) => `/api/fs/image?${qs({ path })}`,
@@ -131,6 +139,7 @@ export const api = {
   projects: () => req<ProjectSummary[]>("/api/projects"),
   allCases: () => req<CatalogCase[]>("/api/cases"),
   project: (id: string, refresh = false) => req<Project>(`/api/projects/${id}${refresh ? "?refresh=true" : ""}`),
+  solves: (id: string) => req<Record<string, SolveState>>(`/api/projects/${id}/solves`),
   createProject: (name: string, root: string, meta?: Partial<ProjectMeta>) =>
     req<Project>("/api/projects", json("POST", { name, root, ...meta })),
   patchProject: (id: string, body: Partial<{ name: string; included: Record<string, boolean>;
@@ -176,8 +185,8 @@ export const api = {
       `/api/case/line?${qs({ path, file, array, comp, p0: p0.join(","), p1: p1.join(","), n })}`),
   cmaps: () => req<string[]>("/api/case/cmaps"),
   planeUrl: (path: string, file: string, array: string, comp: string,
-             axis: number | null, pos: number | null, mask = true) =>
-    `/api/case/plane?${qs({ path, file, array, comp, axis, pos, mask })}`,
+             axis: number | null, pos: number | null, mask = true, smooth = false) =>
+    `/api/case/plane?${qs({ path, file, array, comp, axis, pos, mask, smooth })}`,
   planeVecUrl: (path: string, file: string, array: string, axis: number | null, pos: number | null,
                 mask = true) => `/api/case/plane_vec?${qs({ path, file, array, axis, pos, mask })}`,
   streamlinesUrl: (path: string, file: string, array: string, axis: number, pos: number | null,

@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import numpy as np
 
-from app import cases, config, jobs, tasks
+from app import cases, config, jobs, solver, tasks
 from app import caseid
 from app import cases as cases_mod
 from app.auth import Identity, current_user, require_manage, require_user
@@ -168,6 +168,21 @@ def _status(p: dict) -> dict:
     """Copy of p flagging a missing project root and missing case folders (e.g. renamed)."""
     return {**p, "root_missing": not Path(p["root"]).is_dir(),
             "cases": [{**c, "missing": not Path(c["path"]).is_dir()} for c in p["cases"]]}
+
+
+@router.get("/{pid}/solves")
+def solve_states(pid: str) -> dict:
+    """M-Star solver status per case from the newest mstar-run-*.txt log in the case folder
+    (running / stalled / complete / stopped / failed / no log, with the last progress block)."""
+    p = load(pid)
+    now = time.time()
+    out = {}
+    for c in p["cases"]:
+        try:
+            out[c["id"]] = solver.solve_status(Path(c["path"]), now)
+        except Exception as e:
+            out[c["id"]] = {"state": "no log", "error": str(e)}
+    return out
 
 
 def _safe_info(c: dict) -> dict | None:

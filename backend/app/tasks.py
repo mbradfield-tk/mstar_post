@@ -243,8 +243,10 @@ ZONER = Task(
     id="cfd_zoner", label="CFD zoner", per_case=True,
     description="Add-on: value-based zoning of a Volume .vti field (k-means), per-zone "
                 "statistics and heterogeneity metrics (cfd_zoner.py), run per case. Writes "
-                "zones.csv, heterogeneity.csv, the plot data (histogram, exposure CDF, "
-                "profiles, zone weights, time trace) as CSVs and zones.vti for the Viewer.",
+                "zones.csv, heterogeneity.csv, zoner_summary.csv (one row of scalar results), "
+                "the zone maps as data (zone_slices.csv + zone_slice_<view>.csv), the plot data "
+                "(histogram, exposure CDF, profiles, zone weights, time trace) as CSVs and "
+                "zones.vti. Plots > Zones compares the zones of all cases.",
     params=[
         P("variable", "Variables", "list", "edr",
           help="aliases: edr, tke, velocity, shear, tracer, kolmogorov, micromixing"),

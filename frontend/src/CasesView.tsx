@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { api, caseName, download, fmt, toCsv, type Project, type ProjectCase } from "./api";
+import { useEffect, useMemo, useState } from "react";
+import { api, caseName, download, fmt, toCsv, type Project, type ProjectCase, type SolveState } from "./api";
 import ProjectMetaEditor from "./ProjectMeta";
 import { useUser } from "./user";
 
@@ -54,14 +54,62 @@ function settingCols(cases: ProjectCase[]): string[] {
   return out;
 }
 
-export default function CasesView({ project, onChange }: {
+const ago = (s: number | undefined) => s === undefined ? "" : s < 90 ? `${Math.round(s)} s ago`
+  : s < 5400 ? `${Math.round(s / 60)} min ago` : s < 172800 ? `${(s / 3600).toFixed(1)} h ago` : `${(s / 86400).toFixed(1)} d ago`;
+const hours = (h: number | undefined) => h === undefined || !Number.isFinite(h) ? "" : h < 1 ? `${Math.round(60 * h)} min` : `${h.toFixed(1)} h`;
+const SOLVE_CLASS: Record<SolveState["state"], string> = { running: "running", stalled: "queued", complete: "done", stopped: "", failed: "failed", "no log": "" };
+const SOLVE_HELP: Record<SolveState["state"], string> = {
+  running: "the solver process of the newest log is alive",
+  stalled: "the solver process is alive but the log has not been written for 30 min",
+  complete: "the newest log ends with 'Simulation Complete'",
+  stopped: "stopped by the user (checkpoint written)",
+  failed: "the log ends without a completion marker and the solver process is gone (crashed or killed)",
+  "no log": "no mstar-run-*.txt in the case folder",
+};
+
+// M-Star solver state of a case from its newest run log, with the last progress block on hover.
+export function SolveTag({ s }: { s: SolveState | undefined }) {
+  if (!s) return <span className="muted small">...</span>;
+  const pct = s.completion_pct !== undefined ? `${fmt(s.completion_pct, 3)} %` : "";
+  const title = [SOLVE_HELP[s.state], s.log && `log: ${s.log}${s.n_logs > 1 ? ` (${s.n_logs} runs)` : ""}`,
+    s.log_age_s !== undefined && `last written ${ago(s.log_age_s)}`,
+    s.time_s !== undefined && `t = ${fmt(s.time_s)} s of ${fmt(s.runtime_s)} s${pct ? ` (${pct})` : ""}`,
+    s.wall_h !== undefined && `wall time ${hours(s.wall_h)}${s.state === "running" && s.eta_h !== undefined && s.eta_h > 0 ? `, about ${hours(s.eta_h)} remaining` : ""}`,
+    s.iterations !== undefined && `${fmt(s.iterations)} iterations${s.mups ? `, ${fmt(s.mups, 4)} MUPS` : ""}`,
+    s.gpu && `GPU: ${s.gpu}`, s.version && `M-Star ${s.version}`, s.pid && `PID ${s.pid}`,
+    s.note, s.error, s.last_lines?.length && `last lines:\n${s.last_lines.join("\n")}`].filter(Boolean).join("\n");
+  return (
+    <span className={`status ${SOLVE_CLASS[s.state]}`} title={title}>
+      {s.state}{pct && s.state !== "complete" ? ` ${pct}` : ""}
+      {s.state === "running" && s.eta_h !== undefined && s.eta_h > 0 && <span className="muted">{hours(s.eta_h)} left</span>}
+    </span>
+  );
+}
+
+// Solver states of the project's cases, refreshed every 30 s while shown.
+export function useSolves(pid: string, active: boolean) {
+  const [solves, setSolves] = useState<Record<string, SolveState> | null>(null);
+  useEffect(() => {
+    if (!active) return;
+    let live = true;
+    const load = () => api.solves(pid).then((s) => live && setSolves(s)).catch(() => undefined);
+    load();
+    const id = setInterval(load, 30000);
+    return () => { live = false; clearInterval(id); };
+  }, [pid, active]);
+  return solves;
+}
+
+export default function CasesView({ project, onChange, active = true }: {
   project: Project;
   onChange: (p: Project) => void;
+  active?: boolean;
 }) {
   const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showDiff, setShowDiff] = useState(false);
+  const solves = useSolves(project.id, active);
   const cols = useMemo(() => settingCols(project.cases), [project]);
   const shown = project.cases.filter((c) => c.id.toLowerCase().includes(filter.toLowerCase()));
   const groups = useMemo(() => {
@@ -93,11 +141,12 @@ export default function CasesView({ project, onChange }: {
   };
 
   const exportTable = () => download(`${project.id}_cases.csv`, toCsv(
-    ["case", "case_id", "included", "end_time_s", ...cols],
-    project.cases.map((c) => [c.id, c.uid ?? "", c.included, c.info?.end_time_s ?? "",
-      ...cols.map((k) => c.info?.settings?.[k] ?? "")])));
+    ["case", "case_id", "included", "solver", "completion_pct", "end_time_s", ...cols],
+    project.cases.map((c) => [c.id, c.uid ?? "", c.included, solves?.[c.id]?.state ?? "", solves?.[c.id]?.completion_pct ?? "",
+      c.info?.end_time_s ?? "", ...cols.map((k) => c.info?.settings?.[k] ?? "")])));
 
   const nIncl = project.cases.filter((c) => c.included).length;
+  const nRunning = solves ? Object.values(solves).filter((s) => s.state === "running" || s.state === "stalled").length : 0;
   const me = useUser();
   const ro = !me.user;  // guests see the table but change nothing
   return (
@@ -123,6 +172,7 @@ export default function CasesView({ project, onChange }: {
       <div className="small">
         <span className="muted">Tick the cases to work on: only selected cases are used by Run, Plots, Viewer and the case time series until you change the selection. </span>
         Selected cases: {simTimeSummary(project.cases.filter((c) => c.included))}
+        {nRunning > 0 && <span className="muted"> &middot; {nRunning} solve{nRunning === 1 ? "" : "s"} running: outputs written so far are already viewable (Viewer &gt; Refresh for new time steps).</span>}
       </div>
       {!nIncl && project.cases.length > 0 && <div className="error">No case is selected: the Run, Plots and Viewer tabs have nothing to work on.</div>}
       {error && <div className="error">{error}</div>}
@@ -133,7 +183,9 @@ export default function CasesView({ project, onChange }: {
           <tr>
             <th title="selected: used by Run, Plots, Viewer and the case time series">sel.</th>
             <th title="reference case for % differences">ref</th>
-            <th>case</th><th title="unique case ID across all projects (stored in mstar_post_case.json in the case folder)">ID</th><th>simulated [s]</th><th>outputs</th>
+            <th>case</th><th title="unique case ID across all projects (stored in mstar_post_case.json in the case folder)">ID</th>
+            <th title="M-Star solver state from the newest mstar-run-*.txt log in the case folder (hover a tag for details); refreshed every 30 s">solver</th>
+            <th>simulated [s]</th><th>outputs</th>
             {cols.map((k) => <th key={k}>{k}</th>)}
           </tr>
         </thead>
@@ -143,7 +195,7 @@ export default function CasesView({ project, onChange }: {
               <tr key={`g-${g}`} className="group">
                 <td><input type="checkbox" checked={cs.every((c) => c.included)} disabled={ro}
                            onChange={(e) => setIncluded(cs.map((c) => c.id), e.target.checked)} /></td>
-                <td colSpan={5 + cols.length}><b>{g}</b> <span className="muted">({cs.length})</span></td>
+                <td colSpan={6 + cols.length}><b>{g}</b> <span className="muted">({cs.length})</span></td>
               </tr>
             ),
             ...cs.map((c) => (
@@ -156,6 +208,7 @@ export default function CasesView({ project, onChange }: {
                   {c.info?.error && <span className="error"> {c.info.error}</span>}</td>
                 <td className="mono small nowrap" title={c.id_written === false ? "the case folder is not writable: the id is stored in the project only" : "written to mstar_post_case.json in the case folder"}>
                   {c.uid ?? ""}{c.id_written === false && <span className="tag">not in folder</span>}</td>
+                <td className="nowrap"><SolveTag s={solves?.[c.id]} /></td>
                 <td className="num">{fmt(simTime(c).end)}</td>
                 <td className="small">{(c.info?.output_kinds ?? []).map((k) =>
                   <span key={k} className="tag">{k}</span>)}</td>
@@ -163,7 +216,7 @@ export default function CasesView({ project, onChange }: {
               </tr>
             )),
           ])}
-          {!shown.length && <tr><td colSpan={6 + cols.length} className="muted">
+          {!shown.length && <tr><td colSpan={7 + cols.length} className="muted">
             {project.cases.length ? "No case matches the filter." : "No cases found under this folder: check the path or use Rediscover."}</td></tr>}
         </tbody>
       </table>

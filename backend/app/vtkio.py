@@ -250,20 +250,41 @@ def _plane_meta(h: dict, a: dict, axis: int, idx: int, dims, so, sp, values) -> 
 
 
 def extract_plane(path: Path, name: str, comp: str, axis: int | None,
-                  pos: float | None, mask: bool = True) -> dict:
+                  pos: float | None, mask: bool = True, smooth: bool = False) -> dict:
     """Scalar plane of a .vti normal to axis at world position pos.
 
     For a 2D slice file axis/pos are taken from the file. Solid cells (all
     'Volume Fraction' arrays ~0, M-Star two-fluid) are NaN when mask is set.
+    smooth: [1, 2, 1]/4 tent over the neighbouring layers (the normal-direction part
+    of VTK's cell-to-point averaging; the in-plane part is done by the viewer),
+    fluid neighbours only, solid cells stay NaN.
     """
     h = header(path)
     a = find_array(h, name)
     axis, idx, dims, so, sp = _plane_geom(h, a, axis, pos)
-    plane = reduce_comp(_take(volume_array(path, name), axis, idx), comp, a["ncomp"])
-    plane = np.array(plane, np.float32)
-    solid = _solid(path, h, a["assoc"], axis, idx) if mask else None
-    if solid is not None:
-        plane[solid] = np.nan
+    arr = volume_array(path, name)
+
+    def layer(i: int) -> np.ndarray:
+        p = np.array(reduce_comp(_take(arr, axis, i), comp, a["ncomp"]), np.float32)
+        s = _solid(path, h, a["assoc"], axis, i) if mask else None
+        if s is not None:
+            p[s] = np.nan
+        return p
+
+    plane = layer(idx)
+    if smooth and dims[axis] > 1:
+        acc = np.where(np.isfinite(plane), 2.0 * plane, 0.0)
+        wsum = np.where(np.isfinite(plane), 2.0, 0.0)
+        for j in (idx - 1, idx + 1):
+            if 0 <= j < dims[axis]:
+                q = layer(j)
+                ok = np.isfinite(q)
+                acc += np.where(ok, q, 0.0)
+                wsum += ok
+        out = np.full_like(plane, np.nan)
+        fluid = np.isfinite(plane)
+        out[fluid] = acc[fluid] / wsum[fluid]
+        plane = out
     return {"data": plane, **_plane_meta(h, a, axis, idx, dims, so, sp, plane)}
 
 

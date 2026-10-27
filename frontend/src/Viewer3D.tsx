@@ -3,7 +3,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import ColorLegend, { drawLegend, savePng, type LegendInfo } from "./ColorLegend";
-import { cmapLut, colorize, hexRgb, luminance, shadeLic } from "./cmap";
+import { cmapLut, colorize, hexRgb, luminance, shadeLic, upsample } from "./cmap";
 import type { Plane } from "./plane";
 import type { Overlay } from "./SliceCanvas";
 
@@ -81,10 +81,10 @@ function loadLines(url: string): Promise<Lines> {
 }
 
 // Textured quad of a plane in world coordinates; px is RGBA at scale s x the plane grid (rows = v up).
-function planeMesh(plane: Plane, px: Uint8ClampedArray<ArrayBuffer>, s = 1): THREE.Mesh {
+function planeMesh(plane: Plane, px: Uint8ClampedArray<ArrayBuffer>, s = 1, smooth = false): THREE.Mesh {
   const tex = new THREE.DataTexture(px, plane.w * s, plane.h * s, THREE.RGBAFormat);
   tex.colorSpace = THREE.SRGBColorSpace;
-  tex.magFilter = THREE.NearestFilter;
+  tex.magFilter = smooth ? THREE.LinearFilter : THREE.NearestFilter;
   tex.needsUpdate = true;
   const W = plane.w * plane.du, H = plane.h * plane.dv;
   const m = new THREE.Mesh(new THREE.PlaneGeometry(W, H),
@@ -158,7 +158,7 @@ async function linesObject(l: Lines, layer: LineLayer): Promise<THREE.LineSegmen
 // textured plane (optionally LIC-shaded), with an in-view legend.
 export default function Viewer3D({ layers, plane, cmap, range, log, height = 560, sync, lines = [],
                                    background = "#f4f6f9", legend, overlay, exportName = "view3d",
-                                   extraPlanes = NO_PLANES }: {
+                                   extraPlanes = NO_PLANES, smooth = false }: {
   layers: MeshLayer[];
   plane: Plane | null;
   cmap: string;
@@ -172,6 +172,7 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
   overlay?: Overlay;
   exportName?: string;
   extraPlanes?: Plane[];
+  smooth?: boolean;  // bilinear plane texture (2x upsampled, masked cells crisp) instead of flat cells
 }) {
   const host = useRef<HTMLDivElement>(null);
   const three = useRef<{
@@ -389,16 +390,22 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
       ? overlay.lic : null;
     cmapLut(cmap).then((lut) => {
       if (!live || !three.current) return;
-      const base = colorize(plane.data, plane.w, plane.h, lut, range[0], range[1], log, false, hexRgb(background));
-      const s = lic ? overlay!.licScale : 1;
-      const px = lic ? shadeLic(base, plane.w, plane.h, lic, s, overlay!.licMode, false) : base;
-      const m = planeMesh(plane, px, s);
+      const s = lic ? overlay!.licScale : smooth ? 2 : 1;
+      let px: Uint8ClampedArray<ArrayBuffer>;
+      if (smooth) {
+        px = colorize(upsample(plane.data, plane.w, plane.h, s), plane.w * s, plane.h * s, lut, range[0], range[1], log, false, hexRgb(background));
+        if (lic) px = shadeLic(px, plane.w * s, plane.h * s, lic, 1, overlay!.licMode, false);
+      } else {
+        const base = colorize(plane.data, plane.w, plane.h, lut, range[0], range[1], log, false, hexRgb(background));
+        px = lic ? shadeLic(base, plane.w, plane.h, lic, s, overlay!.licMode, false) : base;
+      }
+      const m = planeMesh(plane, px, s, smooth);
       three.current.scene.add(m);
       three.current.plane = m;
       if (!three.current.fitted) fit();
     });
     return () => { live = false; };
-  }, [plane, cmap, range, log, overlay?.lic, overlay?.licMode, background]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [plane, cmap, range, log, overlay?.lic, overlay?.licMode, background, smooth]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // additional planes (e.g. the three center planes), colored like the main plane
   useEffect(() => {
@@ -412,14 +419,16 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
       const tt = three.current;
       if (!live || !tt) return;
       for (const p of extraPlanes) {
-        const m = planeMesh(p, colorize(p.data, p.w, p.h, lut, range[0], range[1], log, false, hexRgb(background)));
+        const s = smooth ? 2 : 1;
+        const d = smooth ? upsample(p.data, p.w, p.h, s) : p.data;
+        const m = planeMesh(p, colorize(d, p.w * s, p.h * s, lut, range[0], range[1], log, false, hexRgb(background)), s, smooth);
         tt.scene.add(m);
         tt.extra.push(m);
       }
       if (!tt.fitted) fit();
     });
     return () => { live = false; };
-  }, [extraPlanes, cmap, range, log, background]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [extraPlanes, cmap, range, log, background, smooth]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function fit() {
     const t = three.current;

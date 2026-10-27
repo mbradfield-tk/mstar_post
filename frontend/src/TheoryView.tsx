@@ -295,7 +295,7 @@ const SECTIONS: Section[] = [
                [T`B`, "logarithm base"], [T`x`, "clustered value"],
                [T`a_i,\ b_i`, "mean distance of cell i to its own cluster and to the nearest other cluster"],
                [T`s_i,\ \bar s`, "silhouette of cell i and its mean over the cells (-1 to 1)"]],
-        where: "cfd_zoner.py cluster_values, bin_values", refs: ["Rousseeuw"] },
+        where: "cfd_zoner.py cluster_values, bin_values; Plots > Zones (zone maps, zone bars)", refs: ["Rousseeuw"] },
       { name: "Heterogeneity metrics",
         eq: [T`\mathrm{CV} = \frac{\sigma}{\mu},\quad \sigma_{\log} = \mathrm{std}(\log_{10} v),\quad P_{95}/P_{50},\quad P_{99}/\mu`,
              T`\eta^2 = \frac{SS_\mathrm{between}}{SS_\mathrm{total}},\qquad SS_\mathrm{between} = \sum_c n_c\,(\mu_c - \mu)^2`,
@@ -305,7 +305,7 @@ const SECTIONS: Section[] = [
                [T`SS_\mathrm{total}`, "total sum of squares of v about mu"], [T`\eta^2`, "share of the variance explained by the zones"],
                [T`\bar v_\mathrm{zone}`, "mean of v in a zone"], [T`|\nabla v|`, "magnitude of the gradient of v [unit of v / m]"],
                [T`L`, "characteristic domain length [m]"]],
-        where: "cfd_zoner.py heterogeneity_stats", refs: ["HIM-2", "App"] },
+        where: "cfd_zoner.py heterogeneity_stats; zoner_summary.csv; Plots > Zones (heterogeneity bars, tables), Results key results", refs: ["HIM-2", "App"] },
     ],
   },
   {

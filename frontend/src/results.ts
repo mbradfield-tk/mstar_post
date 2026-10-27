@@ -31,6 +31,11 @@ export const KEY_METRICS: [RegExp, string][] = [
   [/^UA \[/, "UA"],
   [/^U \[/, "U"],
   [/^Q_wall \[/, "Q wall"],
+  [/^global mean \(/, "Zoner global mean"],
+  [/^eta2 between zones \(/, "eta2 between zones"],
+  [/^CV \(/, "CV"],
+  [/^zone contrast \(/, "Zone contrast"],
+  [/^gradient index \(/, "Gradient index"],
 ];
 export const MAX_METRICS = 10;
 // case operating conditions (keys of case_info.settings) shown in front of the results
@@ -72,8 +77,9 @@ export const meansFilesOf = (run: Run) => run.csvs.filter((f) => !f.includes("/"
 // per-case scalar results of per-case tasks: <case id>/<tool>_summary.csv with a single "case" row
 export const caseSummaryFilesOf = (run: Run) => run.csvs.filter((f) => f.includes("/") && /_summary\.csv$/.test(f));
 
-// case id of a per-case output path (<case id>/<file>)
-const caseOfPath = (f: string) => f.slice(0, f.lastIndexOf("/"));
+// case id of a per-case output path (<case id>/[<sub dir>/]<file>); case ids contain "/", so match by prefix
+const caseOfPath = (project: Project, f: string) =>
+  project.cases.find((c) => f.startsWith(`${c.id}/`))?.id ?? (project.single ? project.cases[0]?.id : undefined) ?? f.slice(0, f.lastIndexOf("/"));
 
 // One row per case of a run: merged root *_means.csv (first file wins per column), or
 // the final value of every key column of the per-case time series.
@@ -97,7 +103,7 @@ export async function loadRunResults(project: Project, run: Run, full = false): 
   // per-case tasks: their scalar summaries first (ua_summary.csv), then the final time-series values
   const summaries = caseSummaryFilesOf(run);
   for (const f of summaries) {
-    const cid = project.single && !project.cases.some((c) => f.startsWith(`${c.id}/`)) ? project.cases[0]?.id ?? caseOfPath(f) : caseOfPath(f);
+    const cid = caseOfPath(project, f);
     const t = await api.csv(project.id, `${run.path}/${f}`).catch(() => null);
     if (!t || !t.rows.length) continue;
     const name = f.slice(f.lastIndexOf("/") + 1);

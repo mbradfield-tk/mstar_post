@@ -123,6 +123,20 @@ def rename(body: RenameRequest, me: Identity = Depends(require_user)) -> dict:
     return out
 
 
+class MoveRequest(BaseModel):
+    paths: list[str]
+    dest: str
+
+
+@router.post("/move")
+def move(body: MoveRequest, me: Identity = Depends(require_user)) -> dict:
+    """Move files, folders or symlinks into an existing folder inside the writable roots;
+    never overwrites. Items that cannot be moved are listed in `skipped`."""
+    out = fsops.run_as(me.user, "move", timeout=600, paths=body.paths, dest=body.dest)
+    _du_cache.clear()
+    return out
+
+
 @router.get("/whoami")
 def fs_whoami(me: Identity = Depends(require_user)) -> dict:
     """Account the file operations run as (sanity check of the helper setup)."""

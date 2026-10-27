@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, AXES, download, fmt, toCsv, type Inventory, type OutputKind, type Project } from "./api";
+import { SolveTag, useSolves } from "./CasesView";
 import { traceStreamlines, type Vec2 } from "./flow";
 import { runLic } from "./lic";
 import { fetchPlane, type Plane } from "./plane";
@@ -39,8 +40,9 @@ const geoDefaults = (inv: Inventory) => {
 const surfDefaults = (inv: Inventory) => Object.fromEntries(inv.kinds.filter((k) => k.type === "surface")
   .map((k) => [k.kind, /^VolumeMovingBody/i.test(k.kind)]));
 
-export default function ViewerView({ project, onRefresh }: { project: Project; onRefresh: () => void }) {
+export default function ViewerView({ project, onRefresh, active = true }: { project: Project; onRefresh: () => Promise<unknown>; active?: boolean }) {
   const cases = project.cases.filter((c) => c.included);
+  const solves = useSolves(project.id, active);
   // first selected case is the reference: its outputs, times and 3D settings drive the view
   const [sel, setSel] = useState<string[]>(() => {
     const r = project.ref_case && cases.some((c) => c.id === project.ref_case) ? project.ref_case : cases[0]?.id;
@@ -62,6 +64,8 @@ export default function ViewerView({ project, onRefresh }: { project: Project; o
   const [manual, setManual] = useState<[number, number]>([0, 1]);
   const [log, setLog] = useState(false);
   const [mask, setMask] = useState(true);
+  const [smooth, setSmooth] = useState(() => localStorage.getItem("mstar_post.viewer.smooth") === "1");
+  useEffect(() => { localStorage.setItem("mstar_post.viewer.smooth", smooth ? "1" : "0"); }, [smooth]);
   const [planes, setPlanes] = useState<Record<string, Plane | null>>({});
   const [error, setError] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
@@ -89,9 +93,40 @@ export default function ViewerView({ project, onRefresh }: { project: Project; o
   const [cplanes, setCplanes] = useState<Record<string, Plane[]>>({});
   const [extras, setExtras] = useState<Extra[]>([]);
   const [xPlanes, setXPlanes] = useState<Record<number, Plane | null>>({});
+  const [refreshing, setRefreshing] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const followLast = useRef(false);  // jump to the newest frame once the refreshed inventory arrives
 
   const pathOf = (id: string) => cases.find((c) => c.id === id)?.path ?? "";
   const invA = invs[ref] ?? null;
+
+  // Re-read the outputs of the shown cases (new time steps, fields) and keep every view setting.
+  const refresh = async () => {
+    setRefreshing(true);
+    setError(null);
+    setNote(null);
+    try {
+      await onRefresh();  // reloads the project: the server drops its case-info and inventory caches
+      const k = invs[ref]?.kinds.find((x) => x.kind === kindName);
+      followLast.current = !!k && ti >= k.times.length - 1;
+      const fresh = await Promise.all(sel.map(async (id) => [id, await api.inventory(pathOf(id))] as const));
+      let added = 0;
+      for (const [id, inv] of fresh) {
+        const old = invs[id]?.kinds.find((x) => x.kind === kindName)?.times.length ?? 0;
+        added += Math.max(0, (inv.kinds.find((x) => x.kind === kindName)?.times.length ?? 0) - old);
+        setGeo((g) => ({ ...geoDefaults(inv), ...g }));
+        setSurf((s) => ({ ...surfDefaults(inv), ...s }));
+      }
+      setInvs((m) => ({ ...m, ...Object.fromEntries(fresh) }));
+      setNote(added ? `${added} new time step${added === 1 ? "" : "s"} of ${kindName}` : "no new time steps");
+    } catch (e) { setError((e as Error).message); }
+    setRefreshing(false);
+  };
+  useEffect(() => {
+    if (!note) return;
+    const id = setTimeout(() => setNote(null), 6000);
+    return () => clearTimeout(id);
+  }, [note]);
 
   useEffect(() => { api.cmaps().then(setCmaps); }, []);
   useEffect(() => {
@@ -123,7 +158,10 @@ export default function ViewerView({ project, onRefresh }: { project: Project; o
       const pick = kind.arrays.find((a) => /velocity/i.test(a.name)) ?? kind.arrays[0];
       setArray(pick?.name ?? "");
     }
-    setTi((i) => Math.min(i, kind.times.length - 1) < 0 ? 0 : (i >= kind.times.length ? kind.times.length - 1 : i));
+    if (followLast.current) {
+      followLast.current = false;
+      setTi(kind.times.length - 1);
+    } else setTi((i) => Math.min(i, kind.times.length - 1) < 0 ? 0 : (i >= kind.times.length ? kind.times.length - 1 : i));
     if (kind.type === "slice" && kind.slice_axis !== null) setAxis(kind.slice_axis);
     const fr = kind.arrays.filter((a) => /volume fraction/i.test(a.name));
     setIso((s) => ({ ...s, array: s.array && kind.arrays.some((a) => a.name === s.array) ? s.array : (fr[fr.length - 1] ?? kind.arrays[0])?.name ?? "" }));
@@ -143,7 +181,7 @@ export default function ViewerView({ project, onRefresh }: { project: Project; o
 
   const urlFor = (path: string, k: OutputKind | undefined, idx: number) =>
     k && array ? api.planeUrl(path, k.files[idx][0], array, comp, isVolume ? axis : null,
-                              isVolume ? pos : null, mask) : null;
+                              isVolume ? pos : null, mask, smooth) : null;
   // other cases show their output time nearest to the reference time
   const frameOf = (id: string): [OutputKind, number] | null => {
     const k = invs[id]?.kinds.find((x) => x.kind === kindName);
@@ -159,7 +197,7 @@ export default function ViewerView({ project, onRefresh }: { project: Project; o
   const extraUrls = shownExtras.map((e) => {
     const f = frameOf(e.id);
     return f && extraArr(e) ? api.planeUrl(pathOf(e.id), f[0].files[f[1]][0], e.array, extraComp(e),
-      isVolume ? axis : null, isVolume ? pos : null, mask) : null;
+      isVolume ? axis : null, isVolume ? pos : null, mask, smooth) : null;
   });
   const extraKey = JSON.stringify(shownExtras.map((e, i) => [e.key, extraUrls[i]]));
   useEffect(() => {
@@ -219,7 +257,7 @@ export default function ViewerView({ project, onRefresh }: { project: Project; o
     const yc = cp.yAuto ? fluidC[`${id}|${file}`]?.[1] : cp.cy;
     if (yc === undefined) return null;
     return [0, 1, 2].map((ax) => api.planeUrl(pathOf(id), file, array, comp, ax,
-                                               [cp.cx, yc, cp.cz][ax], mask));
+                                               [cp.cx, yc, cp.cz][ax], mask, smooth));
   });
   const cpKey = JSON.stringify(cpUrls);
   useEffect(() => {
@@ -372,8 +410,10 @@ export default function ViewerView({ project, onRefresh }: { project: Project; o
     <div className="split">
       <div className="side controls">
         <div className="row">
-          <span className="grow" />
-          <button onClick={onRefresh} title="reload the case list and output files (new time steps, fields) and reset the view">Refresh</button>
+          <span className="grow small muted">{note}</span>
+          <button onClick={refresh} disabled={refreshing}
+                  title="re-read the outputs of the shown cases (new time steps, fields) and keep the current view; moves to the newest frame when the last one is shown">
+            {refreshing ? "Refreshing..." : "Refresh"}</button>
         </div>
         <Section id="cases" title={`Cases (max ${MAX_CASES})`}>
           <div className="checklist">
@@ -385,6 +425,7 @@ export default function ViewerView({ project, onRefresh }: { project: Project; o
                     disabled={on ? n === 1 : n >= MAX_CASES}
                     onChange={(e) => setSel(e.target.checked ? [...sel, c.id] : sel.filter((x) => x !== c.id))} />
                     <span className="mono">{c.id}</span></label>
+                  {solves?.[c.id] && solves[c.id].state !== "complete" && solves[c.id].state !== "no log" && <SolveTag s={solves[c.id]} />}
                   {on && (c.id === ref ? <span className="tag">ref</span>
                     : <button title="use as reference (outputs, time, 3D settings)"
                               onClick={() => setSel([c.id, ...sel.filter((x) => x !== c.id)])}>ref</button>)}
@@ -447,6 +488,8 @@ export default function ViewerView({ project, onRefresh }: { project: Project; o
                 )}
                 <label><input type="checkbox" checked={log} onChange={(e) => setLog(e.target.checked)} /> log scale</label>
                 <label><input type="checkbox" checked={mask} onChange={(e) => setMask(e.target.checked)} /> mask solids</label>
+                <label title="VTK-style cell-to-point shading as in M-Star Post: 1-2-1 average over the neighbouring cells in all three directions, then bilinear interpolation; solid edges stay sharp. Hover values are then smoothed too; the line probe stays raw.">
+                  <input type="checkbox" checked={smooth} onChange={(e) => setSmooth(e.target.checked)} /> smooth shading</label>
                 <label><input type="checkbox" checked={lineMode} onChange={(e) => setLineMode(e.target.checked)} /> line probe (2 clicks)</label>
               </>
             )}
@@ -627,12 +670,12 @@ export default function ViewerView({ project, onRefresh }: { project: Project; o
                     {layout !== "3d" && (
                       <SliceCanvas plane={planes[id] ?? null} cmap={cmap} range={range} log={log} height={paneH}
                                    lineMode={lineMode} onLine={onLine} legend={legend} overlay={overlayOf(id)}
-                                   background={bg}
+                                   background={bg} smooth={smooth}
                                    exportName={`${id}_${kindName}_t${fmt(t)}`} />
                     )}
                     {layout !== "2d" && invs[id] && (
                       <Viewer3D layers={layersBy[id] ?? []} plane={planeIn3d ? planes[id] ?? null : null}
-                                cmap={cmap} range={range} log={log} height={paneH} background={bg}
+                                cmap={cmap} range={range} log={log} height={paneH} background={bg} smooth={smooth}
                                 legend={legend} overlay={overlayOf(id)} lines={lines3dBy[id]}
                                 extraPlanes={cp.on ? cplanes[id] : undefined}
                                 exportName={`${id}_3d_t${fmt(t)}`}
@@ -656,11 +699,11 @@ export default function ViewerView({ project, onRefresh }: { project: Project; o
                     {layout !== "3d" && (
                       <SliceCanvas plane={p} cmap={e.cmap} range={r} log={e.log} height={paneH}
                                    lineMode={false} onLine={onLine} legend={lg} overlay={overlayOf(e.id)}
-                                   background={bg} exportName={`${e.id}_${e.array}_t${fmt(t)}`} />
+                                   background={bg} smooth={smooth} exportName={`${e.id}_${e.array}_t${fmt(t)}`} />
                     )}
                     {layout !== "2d" && invs[e.id] && (
                       <Viewer3D layers={layersBy[e.id] ?? []} plane={planeIn3d ? p : null}
-                                cmap={e.cmap} range={r} log={e.log} height={paneH} background={bg}
+                                cmap={e.cmap} range={r} log={e.log} height={paneH} background={bg} smooth={smooth}
                                 legend={lg} overlay={overlayOf(e.id)}
                                 exportName={`${e.id}_${e.array}_3d_t${fmt(t)}`}
                                 sync={syncCams ? camSync : undefined} />

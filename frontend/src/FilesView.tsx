@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type DragEvent } from "react";
 import { api, type Browse, type BrowseEntry, type DirUsage } from "./api";
 import BatchFolders from "./BatchFolders";
 import FileViewer from "./FileViewer";
@@ -36,6 +36,13 @@ export default function FilesView() {
   const [pending, setPending] = useState<{ e: BrowseEntry; step: "confirm" | "typed"; typed: string; busy: boolean } | null>(null);
   const [renaming, setRenaming] = useState<{ e: BrowseEntry; name: string; busy: boolean; error: string | null } | null>(null);
   const [viewing, setViewing] = useState<string | null>(null);
+  // multi-selection for moves (paths of the current listing); drag source and hovered drop target
+  const [selected, setSelected] = useState<string[]>([]);
+  const [subName, setSubName] = useState("");
+  const [dragging, setDragging] = useState<string[] | null>(null);
+  const [dropAt, setDropAt] = useState<string | null>(null);
+  // move confirmation (drag-and-drop or "Move to"): paths -> destination folder
+  const [moving, setMoving] = useState<{ paths: string[]; dest: string; busy: boolean; error: string | null } | null>(null);
   const reload = () => setTick((x) => x + 1);
   useEffect(() => {
     if (!note) return;
@@ -59,6 +66,56 @@ export default function FilesView() {
     setNote(`renamed ${e.name} to ${name.trim()}`);
     reload();
   };
+
+  const doMove = async (paths: string[], dest: string) => {
+    const r = await api.movePaths(paths, dest);
+    setUsage((u) => { const rest = { ...u }; for (const p of paths) delete rest[p]; delete rest[dest]; return rest; });
+    setSelected((s) => s.filter((p) => !r.moved.some((m) => m.endsWith(`/${p.split("/").pop()}`))));
+    const where = dest === listing?.path ? "here" : `to ${dest.split("/").pop()}`;
+    setNote(`moved ${r.moved.length} item${r.moved.length === 1 ? "" : "s"} ${where}`
+      + (r.skipped.length ? `; skipped: ${r.skipped.map((s) => `${s.path.split("/").pop()} (${s.reason})`).join(", ")}` : ""));
+    reload();
+    return r;
+  };
+  const confirmMove = async () => {
+    if (!moving) return;
+    setMoving({ ...moving, busy: true, error: null });
+    try { await doMove(moving.paths, moving.dest); } catch (err) { setMoving({ ...moving, busy: false, error: (err as Error).message }); return; }
+    setMoving(null);
+  };
+  // "Combine in a sub-folder": create it in the current folder, then move the selection into it
+  const combine = async () => {
+    if (!listing || !subName.trim() || !selected.length) return;
+    setError(null);
+    try {
+      const name = subName.trim();
+      const dest = `${listing.path}/${name}`;
+      if (!listing.entries.some((e) => e.name === name && e.dir)) {
+        const r = await api.mkdirs(listing.path, [name]);
+        if (r.skipped.length) throw new Error(`${r.skipped[0].name}: ${r.skipped[0].reason}`);
+      }
+      await doMove(selected.filter((p) => p !== dest), dest);
+      setSubName("");
+    } catch (e) { setError((e as Error).message); }
+  };
+  // drag-and-drop: dragging a selected row moves the whole selection, any other row only itself
+  const dragStart = (e: BrowseEntry) => (ev: DragEvent) => {
+    const paths = selected.includes(e.path) ? selected : [e.path];
+    setDragging(paths);
+    ev.dataTransfer.effectAllowed = "move";
+    ev.dataTransfer.setData("text/plain", paths.join("\n"));
+  };
+  const dropProps = (dest: string | null | undefined, ok = true) => dest && ok && dragging && !dragging.includes(dest) ? {
+    onDragOver: (ev: DragEvent) => { ev.preventDefault(); ev.dataTransfer.dropEffect = "move"; if (dropAt !== dest) setDropAt(dest); },
+    onDragLeave: () => setDropAt((d) => (d === dest ? null : d)),
+    onDrop: (ev: DragEvent) => {
+      ev.preventDefault();
+      const paths = dragging;
+      setDragging(null); setDropAt(null);
+      if (paths?.length) setMoving({ paths, dest, busy: false, error: null });
+    },
+    className: dropAt === dest ? "droptarget" : undefined,
+  } : {};
 
   const createOne = async () => {
     if (!listing || !newName.trim()) return;
@@ -109,6 +166,7 @@ export default function FilesView() {
     api.browse(path, hidden).then((l) => {
       setListing(l);
       setTyped(l.path);
+      setSelected((s) => s.filter((p) => l.entries.some((e) => e.path === p)));
       localStorage.setItem("mstar_post.files.path", l.path);
     }).catch((e) => setError(e.message));
   }, [path, hidden, tick]);
@@ -160,6 +218,10 @@ export default function FilesView() {
     <th className="sortable" onClick={() => setSort({ key: k, asc: sort.key === k ? !sort.asc : k === "name" })}>
       {label}{sort.key === k ? (sort.asc ? " \u25b2" : " \u25bc") : ""}</th>
   );
+  const folders = entries.filter((e) => e.dir && !e.link);
+  const allSelected = entries.length > 0 && selected.length === entries.length;
+  const subExists = !!subName.trim() && listing?.entries.some((e) => e.name === subName.trim());
+  const destName = (d: string) => (d === listing?.parent ? `parent folder (${d.split("/").pop() || d})` : d.split("/").pop() || d);
 
   return (
     <div className="panel files">
@@ -172,7 +234,9 @@ export default function FilesView() {
         <input className="wide mono" value={typed} onChange={(e) => setTyped(e.target.value)}
                onKeyDown={(e) => e.key === "Enter" && setPath(typed)} />
         <button onClick={() => setPath(typed)}>Go</button>
-        <button disabled={!listing?.parent} onClick={() => listing?.parent && setPath(listing.parent)}>Up</button>
+        <button disabled={!listing?.parent} onClick={() => listing?.parent && setPath(listing.parent)}
+                title={dragging ? "drop here to move into the parent folder" : undefined}
+                {...dropProps(listing?.parent, !!listing?.writable)}>Up</button>
         <button onClick={reload}>Refresh</button>
         <label className="small"><input type="checkbox" checked={hidden} onChange={(e) => setHidden(e.target.checked)} /> hidden</label>
       </div>
@@ -180,7 +244,7 @@ export default function FilesView() {
         <div className="row small mono crumbs">
           {crumbs.map((c, i) => {
             const p = i === 0 ? base : `${base}/${crumbs.slice(1, i + 1).join("/")}`;
-            return <span key={p}>{i > 0 && " / "}<a onClick={() => setPath(p)}>{c}</a></span>;
+            return <span key={p}>{i > 0 && " / "}<a onClick={() => setPath(p)} {...dropProps(p !== listing.path ? p : null, listing.writable)}>{c}</a></span>;
           })}
           {listing.is_case && <span className="tag">case</span>}
         </div>
@@ -201,6 +265,25 @@ export default function FilesView() {
           )}
         </div>
       ) : <div className="small muted">Read-only here (create and delete only inside the writable roots).</div>)}
+      {listing?.writable && selected.length > 0 && (
+        <div className="row small card">
+          <b>{selected.length} selected</b>
+          <label title="create this sub-folder in the current folder (if needed) and move the selection into it">Combine in sub-folder{" "}
+            <input className="mono" placeholder="new sub-folder name" value={subName}
+                   onChange={(e) => setSubName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && combine()} /></label>
+          <button className="primary" disabled={!subName.trim() || subName.includes("/")} onClick={combine}>
+            {subExists ? "Move into existing" : "Create and move"}</button>
+          {folders.some((f) => !selected.includes(f.path)) && (
+            <label>Move to{" "}
+              <select value="" onChange={(e) => e.target.value && setMoving({ paths: selected, dest: e.target.value, busy: false, error: null })}>
+                <option value="">folder...</option>
+                {listing.parent && <option value={listing.parent}>.. (parent folder)</option>}
+                {folders.filter((f) => !selected.includes(f.path)).map((f) => <option key={f.path} value={f.path}>{f.name}/</option>)}
+              </select></label>)}
+          <button onClick={() => setSelected([])}>Clear selection</button>
+          <span className="muted">or drag rows onto a folder, a breadcrumb or Up</span>
+        </div>
+      )}
       {listing?.writable && tool === "file" && (
         <textarea className="paste mono" rows={5} placeholder="optional text content" value={newText}
                   onChange={(e) => setNewText(e.target.value)} />
@@ -233,13 +316,19 @@ export default function FilesView() {
       {listing && (
         <div className="tablewrap">
           <table className="grid">
-            <thead><tr>{head("name", "name")}{head("size", "size")}<th>share</th>{head("mtime", "modified")}
+            <thead><tr>{listing.writable && <th><input type="checkbox" checked={allSelected} title="select all"
+                onChange={(e) => setSelected(e.target.checked ? entries.map((x) => x.path) : [])} /></th>}
+              {head("name", "name")}{head("size", "size")}<th>share</th>{head("mtime", "modified")}
               {listing.writable && <th>actions</th>}</tr></thead>
             <tbody>
               {entries.map((e) => {
                 const s = sizeOf(e), u = usage[e.path];
+                const drop = dropProps(e.dir && !e.link ? e.path : null, listing.writable);
                 return (
-                  <tr key={e.path} className={viewing === e.path ? "selected" : ""}>
+                  <tr key={e.path} draggable={listing.writable} onDragStart={dragStart(e)} onDragEnd={() => { setDragging(null); setDropAt(null); }}
+                      {...drop} className={[viewing === e.path ? "selected" : "", selected.includes(e.path) ? "checked" : "", drop.className ?? ""].join(" ").trim()}>
+                    {listing.writable && <td><input type="checkbox" checked={selected.includes(e.path)}
+                      onChange={(ev) => setSelected(ev.target.checked ? [...selected, e.path] : selected.filter((p) => p !== e.path))} /></td>}
                     <td className="mono">{e.dir
                       ? <a onClick={() => !e.link && setPath(e.path)}>{e.name}/</a>
                       : <a title="view contents" onClick={() => setViewing(e.path)}>{e.name}</a>}
@@ -262,13 +351,32 @@ export default function FilesView() {
                   </tr>
                 );
               })}
-              {!entries.length && <tr><td colSpan={listing.writable ? 5 : 4} className="muted">(empty folder)</td></tr>}
+              {!entries.length && <tr><td colSpan={listing.writable ? 6 : 4} className="muted">(empty folder)</td></tr>}
             </tbody>
           </table>
           {listing.truncated && <div className="muted small">Only the first 5000 entries are listed.</div>}
         </div>
       )}
       {viewing && <FileViewer path={viewing} onClose={() => setViewing(null)} />}
+      {moving && (
+        <div className="modal-bg" onClick={() => !moving.busy && setMoving(null)}>
+          <div className="modal" role="dialog" aria-modal="true" onClick={(ev) => ev.stopPropagation()}
+               onKeyDown={(ev) => ev.key === "Escape" && !moving.busy && setMoving(null)}>
+            <h3>Move {moving.paths.length} item{moving.paths.length === 1 ? "" : "s"} to {destName(moving.dest)}?</h3>
+            <div className="mono small">{moving.dest}</div>
+            <ul className="small mono">{moving.paths.slice(0, 12).map((p) => <li key={p}>{p.split("/").pop()}</li>)}
+              {moving.paths.length > 12 && <li className="muted">... and {moving.paths.length - 12} more</li>}</ul>
+            {moving.paths.some((p) => listing?.entries.find((e) => e.path === p)?.is_case) &&
+              <p className="small muted">Case folders are among them: projects that include them will no longer find them at the old location (use Relocate or Rediscover on the Cases tab).</p>}
+            {moving.error && <div className="error">{moving.error}</div>}
+            <div className="row">
+              <span className="grow" />
+              <button disabled={moving.busy} onClick={() => setMoving(null)}>Cancel</button>
+              <button className="primary" autoFocus disabled={moving.busy} onClick={confirmMove}>{moving.busy ? "Moving..." : "Move"}</button>
+            </div>
+          </div>
+        </div>
+      )}
       {renaming && (
         <div className="modal-bg" onClick={() => !renaming.busy && setRenaming(null)}>
           <div className="modal" role="dialog" aria-modal="true" onClick={(ev) => ev.stopPropagation()}

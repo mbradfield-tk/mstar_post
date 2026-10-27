@@ -73,11 +73,12 @@ def _plane_response(p: dict, h: int, w: int) -> Response:
 
 @router.get("/plane")
 def plane(path: str, file: str, array: str, comp: str = "mag",
-          axis: int | None = None, pos: float | None = None, mask: bool = True):
-    """Scalar plane as little-endian float32 (rows = v, columns = u), metadata in headers."""
+          axis: int | None = None, pos: float | None = None, mask: bool = True, smooth: bool = False):
+    """Scalar plane as little-endian float32 (rows = v, columns = u), metadata in headers.
+    smooth: averaged with the neighbouring layers (1-2-1), like VTK's cell-to-point data."""
     f = _vtk_file(_case(path), file)
     try:
-        p = vtkio.extract_plane(f, array, comp, axis, pos, mask)
+        p = vtkio.extract_plane(f, array, comp, axis, pos, mask, smooth)
     except KeyError:
         raise HTTPException(404, f"no array '{array}' in {f.name}")
     except ValueError as e:

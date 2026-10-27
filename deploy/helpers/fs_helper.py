@@ -321,6 +321,34 @@ def op_rename(ctx: Ctx, req: dict) -> dict:
     return {"path": str(dest)}
 
 
+def op_move(ctx: Ctx, req: dict) -> dict:
+    """Move files/folders/symlinks into an existing folder (same guards as rename;
+    never overwrites, a folder cannot be moved into itself). Per-item skips are reported."""
+    dest_dir = ctx.writable_dir(req["dest"])
+    paths = req.get("paths") or []
+    if len(paths) > 1000:
+        raise Fail(422, "at most 1000 items at once")
+    moved, skipped = [], []
+    for raw in paths:
+        try:
+            target = ctx.modifiable(raw, "move")
+            dest = dest_dir / target.name
+            if dest == target:
+                skipped.append({"path": raw, "reason": "already there"})
+                continue
+            if not target.is_symlink() and target.is_dir() and _under(dest_dir, target.resolve()):
+                raise Fail(422, "cannot move a folder into itself")
+            if dest.exists() or dest.is_symlink():
+                raise Fail(409, f"already exists in the destination: {dest.name}")
+            shutil.move(str(target), str(dest))
+            moved.append(str(dest))
+        except Fail as e:
+            skipped.append({"path": raw, "reason": str(e)})
+        except OSError as e:
+            skipped.append({"path": raw, "reason": str(e)})
+    return {"dest": str(dest_dir), "moved": moved, "skipped": skipped}
+
+
 def op_write_marker(ctx: Ctx, req: dict) -> dict:
     """Write the case-id marker into a case folder (idempotent); ok=False when not writable."""
     case = ctx.safe(req["path"])
@@ -422,6 +450,7 @@ def op_whoami(ctx: Ctx, req: dict) -> dict:
 
 OPS = {"list": op_list, "browse": op_browse, "du": op_du, "read": op_read, "image": op_image,
        "mkdirs": op_mkdirs, "newfile": op_newfile, "delete": op_delete, "rename": op_rename,
+       "move": op_move,
        "write_marker": op_write_marker, "kill": op_kill, "whoami": op_whoami, "mesh": op_mesh}
 
 
