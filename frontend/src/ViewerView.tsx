@@ -29,12 +29,12 @@ const bounds = (k: OutputKind, axis: number): [number, number] => {
   const e = k.extent!, o = k.origin!, s = k.spacing!;
   return [o[axis] + e[2 * axis] * s[axis], o[axis] + e[2 * axis + 1] * s[axis]];
 };
-// posed moving-body surfaces replace the static impeller STL
+// posed moving-body surfaces replace the static impeller STL; the vessel shell starts hidden
 const geoDefaults = (inv: Inventory) => {
   const moving = inv.kinds.some((k) => k.type === "surface" && /movingbody/i.test(k.kind));
   return Object.fromEntries(inv.geometry.map((g) => [g.name, {
-    on: !/fluid height|box/i.test(g.name) && !(moving && /moving|agitator|impeller|rotor/i.test(g.name)),
-    opacity: /wall|vessel|static/i.test(g.name) ? 0.2 : 0.9,
+    on: !/fluid height|box|vessel|tank|shell|wall|static/i.test(g.name) && !(moving && /moving|agitator|impeller|rotor/i.test(g.name)),
+    opacity: /wall|vessel|tank|shell|static/i.test(g.name) ? 0.2 : 0.9,
   }]));
 };
 // time-varying output surfaces (VOF free surface, posed moving bodies): shown, color, opacity
@@ -107,7 +107,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const [xPlanes, setXPlanes] = useState<Record<number, Plane | null>>({});
   const [refreshing, setRefreshing] = useState(false);
   const [note, setNote] = useState<string | null>(null);
-  const followLast = useRef(false);  // jump to the newest frame once the refreshed inventory arrives
+  const followLast = useRef(true);  // start on the newest frame; set again by Refresh when the last frame was shown
 
   const pathOf = (id: string) => cases.find((c) => c.id === id)?.path ?? "";
   const invA = invs[ref] ?? null;
@@ -157,7 +157,8 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
     if (!invA) return;
     const imgs = invA.kinds.filter((k) => k.type === "volume" || k.type === "slice");
     setKindName((cur) => imgs.some((k) => k.kind === cur) ? cur
-      : (imgs.find((k) => k.type === "volume") ?? imgs[0])?.kind ?? "");
+      : (imgs.find((k) => k.kind === "Volume") ?? imgs.find((k) => k.type === "volume" && !/boundary/i.test(k.kind))
+         ?? imgs.find((k) => k.type === "volume") ?? imgs[0])?.kind ?? "");
   }, [invA]);
 
   const kind = invA?.kinds.find((k) => k.kind === kindName);
@@ -167,7 +168,9 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   useEffect(() => {
     if (!kind) return;
     if (!kind.arrays.some((a) => a.name === array)) {
-      const pick = kind.arrays.find((a) => /velocity/i.test(a.name)) ?? kind.arrays[0];
+      const pick = kind.arrays.find((a) => /^velocity magnitude/i.test(a.name))
+        ?? kind.arrays.find((a) => /velocity/i.test(a.name) && a.ncomp === 1)
+        ?? kind.arrays.find((a) => /velocity/i.test(a.name)) ?? kind.arrays[0];
       setArray(pick?.name ?? "");
     }
     if (followLast.current) {
