@@ -195,10 +195,15 @@ export const api = {
   fluidCenter: (path: string, file: string) =>
     req<{ lo: number[]; hi: number[]; center: number[]; source: string }>(
       `/api/case/fluid_center?${qs({ path, file })}`),
-  surfaceUrl: (path: string, file: string, max_tris = 400000) =>
-    `/api/case/surface?${qs({ path, file, max_tris })}`,
-  isoUrl: (path: string, file: string, array: string, comp: string, level: number, stride = 1) =>
-    `/api/case/iso?${qs({ path, file, array, comp, level, stride })}`,
+  volumeMean: (path: string, file: string, array: string, comp: string, mask = true) =>
+    req<{ mean: number | null; n_cells: number; unit: string; time: number | null; masked: boolean }>(
+      `/api/case/mean?${qs({ path, file, array, comp, mask })}`),
+  surfaceUrl: (path: string, file: string, max_tris = 400000, fmt: "stl" | "mesh" = "stl") =>
+    `/api/case/surface?${qs({ path, file, max_tris, fmt })}`,
+  surfaceWarm: (path: string, files: string[], max_tris = 400000) =>
+    req<{ queued: number }>(`/api/case/surface_warm?${qs({ path, file: files, max_tris, fmt: "mesh" })}`),
+  isoUrl: (path: string, file: string, array: string, comp: string, level: number, stride = 1, max_tris = 600000) =>
+    `/api/case/iso?${qs({ path, file, array, comp, level, stride, max_tris, fmt: "mesh" })}`,
 };
 
 export function download(filename: string, text: string, type = "text/csv") {

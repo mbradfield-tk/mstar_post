@@ -399,6 +399,12 @@ def test_planes(client, case_id):
     d = np.frombuffer(r.content, "<f4").reshape(hh, w)
     expect = np.arange(6 * 5 * 4, dtype=np.float32).reshape(4, 5, 6)
     np.testing.assert_array_equal(d, expect[1])
+    assert float(h["x-mean"]) == pytest.approx(float(expect[1].mean()))
+    # fluid-volume mean: all cells unmasked; the first five cells of layer 0 are solid when masked
+    m = client.get("/api/case/mean", params={"path": case, "file": vol, "array": "Velocity Vector (m/s)", "comp": "0", "mask": False}).json()
+    assert m["n_cells"] == 6 * 5 * 4 and m["mean"] == pytest.approx(float(expect.mean()))
+    m = client.get("/api/case/mean", params={"path": case, "file": vol, "array": "Velocity Vector (m/s)", "comp": "0"}).json()
+    assert m["masked"] and m["n_cells"] == 6 * 5 * 4 - 5 and m["mean"] == pytest.approx(float(expect.ravel()[5:].mean()))
     r = client.get("/api/case/plane", params={
         "path": case, "file": vol, "array": "Velocity Vector (m/s)", "comp": "0",
         "axis": 2, "pos": 0.0})
@@ -443,6 +449,21 @@ def test_meshes(client):
         "array": "Velocity Vector (m/s)", "comp": "0", "level": 60})
     n = int(np.frombuffer(r.content[80:84], "<u4")[0])
     assert r.status_code == 200 and n > 0 and len(r.content) == 84 + 50 * n
+    # compact indexed mesh: same triangles, ~3x smaller
+    r = client.get("/api/case/iso", params={
+        "path": case, "file": "out/Output/Volume/block0/Volume.1.00000e+00.vti",
+        "array": "Velocity Vector (m/s)", "comp": "0", "level": 60, "fmt": "mesh"})
+    assert r.content[:4] == b"MPM1"
+    npts, ntri = np.frombuffer(r.content[4:12], "<u4")
+    assert ntri == n and len(r.content) == 12 + 12 * npts + 12 * ntri
+    idx = np.frombuffer(r.content[12 + 12 * npts:], "<u4")
+    assert idx.max() < npts
+    vof = "out/Output/VolumeVOFSurface/block0/VOFSurface.1.00000e+00.vtp"
+    r = client.get("/api/case/surface", params={"path": case, "file": vof, "fmt": "mesh"})
+    assert r.status_code == 200 and r.content[:4] == b"MPM1"
+    r = client.get("/api/case/surface_warm", params={"path": case, "file": [vof], "max_tris": 1000})
+    assert r.status_code == 200 and r.json()["queued"] == 1
+    assert client.get("/api/case/surface", params={"path": case, "file": vof, "fmt": "obj"}).status_code == 422
     assert client.get("/api/case/surface", params={
         "path": case, "file": "../../R2/caseA/Vessel.stl"}).status_code == 403
 
@@ -707,11 +728,10 @@ def test_solver_status(client, tmp_path):
     with monkeypatch_alive(solver, True):
         assert solver.solve_status(case)["state"] == "running"
         assert solver.solve_status(case, now=time.time() + 3600)["state"] == "stalled"
-    # a newer log wins; its end marker decides
+    # a newer log (later start time in the name) wins; its end marker decides
     newer = case / "mstar-run-2026_10_23_0900.txt"
     newer.write_text(_LOG_HEAD.format(pid=1) + _LOG_BLOCK.format(t=100, it=2000, pct=100, eta=-0)
                      + "Writing checkpoint at time 100\nDone writing checkpoint\n\n\nSimulation Complete\n")
-    os.utime(newer, (time.time() + 10, time.time() + 10))
     s = solver.solve_status(case)
     assert s["state"] == "complete" and s["log"] == newer.name and s["n_logs"] == 2 and s["last_lines"][-1] == "Simulation Complete"
     newer.write_text(_LOG_HEAD.format(pid=1) + "Found command to stop simulation\n\nSimulation Stopped\n")

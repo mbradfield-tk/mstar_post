@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { fmt } from "./api";
 import { cmapLut, legendTicks } from "./cmap";
 
-export type LegendInfo = { label: string; unit: string };
+export type LegendInfo = { label: string; unit: string; notes?: string[] };  // notes: lines under the bar (e.g. means)
 
 const lutStrip = (cv: HTMLCanvasElement, lut: Uint8ClampedArray) => {
   cv.width = 1;
@@ -13,7 +13,7 @@ const lutStrip = (cv: HTMLCanvasElement, lut: Uint8ClampedArray) => {
 };
 
 // Compact vertical colorbar overlaid inside a 2D/3D pane (top = max).
-export default function ColorLegend({ cmap, range, log, label, unit, dark = false }: LegendInfo & {
+export default function ColorLegend({ cmap, range, log, label, unit, notes, dark = false }: LegendInfo & {
   cmap: string;
   range: [number, number];
   log: boolean;
@@ -33,6 +33,7 @@ export default function ColorLegend({ cmap, range, log, label, unit, dark = fals
         <canvas ref={ref} />
         <div className="legend-ticks">{legendTicks(range, log).map((v, i) => <span key={i}>{fmt(v, 3)}</span>)}</div>
       </div>
+      {notes?.map((s, i) => <div key={i} className="legend-note">{s}</div>)}
     </div>
   );
 }
@@ -58,7 +59,9 @@ export function drawLegend(ctx: CanvasRenderingContext2D, box: { x: number; y: n
   ctx.font = `${fs}px system-ui, sans-serif`;
   ctx.fillText(`[${info.unit || "-"}]${log ? " log" : ""}`, box.x, y);
   y += fs * 1.6;
-  const barW = Math.max(12, box.w * 0.22), barH = Math.max(40, box.y + box.h - y - fs / 2);
+  const notes = info.notes ?? [];
+  const notesH = notes.length ? notes.length * fs * 1.25 + fs * 0.5 : 0;
+  const barW = Math.max(12, box.w * 0.22), barH = Math.max(40, box.y + box.h - y - fs / 2 - notesH);
   const strip = document.createElement("canvas");
   lutStrip(strip, lut);
   ctx.imageSmoothingEnabled = true;
@@ -72,6 +75,9 @@ export function drawLegend(ctx: CanvasRenderingContext2D, box: { x: number; y: n
     ctx.fillRect(box.x + barW, ty, 4, 1);
     ctx.fillText(fmt(v, 3), box.x + barW + 7, ty);
   });
+  ctx.textBaseline = "top";
+  let ny = y + barH + fs * 0.6;
+  for (const s of notes) { ctx.fillText(s, box.x, ny); ny += fs * 1.25; }
   ctx.restore();
 }
 

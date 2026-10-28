@@ -3,7 +3,7 @@ export type Plane = {
   w: number; h: number; data: Float32Array;
   axis: number; index: number; count: number; pos: number;
   uAxis: number; vAxis: number; u0: number; v0: number; du: number; dv: number;
-  vmin: number; vmax: number; p01: number; p99: number; unit: string; time: number | null;
+  vmin: number; vmax: number; p01: number; p99: number; mean: number; unit: string; time: number | null;
 };
 
 const CACHE_BYTES = 512 * 1024 * 1024;
@@ -50,7 +50,7 @@ export function fetchPlane(url: string): Promise<Plane> {
       axis: n("x-axis"), index: n("x-index"), count: n("x-count"), pos: n("x-pos"),
       uAxis: n("x-u-axis"), vAxis: n("x-v-axis"), u0: n("x-u0"), v0: n("x-v0"),
       du: n("x-du"), dv: n("x-dv"), vmin: n("x-vmin"), vmax: n("x-vmax"),
-      p01: n("x-p01"), p99: n("x-p99"), unit: h.get("x-unit") ?? "",
+      p01: n("x-p01"), p99: n("x-p99"), mean: h.get("x-mean") ? n("x-mean") : NaN, unit: h.get("x-unit") ?? "",
       time: h.get("x-time") ? n("x-time") : null,
     };
   })();

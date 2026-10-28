@@ -254,6 +254,11 @@ th.sortable { cursor: pointer; }
 details.inline { display: inline-block; }
 details.inline summary { cursor: pointer; }
 details.inline[open] { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+/* Cases table: output kinds collapsed to one line */
+details.outputs summary { cursor: pointer; white-space: nowrap; list-style: none; }
+details.outputs summary::before { content: "\25B8 "; opacity: 0.6; }
+details.outputs[open] summary::before { content: "\25BE "; }
+details.outputs .tags { display: flex; flex-wrap: wrap; gap: 3px; max-width: 320px; margin-top: 3px; white-space: normal; }
 .overview .card { margin: 8px 0; }
 .overview .card h3 { margin-top: 0; }
 .overview ul.kv { margin: 2px 0 0; padding-left: 18px; }
@@ -294,6 +299,7 @@ input[type="number"].short { width: 70px; }
 .legend-body { display: flex; gap: 4px; margin-top: 4px; height: 150px; }
 .legend-body canvas { width: 12px; height: 100%; image-rendering: pixelated; border: 1px solid var(--line); }
 .legend-ticks { display: flex; flex-direction: column; justify-content: space-between; font-variant-numeric: tabular-nums; }
+.legend-note { margin-top: 4px; opacity: 0.85; font-variant-numeric: tabular-nums; line-height: 1.2; }
 button.swatch { width: 18px; height: 18px; padding: 0; border: 1px solid #94a3b8; border-radius: 3px; }
 button.swatch:hover:not(:disabled) { border-color: var(--accent); }
 fieldset.section > legend { cursor: pointer; user-select: none; color: var(--text); font-weight: 600; }

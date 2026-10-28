@@ -50,8 +50,10 @@ def pid_alive(pid: int | None) -> bool:
 
 
 def logs_of(case: Path) -> list[Path]:
+    """Solver logs, oldest first: the name carries the start time (YYYY_MM_DD_HHMM), so
+    lexical order is chronological; mtime breaks ties."""
     try:
-        return sorted(case.glob("mstar-run-*.txt"), key=lambda p: p.stat().st_mtime)
+        return sorted(case.glob("mstar-run-*.txt"), key=lambda p: (p.name, p.stat().st_mtime))
     except OSError:
         return []
 

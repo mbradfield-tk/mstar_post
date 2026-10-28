@@ -6,7 +6,7 @@ import { runLic } from "./lic";
 import { fetchPlane, type Plane } from "./plane";
 import Plot from "./Plot";
 import SliceCanvas, { type Overlay } from "./SliceCanvas";
-import Viewer3D, { CameraSync, layerColor, type LineLayer, type MeshLayer } from "./Viewer3D";
+import Viewer3D, { CameraSync, layerColor, prefetchMesh, type LineLayer, type MeshLayer } from "./Viewer3D";
 
 const MAX_CASES = 4;
 const BG_PRESETS = ["#f4f6f9", "#ffffff", "#808080", "#000000", "#1e293b"];
@@ -37,8 +37,13 @@ const geoDefaults = (inv: Inventory) => {
     opacity: /wall|vessel|static/i.test(g.name) ? 0.2 : 0.9,
   }]));
 };
-const surfDefaults = (inv: Inventory) => Object.fromEntries(inv.kinds.filter((k) => k.type === "surface")
-  .map((k) => [k.kind, /^VolumeMovingBody/i.test(k.kind)]));
+// time-varying output surfaces (VOF free surface, posed moving bodies): shown, color, opacity
+type SurfOpt = { on: boolean; color: string; opacity: number };
+const isVof = (kind: string) => /vof/i.test(kind);
+const surfDefaults = (inv: Inventory): Record<string, SurfOpt> => Object.fromEntries(inv.kinds.filter((k) => k.type === "surface")
+  .map((k) => [k.kind, { on: /^VolumeMovingBody/i.test(k.kind), color: isVof(k.kind) ? "#4aa3df" : "#9a9a9a", opacity: isVof(k.kind) ? 0.75 : 1 }]));
+// triangle budget per surface: lower = faster conversion, download and rendering; "full" skips simplification
+const DETAIL: [number, string][] = [[100000, "low (~100k triangles)"], [250000, "medium (~250k)"], [4000000, "full (as exported)"]];
 
 export default function ViewerView({ project, onRefresh, active = true }: { project: Project; onRefresh: () => Promise<unknown>; active?: boolean }) {
   const cases = project.cases.filter((c) => c.included);
@@ -67,13 +72,20 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const [smooth, setSmooth] = useState(() => localStorage.getItem("mstar_post.viewer.smooth") === "1");
   useEffect(() => { localStorage.setItem("mstar_post.viewer.smooth", smooth ? "1" : "0"); }, [smooth]);
   const [planes, setPlanes] = useState<Record<string, Plane | null>>({});
+  const [planesFor, setPlanesFor] = useState("");  // urlsKey whose planes have all arrived
+  const [busy3d, setBusy3d] = useState<Record<string, number>>({});  // meshes still loading per 3D pane
+  const [fps, setFps] = useState(() => Number(localStorage.getItem("mstar_post.viewer.fps")) || 4);
+  useEffect(() => { localStorage.setItem("mstar_post.viewer.fps", String(fps)); }, [fps]);
+  const lastAdvance = useRef(0);
   const [error, setError] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
   const [lineMode, setLineMode] = useState(false);
   const [profiles, setProfiles] = useState<Profile[] | null>(null);
   // 3D state
   const [geo, setGeo] = useState<Record<string, { on: boolean; opacity: number }>>({});
-  const [surf, setSurf] = useState<Record<string, boolean>>({});
+  const [surf, setSurf] = useState<Record<string, SurfOpt>>({});
+  const [detail, setDetail] = useState(() => Number(localStorage.getItem("mstar_post.viewer.detail")) || 250000);
+  useEffect(() => { localStorage.setItem("mstar_post.viewer.detail", String(detail)); }, [detail]);
   const [iso, setIso] = useState({ on: false, array: "", level: 0.5 });
   const [planeIn3d, setPlaneIn3d] = useState(true);
   const [syncCams, setSyncCams] = useState(false);
@@ -87,8 +99,8 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const setF = (patch: Partial<typeof flow>) => setFlow((f) => ({ ...f, ...patch }));
   const [vecs, setVecs] = useState<Record<string, Plane | null>>({});
   const [lics, setLics] = useState<Record<string, Float32Array>>({});
-  // center planes: x = cx and z = cz planes, y plane at the fluid-region center (or cy)
-  const [cp, setCp] = useState({ on: false, cx: 0, cz: 0, yAuto: true, cy: 0 });
+  // center planes: x = cx and z = cz planes, y plane at the fluid-region center (or cy); on by default
+  const [cp, setCp] = useState({ on: true, cx: 0, cz: 0, yAuto: true, cy: 0 });
   const [fluidC, setFluidC] = useState<Record<string, number[]>>({});
   const [cplanes, setCplanes] = useState<Record<string, Plane[]>>({});
   const [extras, setExtras] = useState<Extra[]>([]);
@@ -223,18 +235,45 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
     setExtras((xs) => xs.map((e) => (e.key === key ? { ...e, ...patch } : e)));
 
   useEffect(() => {
-    if (layout === "3d" && !planeIn3d) return;
+    if (layout === "3d" && !planeIn3d) { setPlanesFor(urlsKey); return; }
     let live = true;
     setError(null);
-    sel.forEach((id, i) => {
+    Promise.allSettled(sel.map((id, i) => {
       const u = urls[i];
-      if (!u) { setPlanes((m) => ({ ...m, [id]: null })); return; }
-      fetchPlane(u).then((p) => live && setPlanes((m) => ({ ...m, [id]: p })))
+      if (!u) { setPlanes((m) => ({ ...m, [id]: null })); return null; }
+      return fetchPlane(u).then((p) => live && setPlanes((m) => ({ ...m, [id]: p })))
         .catch((e) => live && setError(`${id}: ${e.message}`));
-    });
+    })).then(() => live && setPlanesFor(urlsKey));
     return () => { live = false; };
   }, [urlsKey, layout, planeIn3d]); // eslint-disable-line react-hooks/exhaustive-deps
-  const planeA = planes[ref] ?? null;
+
+  // global (fluid-volume) mean of the shown field per case and extra view, keyed by the mean URL
+  const [vmeans, setVmeans] = useState<Record<string, number | null>>({});
+  const meanKey = (id: string, arrName: string, c: string) => {
+    const f = frameOf(id);
+    return f && arrName && f[0].type === "volume" ? `${pathOf(id)}|${f[0].files[f[1]][0]}|${arrName}|${c}|${mask}` : null;
+  };
+  const meanKeys = [...sel.map((id) => meanKey(id, array, comp)),
+                    ...shownExtras.map((e) => meanKey(e.id, e.array, extraComp(e)))].filter((k): k is string => !!k);
+  useEffect(() => {
+    let live = true;
+    for (const k of meanKeys) {
+      if (k in vmeans) continue;
+      const [path, file, arrName, c, m] = k.split("|");
+      api.volumeMean(path, file, arrName, c, m === "true")
+        .then((r) => live && setVmeans((v) => ({ ...v, [k]: r.mean })))
+        .catch(() => live && setVmeans((v) => ({ ...v, [k]: null })));
+    }
+    return () => { live = false; };
+  }, [meanKeys.join("\n")]); // eslint-disable-line react-hooks/exhaustive-deps
+  const meanNotes = (p: Plane | null, key: string | null): string[] => {
+    const out: string[] = [];
+    if (p && Number.isFinite(p.mean)) out.push(`plane mean ${fmt(p.mean, 4)}`);
+    const g = key ? vmeans[key] : undefined;
+    if (typeof g === "number") out.push(`global mean ${fmt(g, 4)}`);
+    else if (key && g === undefined) out.push("global mean ...");
+    return out;
+  };
 
   const cpFiles = sel.map((id) => {
     const f = frameOf(id);
@@ -322,15 +361,28 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   }));
   const lines3dKey = JSON.stringify(lines3d);
 
-  // playback: advance once the current frame is shown, prefetching the next
+  // playback: advance once the frame is complete (planes of every case and all 3D meshes),
+  // at most `fps` frames per second; the next two frames are fetched and decoded meanwhile
+  const busyTotal = Object.values(busy3d).reduce((a, b) => a + b, 0);
   useEffect(() => {
-    if (!playing || !kind || !planeA) return;
-    const next = (ti + 1) % kind.times.length;
-    const u = urlFor(pathOf(ref), kind, next);
-    if (u) fetchPlane(u).catch(() => {});
-    const id = setTimeout(() => setTi(next), 350);
+    if (!playing || !kind) return;
+    if (planesFor !== urlsKey || (layout !== "2d" && busyTotal > 0)) return;
+    const n = kind.times.length;
+    const next = (ti + 1) % n;
+    for (const step of [1, 2]) {
+      const tt = kind.times[(ti + step) % n];
+      sel.forEach((id) => {
+        const k = invs[id]?.kinds.find((x) => x.kind === kindName);
+        if (!k) return;
+        const u = urlFor(pathOf(id), k, id === ref ? (ti + step) % n : nearest(k, tt));
+        if (u) fetchPlane(u).catch(() => {});
+      });
+      if (layout !== "2d") Object.values(buildLayers(tt)).flat().forEach((l) => l.visible && l.key !== "iso" && prefetchMesh(l.url));
+    }
+    const wait = Math.max(0, 1000 / fps - (performance.now() - lastAdvance.current));
+    const id = setTimeout(() => { lastAdvance.current = performance.now(); setTi(next); }, wait);
     return () => clearTimeout(id);
-  }, [playing, planeA]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [playing, planesFor, urlsKey, busyTotal, ti, kind, layout, fps]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const shown = sel.map((id) => planes[id]).filter((p): p is Plane => !!p);
   const rangeKey = shown.map((p) => `${p.p01},${p.p99},${p.vmin},${p.vmax}`).join("|");
@@ -369,30 +421,56 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
     } catch (e) { setError((e as Error).message); }
   };
 
-  // 3D layers per case; geometry/surface toggles are shared by name
-  const layersBy: Record<string, MeshLayer[]> = useMemo(() => Object.fromEntries(sel.map((id) => {
+  // 3D layers per case at time tt; geometry/surface toggles are shared by name
+  const buildLayers = (tt: number): Record<string, MeshLayer[]> => Object.fromEntries(sel.map((id) => {
     const inv = invs[id], path = pathOf(id);
     if (!inv) return [id, []];
     const out: MeshLayer[] = inv.geometry.map((g, i) => ({
       key: `geo:${g.name}`, url: api.surfaceUrl(path, g.file), color: layerColor(i),
       opacity: geo[g.name]?.opacity ?? 0.5, visible: !!geo[g.name]?.on,
     }));
-    inv.kinds.filter((k) => k.type === "surface" && surf[k.kind]).forEach((k) => {
-      const idx = nearest(k, t);
+    inv.kinds.filter((k) => k.type === "surface" && surf[k.kind]?.on).forEach((k) => {
+      const idx = nearest(k, tt);
+      const o = surf[k.kind];
       k.files[idx].forEach((f, j) => out.push({
-        key: `surf:${k.kind}:${j}`, url: api.surfaceUrl(path, f),
-        color: /vof/i.test(k.kind) ? "#4aa3df" : "#9a9a9a", opacity: /vof/i.test(k.kind) ? 0.75 : 1, visible: true,
+        key: `surf:${k.kind}:${j}`, url: api.surfaceUrl(path, f, detail, "mesh"),
+        color: o.color, opacity: o.opacity, visible: true, smooth: isVof(k.kind),
       }));
     });
     const vol = inv.kinds.find((k) => k.type === "volume");
     if (iso.on && vol && iso.array) {
       const a = vol.arrays.find((x) => x.name === iso.array);
-      out.push({ key: "iso", url: api.isoUrl(path, vol.files[nearest(vol, t)][0], iso.array,
-        a && a.ncomp > 1 ? "mag" : "", iso.level, vol.file_size > 4e8 ? 2 : 1),
-        color: "#e07b39", opacity: 0.85, visible: true });
+      out.push({ key: "iso", url: api.isoUrl(path, vol.files[nearest(vol, tt)][0], iso.array,
+        a && a.ncomp > 1 ? "mag" : "", iso.level, vol.file_size > 4e8 ? 2 : 1, detail),
+        color: "#e07b39", opacity: 0.85, visible: true, smooth: true });
     }
     return [id, out];
-  })), [sel.join("|"), invs, geo, surf, iso, t]); // eslint-disable-line react-hooks/exhaustive-deps
+  }));
+  const layersBy: Record<string, MeshLayer[]> = useMemo(() => buildLayers(t),
+    [sel.join("|"), invs, geo, surf, iso, t, detail]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // surfaces of other time steps: the server converts the 40 frames around the current one in
+  // the background (re-requested when the time moves more than 15 frames from the last warm-up)
+  // and the browser preloads the next frame, so stepping in time is quick
+  const surfKinds = Object.entries(surf).filter(([, o]) => o.on).map(([k]) => k).join("|");
+  const warmed = useRef<Record<string, number>>({});
+  useEffect(() => {
+    if (!surfKinds || layout === "2d") return;
+    for (const id of sel) {
+      const inv = invs[id];
+      if (!inv) continue;
+      for (const k of inv.kinds.filter((x) => x.type === "surface" && surf[x.kind]?.on)) {
+        const i0 = nearest(k, t);
+        const wk = `${id}|${k.kind}|${detail}`;
+        if (Math.abs((warmed.current[wk] ?? -1e9) - i0) > 15) {
+          warmed.current[wk] = i0;
+          const order = [...k.files.keys()].sort((a, b) => Math.abs(a - i0) - Math.abs(b - i0));
+          api.surfaceWarm(pathOf(id), order.slice(0, 40).flatMap((i) => k.files[i]), detail).catch(() => undefined);
+        }
+        if (i0 + 1 < k.files.length) k.files[i0 + 1].forEach((f) => prefetchMesh(api.surfaceUrl(pathOf(id), f, detail, "mesh")));
+      }
+    }
+  }, [surfKinds, detail, layout, sel.join("|"), invs, t]); // eslint-disable-line react-hooks/exhaustive-deps
   const lines3dBy: Record<string, LineLayer[]> = useMemo(() => Object.fromEntries(Object.entries(lines3d)
     .map(([id, ls]) => [id, ls.map((l) => ({ ...l, range }))])), [lines3dKey, range]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -404,7 +482,8 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const both = layout === "both";
   const paneH = rows === 1 ? (both ? 480 : 620) : rows === 2 ? (both ? 400 : 440) : 330;
   const fieldLabel = `${array}${arr && arr.ncomp > 1 ? (comp === "mag" ? " |mag|" : ` (${AXES[Number(comp)] ?? comp})`) : ""}`;
-  const legend = array ? { label: fieldLabel, unit: planeA?.unit ?? arr?.unit ?? "" } : undefined;
+  const legendFor = (id: string) => array ? { label: fieldLabel, unit: planes[id]?.unit ?? arr?.unit ?? "",
+                                              notes: meanNotes(planes[id] ?? null, meanKey(id, array, comp)) } : undefined;
 
   return (
     <div className="split">
@@ -453,6 +532,9 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                   <button onClick={() => setPlaying(!playing)}>{playing ? "Pause" : "Play"}</button>
                   <button onClick={() => setTi(Math.min(kind.times.length - 1, ti + 1))}>&gt;</button>
                   <button onClick={() => setTi(kind.times.length - 1)}>Last</button>
+                  <select value={fps} title="playback speed; a frame waits for its planes and 3D surfaces, so large surfaces play slower"
+                          onChange={(e) => setFps(Number(e.target.value))}>
+                    {[1, 2, 4, 8, 15].map((f) => <option key={f} value={f}>{f} fps</option>)}</select>
                 </div>
                 <label>Field <select value={array} onChange={(e) => setArray(e.target.value)}>
                   {kind.arrays.map((a) => <option key={a.name}>{a.name}</option>)}</select></label>
@@ -633,11 +715,21 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                            onChange={(v) => setGeo({ ...geo, [g.name]: { ...geo[g.name], opacity: v } })} />
               </div>
             ))}
-            {invA.kinds.filter((k) => k.type === "surface").map((k) => (
-              <label key={k.kind} className="small"><input type="checkbox" checked={!!surf[k.kind]}
-                onChange={(e) => setSurf({ ...surf, [k.kind]: e.target.checked })} />{k.kind}
-                <span className="muted"> ({(k.file_size / 1e6).toFixed(0)} MB)</span></label>
-            ))}
+            {invA.kinds.filter((k) => k.type === "surface").map((k) => {
+              const o = surf[k.kind] ?? { on: false, color: "#9a9a9a", opacity: 1 };
+              const set = (p: Partial<SurfOpt>) => setSurf({ ...surf, [k.kind]: { ...o, ...p } });
+              return (
+                <div key={k.kind} className="row small">
+                  <label className="grow"><input type="checkbox" checked={o.on} onChange={(e) => set({ on: e.target.checked })} />{k.kind}
+                    <span className="muted"> ({(k.file_size / 1e6).toFixed(0)} MB)</span></label>
+                  <input type="color" value={o.color} title="surface color" onChange={(e) => set({ color: e.target.value })} />
+                  <SliderNum inline min={0.05} max={1} step={0.05} value={o.opacity} title="opacity" onChange={(v) => set({ opacity: v })} />
+                </div>
+              );
+            })}
+            {invA.kinds.some((k) => k.type === "surface") && (
+              <label title="triangle budget of output surfaces and isosurfaces: lower loads and draws faster">Surface detail <select value={detail} onChange={(e) => setDetail(Number(e.target.value))}>
+                {DETAIL.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select></label>)}
             {volKind && (
               <>
                 <label className="small"><input type="checkbox" checked={iso.on}
@@ -662,6 +754,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
           <div className={`viewer-grid${!both && rows > 1 ? " cols2" : ""}`}>
             {sel.map((id) => {
               const has = !!invs[id]?.kinds.some((k) => k.kind === kindName);
+              const legend = legendFor(id);
               return (
                 <div key={id} className="viewer-case">
                   <div className="slice-title">{id}{id === ref && n > 1 ? " (reference)" : ""}
@@ -679,6 +772,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                                 legend={legend} overlay={overlayOf(id)} lines={lines3dBy[id]}
                                 extraPlanes={cp.on ? cplanes[id] : undefined}
                                 exportName={`${id}_3d_t${fmt(t)}`}
+                                onLoading={(n) => setBusy3d((b) => (b[id] === n ? b : { ...b, [id]: n }))}
                                 sync={syncCams && rows > 1 ? camSync : undefined} />
                     )}
                   </div>
@@ -689,7 +783,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
               const a = extraArr(e);
               const p = xPlanes[e.key] ?? null;
               const lab = labelOf(e.array, extraComp(e), a?.ncomp ?? 1);
-              const lg = { label: lab, unit: p?.unit ?? a?.unit ?? "" };
+              const lg = { label: lab, unit: p?.unit ?? a?.unit ?? "", notes: meanNotes(p, meanKey(e.id, e.array, extraComp(e))) };
               const r = rangeOf(e);
               return (
                 <div key={`x${e.key}`} className="viewer-case">
@@ -706,6 +800,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                                 cmap={e.cmap} range={r} log={e.log} height={paneH} background={bg} smooth={smooth}
                                 legend={lg} overlay={overlayOf(e.id)}
                                 exportName={`${e.id}_${e.array}_3d_t${fmt(t)}`}
+                                onLoading={(n) => setBusy3d((b) => (b[`x${e.key}`] === n ? b : { ...b, [`x${e.key}`]: n }))}
                                 sync={syncCams ? camSync : undefined} />
                     )}
                   </div>

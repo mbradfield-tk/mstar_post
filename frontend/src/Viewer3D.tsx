@@ -13,6 +13,7 @@ export type MeshLayer = {
   color: string;
   opacity: number;
   visible: boolean;
+  smooth?: boolean; // vertex normals across the mesh (free surfaces) instead of flat facets (CAD, impellers)
 };
 
 // streamlines from /api/case/streamlines; color null = by speed with cmap/range
@@ -45,21 +46,61 @@ export class CameraSync {
   }
 }
 
-const stlCache = new Map<string, Promise<THREE.BufferGeometry>>();
+// Decoded meshes (binary STL or the app's indexed "MPM1" format) kept within a byte budget.
+const MESH_CACHE_BYTES = 700 * 1024 * 1024;
+const meshCache = new Map<string, Promise<THREE.BufferGeometry>>();
+const meshBytes = new Map<string, number>();
 export function clearViewerCaches(): void {
-  stlCache.clear();
+  meshCache.clear();
+  meshBytes.clear();
   lineCache.clear();
 }
-function loadStl(url: string): Promise<THREE.BufferGeometry> {
-  let p = stlCache.get(url);
-  if (!p) {
-    p = new STLLoader().loadAsync(url).then((g) => { g.computeVertexNormals(); return g; });
-    p.catch(() => stlCache.delete(url));
-    stlCache.set(url, p);
-    if (stlCache.size > 64) stlCache.delete(stlCache.keys().next().value!);
+function evictMeshes() {
+  let total = 0;
+  for (const n of meshBytes.values()) total += n;
+  for (const k of meshBytes.keys()) {
+    if (total <= MESH_CACHE_BYTES) break;
+    total -= meshBytes.get(k)!;
+    meshBytes.delete(k);
+    meshCache.delete(k);
   }
+}
+function parseMesh(buf: ArrayBuffer): THREE.BufferGeometry {
+  const magic = new Uint8Array(buf, 0, 4);
+  if (String.fromCharCode(...magic) === "MPM1") {
+    const [np, nt] = new Uint32Array(buf, 4, 2);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(buf, 12, np * 3), 3));
+    g.setIndex(new THREE.BufferAttribute(new Uint32Array(buf, 12 + np * 12, nt * 3), 1));
+    return g;
+  }
+  return new STLLoader().parse(buf);
+}
+// smooth: vertex normals over the shared vertices; flat shading is a material property
+// (derivatives in the shader), so one decoded geometry serves both.
+function loadMesh(url: string): Promise<THREE.BufferGeometry> {
+  let p = meshCache.get(url);
+  if (p) {
+    meshCache.delete(url); meshCache.set(url, p);  // LRU touch
+    return p;
+  }
+  p = fetch(url).then(async (r) => {
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail ?? `${r.status}`);
+    const g = parseMesh(await r.arrayBuffer());
+    g.computeVertexNormals();
+    let bytes = 0;
+    for (const a of Object.values(g.attributes)) bytes += (a as THREE.BufferAttribute).array.byteLength;
+    if (g.index) bytes += g.index.array.byteLength;
+    meshBytes.set(url, bytes);
+    evictMeshes();
+    return g;
+  });
+  p.catch(() => { meshCache.delete(url); meshBytes.delete(url); });
+  meshCache.set(url, p);
   return p;
 }
+/** Fetch and decode a mesh ahead of time (e.g. the next time step). */
+export const prefetchMesh = (url: string) => loadMesh(url).catch(() => undefined);
 
 type Lines = { pts: Float32Array; speed: Float32Array; offsets: Uint32Array };
 const lineCache = new Map<string, Promise<Lines>>();
@@ -158,7 +199,7 @@ async function linesObject(l: Lines, layer: LineLayer): Promise<THREE.LineSegmen
 // textured plane (optionally LIC-shaded), with an in-view legend.
 export default function Viewer3D({ layers, plane, cmap, range, log, height = 560, sync, lines = [],
                                    background = "#f4f6f9", legend, overlay, exportName = "view3d",
-                                   extraPlanes = NO_PLANES, smooth = false }: {
+                                   extraPlanes = NO_PLANES, smooth = false, onLoading }: {
   layers: MeshLayer[];
   plane: Plane | null;
   cmap: string;
@@ -173,14 +214,21 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
   exportName?: string;
   extraPlanes?: Plane[];
   smooth?: boolean;  // bilinear plane texture (2x upsampled, masked cells crisp) instead of flat cells
+  onLoading?: (n: number) => void;  // number of meshes / streamlines still loading (playback waits for 0)
 }) {
   const host = useRef<HTMLDivElement>(null);
   const three = useRef<{
     scene: THREE.Scene; camera: THREE.PerspectiveCamera; renderer: THREE.WebGLRenderer;
     controls: OrbitControls; meshes: Map<string, THREE.Mesh>; plane: THREE.Mesh | null;
-    lines: Map<string, THREE.LineSegments>; extra: THREE.Mesh[]; fitted: boolean; draw: () => void;
+    lines: Map<string, THREE.LineSegments>; extra: THREE.Mesh[]; draw: () => void;
+    userMoved: boolean;   // the user (or a linked camera) has positioned the camera: stop auto-fitting
+    seen: Set<string>;    // layer keys / plane kinds already fitted once
   } | null>(null);
   const [loading, setLoading] = useState(0);
+  const onLoadingRef = useRef(onLoading);
+  onLoadingRef.current = onLoading;
+  useEffect(() => { onLoadingRef.current?.(loading); }, [loading]);
+  useEffect(() => () => onLoadingRef.current?.(0), []);
   const [error, setError] = useState<string | null>(null);
   const me = useRef({});
   const applying = useRef(false);
@@ -195,7 +243,7 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
     el.appendChild(renderer.domElement);
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(40, 1, 1e-4, 1e3);
-    camera.position.set(1, 0.8, 1);
+    camera.position.set(1, 1, 1);  // isometric until the first fit
     scene.add(new THREE.AmbientLight(0xffffff, 0.6));
     const sun = new THREE.DirectionalLight(0xffffff, 1.6);
     sun.position.set(1, 2, 1.5);
@@ -222,6 +270,9 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
                                 up: camera.up.toArray() }, me.current);
     };
     controls.addEventListener("change", onChange);
+    const onStart = () => { if (three.current) three.current.userMoved = true; };
+    controls.addEventListener("start", onStart);
+    renderer.domElement.addEventListener("wheel", onStart, { passive: true });
     const axes = makeAxes();
     renderer.autoClear = false;
     const draw = () => {
@@ -240,7 +291,7 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
       renderer.setViewport(0, 0, w, h);
     };
     three.current = { scene, camera, renderer, controls, meshes: new Map(), plane: null,
-                      lines: new Map(), extra: [], fitted: false, draw };
+                      lines: new Map(), extra: [], draw, userMoved: false, seen: new Set() };
     const resize = () => {
       const w = el.clientWidth, h = el.clientHeight;
       if (!w || !h) return;  // hidden tab
@@ -261,6 +312,8 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
       cancelAnimationFrame(raf);
       ro.disconnect();
       controls.removeEventListener("change", onChange);
+      controls.removeEventListener("start", onStart);
+      renderer.domElement.removeEventListener("wheel", onStart);
       renderer.domElement.removeEventListener("dblclick", onDbl);
       controls.dispose();
       renderer.dispose();
@@ -280,7 +333,7 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
       t.controls.target.fromArray(s.target);
       t.controls.update();
       applying.current = false;
-      t.fitted = true;
+      t.userMoved = true;
     };
     if (sync.last) apply(sync.last);
     return sync.subscribe((s, from) => { if (from !== me.current) apply(s); });
@@ -328,20 +381,22 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
     return () => { live = false; };
   }, [lines]);
 
-  // mesh layers
+  // mesh layers: a layer's previous mesh (e.g. the last time step) stays on screen until
+  // its replacement is decoded, so playback does not blink
   useEffect(() => {
     const t = three.current;
     if (!t) return;
-    const want = new Set(layers.filter((l) => l.visible).map((l) => l.key + l.url));
+    const visible = layers.filter((l) => l.visible);
+    const wantKeys = new Set(visible.map((l) => l.key));
+    const wantIds = new Set(visible.map((l) => l.key + l.url));
     for (const [k, m] of t.meshes) {
-      if (!want.has(k)) {
+      if (!wantKeys.has(m.userData.layerKey)) {
         t.scene.remove(m);
         (m.material as THREE.Material).dispose();
         t.meshes.delete(k);
       }
     }
-    for (const l of layers) {
-      if (!l.visible) continue;
+    for (const l of visible) {
       const k = l.key + l.url;
       const existing = t.meshes.get(k);
       if (existing) {
@@ -350,26 +405,30 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
         mat.opacity = l.opacity;
         mat.transparent = l.opacity < 1;
         mat.depthWrite = l.opacity >= 1;
+        if (mat.flatShading === !!l.smooth) { mat.flatShading = !l.smooth; mat.needsUpdate = true; }
         continue;
       }
       setLoading((n) => n + 1);
-      loadStl(l.url).then((g) => {
-        if (!three.current || three.current.meshes.has(k)) return;
+      loadMesh(l.url).then((g) => {
+        const tt = three.current;
+        if (!tt || tt.meshes.has(k)) return;
         const mat = new THREE.MeshStandardMaterial({
-          color: l.color, opacity: l.opacity, transparent: l.opacity < 1,
+          color: l.color, opacity: l.opacity, transparent: l.opacity < 1, flatShading: !l.smooth,
           depthWrite: l.opacity >= 1, side: THREE.DoubleSide, metalness: 0.1, roughness: 0.7,
         });
         const m = new THREE.Mesh(g, mat);
-        three.current.scene.add(m);
-        three.current.meshes.set(k, m);
-        // drop stale versions of this layer (e.g. previous time step)
-        for (const [kk, mm] of three.current.meshes) {
-          if (kk !== k && kk.startsWith(l.key) && !want.has(kk)) {
-            three.current.scene.remove(mm);
-            three.current.meshes.delete(kk);
+        m.userData.layerKey = l.key;
+        tt.scene.add(m);
+        tt.meshes.set(k, m);
+        // the replaced version of this layer (previous time step) goes now
+        for (const [kk, mm] of tt.meshes) {
+          if (kk !== k && mm.userData.layerKey === l.key && !wantIds.has(kk)) {
+            tt.scene.remove(mm);
+            (mm.material as THREE.Material).dispose();
+            tt.meshes.delete(kk);
           }
         }
-        if (!three.current.fitted) fit();
+        if (!tt.userMoved && !tt.seen.has(l.key)) { tt.seen.add(l.key); fit(ISO); }
       }).catch((e) => setError(`${l.key}: ${e.message ?? e}`))
         .finally(() => setLoading((n) => n - 1));
     }
@@ -402,7 +461,7 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
       const m = planeMesh(plane, px, s, smooth);
       three.current.scene.add(m);
       three.current.plane = m;
-      if (!three.current.fitted) fit();
+      if (!three.current.userMoved && !three.current.seen.has("plane")) { three.current.seen.add("plane"); fit(ISO); }
     });
     return () => { live = false; };
   }, [plane, cmap, range, log, overlay?.lic, overlay?.licMode, background, smooth]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -425,12 +484,17 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
         tt.scene.add(m);
         tt.extra.push(m);
       }
-      if (!tt.fitted) fit();
+      if (!tt.userMoved && !tt.seen.has("extra")) { tt.seen.add("extra"); fit(ISO); }
     });
     return () => { live = false; };
   }, [extraPlanes, cmap, range, log, background, smooth]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  function fit() {
+  const ISO: [number, number, number] = [1 / Math.sqrt(3), 1 / Math.sqrt(3), 1 / Math.sqrt(3)];
+
+  // Frame the whole scene in the viewport: the box corners projected on the camera's right/up
+  // axes set the distance from the vertical and horizontal field of view. Default direction is
+  // isometric (the Fit button keeps the current direction).
+  function fit(dir?: [number, number, number]) {
     const t = three.current;
     if (!t) return;
     const box = new THREE.Box3();
@@ -439,18 +503,34 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
     t.extra.forEach((m) => box.expandByObject(m));
     if (box.isEmpty()) return;
     const c = box.getCenter(new THREE.Vector3());
+    const d = dir ? new THREE.Vector3(...dir).normalize()
+      : t.camera.position.clone().sub(t.controls.target).normalize();
+    if (!d.lengthSq()) d.set(...ISO);
+    const up = Math.abs(d.dot(t.camera.up)) > 0.999 ? new THREE.Vector3(0, 0, -1) : t.camera.up.clone();
+    const right = new THREE.Vector3().crossVectors(up, d).normalize();
+    const upv = new THREE.Vector3().crossVectors(d, right).normalize();
+    let hw = 0, hh = 0, hd = 0;
+    const v = new THREE.Vector3();
+    for (let i = 0; i < 8; i++) {
+      v.set(i & 1 ? box.max.x : box.min.x, i & 2 ? box.max.y : box.min.y, i & 4 ? box.max.z : box.min.z).sub(c);
+      hw = Math.max(hw, Math.abs(v.dot(right)));
+      hh = Math.max(hh, Math.abs(v.dot(upv)));
+      hd = Math.max(hd, Math.abs(v.dot(d)));
+    }
+    const fovV = (t.camera.fov * Math.PI) / 180, fovH = 2 * Math.atan(Math.tan(fovV / 2) * t.camera.aspect);
+    const dist = Math.max(hw / Math.tan(fovH / 2), hh / Math.tan(fovV / 2)) * 1.06 + hd;
     const r = box.getSize(new THREE.Vector3()).length() / 2;
     t.controls.target.copy(c);
-    t.camera.position.copy(c).add(new THREE.Vector3(1.2, 0.8, 1.6).normalize().multiplyScalar(r * 2.6));
-    t.camera.near = r / 200;
-    t.camera.far = r * 50;
+    t.camera.position.copy(c).add(d.multiplyScalar(dist));
+    t.camera.near = Math.max(1e-5, (dist - r) / 10);
+    t.camera.far = (dist + r) * 10;
     t.camera.updateProjectionMatrix();
-    t.fitted = true;
   }
 
   function view(dir: [number, number, number], up: [number, number, number] = [0, 1, 0]) {
     const t = three.current;
     if (!t) return;
+    t.userMoved = true;
     const d = t.camera.position.distanceTo(t.controls.target);
     t.camera.up.set(...up);
     t.camera.position.copy(t.controls.target).add(new THREE.Vector3(...dir).multiplyScalar(d));
@@ -546,14 +626,14 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
             <button key={m} className={mode === m ? "primary" : ""} title={tips[m]} onClick={() => setMode(m)}>
               {{ rotate: "Rotate", pan: "Pan", box: "Box zoom" }[m]}</button>))}
         </span>
-        <button onClick={fit}>Fit</button>
+        <button onClick={() => { if (three.current) three.current.userMoved = true; fit(); }} title="frame everything in the view (keeps the direction)">Fit</button>
         <button onClick={() => zoom(0.8)} title="zoom in (or mouse wheel, toward the cursor)">+</button>
         <button onClick={() => zoom(1.25)} title="zoom out">&minus;</button>
         <button onClick={facePlane} disabled={!plane} title="look straight at the slice plane">Plane</button>
         <button onClick={() => view([0, 0, 1])}>Front</button>
         <button onClick={() => view([1, 0, 0])}>Side</button>
         <button onClick={() => view([0, 1, 0], [0, 0, -1])}>Top</button>
-        <button onClick={() => view([1 / Math.sqrt(3), 1 / Math.sqrt(3), 1 / Math.sqrt(3)])}
+        <button onClick={() => view(ISO)}
                 title="isometric: equal angles to x, y and z, y up">Iso</button>
         <button onClick={snapshot} title="PNG with legend">PNG</button>
         {loading > 0 && <span className="muted">loading {loading}...</span>}

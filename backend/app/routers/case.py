@@ -63,7 +63,7 @@ def _plane_response(p: dict, h: int, w: int) -> Response:
            "X-U0": repr(p["u0"]), "X-V0": repr(p["v0"]),
            "X-Du": repr(p["du"]), "X-Dv": repr(p["dv"]),
            "X-Vmin": repr(p["vmin"]), "X-Vmax": repr(p["vmax"]),
-           "X-P01": repr(p["p01"]), "X-P99": repr(p["p99"]),
+           "X-P01": repr(p["p01"]), "X-P99": repr(p["p99"]), "X-Mean": repr(p["mean"]),
            "X-Unit": p["unit"].encode("ascii", "replace").decode(),
            "X-Time": repr(p["time"]) if p["time"] is not None else "",
            "Access-Control-Expose-Headers": "*"}
@@ -111,6 +111,17 @@ def fluid_center(path: str, file: str) -> dict:
         raise HTTPException(422, str(e))
 
 
+@router.get("/mean")
+def mean(path: str, file: str, array: str, comp: str = "mag", mask: bool = True) -> dict:
+    """Mean of the array over the fluid cells of the whole file (the 'global mean' shown
+    under the Viewer legend); {mean, n_cells, unit, time, masked}."""
+    f = _vtk_file(_case(path), file)
+    try:
+        return vtkio.volume_mean(f, array, comp, mask)
+    except KeyError:
+        raise HTTPException(404, f"no array '{array}' in {f.name}")
+
+
 @router.get("/line")
 def line(path: str, file: str, array: str, p0: str, p1: str, comp: str = "mag",
          n: int = 200) -> dict:
@@ -126,25 +137,46 @@ def line(path: str, file: str, array: str, p0: str, p1: str, comp: str = "mag",
         raise HTTPException(404, f"no array '{array}' in {f.name}")
 
 
+_MESH_TYPES = {"stl": "model/stl", "mesh": "application/octet-stream"}
+
+
+def _fmt(fmt: str) -> str:
+    if fmt not in _MESH_TYPES:
+        raise HTTPException(422, "fmt must be stl or mesh")
+    return fmt
+
+
 @router.get("/surface")
-def surface(path: str, file: str, max_tris: int = 400_000):
-    """A surface (.vtp/.stl/.vtk) as binary STL, simplified above max_tris."""
+def surface(path: str, file: str, max_tris: int = 400_000, fmt: str = "stl"):
+    """A surface (.vtp/.stl/.vtk) simplified above max_tris, as binary STL or as the
+    compact indexed mesh (fmt=mesh: b'MPM1', n_points, n_tris, float32 xyz, uint32 index)."""
     f = _vtk_file(_case(path), file)
-    if f.suffix.lower() == ".stl" and f.stat().st_size < 50 * max_tris:
+    fmt = _fmt(fmt)
+    if fmt == "stl" and f.suffix.lower() == ".stl" and f.stat().st_size < 50 * max_tris:
         return FileResponse(f, media_type="model/stl")
-    return FileResponse(vtkio.surface_stl(f, max(1000, max_tris)), media_type="model/stl")
+    return FileResponse(vtkio.surface_stl(f, max(1000, max_tris), fmt), media_type=_MESH_TYPES[fmt])
+
+
+@router.get("/surface_warm")
+def surface_warm(path: str, file: list[str] = Query(...), max_tris: int = 400_000, fmt: str = "mesh") -> dict:
+    """Queue background conversion of several surfaces (e.g. the next time steps of a
+    VOF surface) so they are served from the disk cache when the user gets there."""
+    case = _case(path)
+    files = [_vtk_file(case, x) for x in file[:200]]
+    return {"queued": vtkio.warm_surfaces(files, max(1000, max_tris), _fmt(fmt))}
 
 
 @router.get("/iso")
 def iso(path: str, file: str, array: str, level: float, comp: str = "mag",
-        stride: int = 1, max_tris: int = 600_000):
+        stride: int = 1, max_tris: int = 600_000, fmt: str = "stl"):
     f = _vtk_file(_case(path), file)
+    fmt = _fmt(fmt)
     try:
         out = vtkio.isosurface_stl(f, array, comp, level, max(1, min(stride, 8)),
-                                   max(1000, max_tris))
+                                   max(1000, max_tris), fmt)
     except KeyError:
         raise HTTPException(404, f"no array '{array}' in {f.name}")
-    return FileResponse(out, media_type="model/stl")
+    return FileResponse(out, media_type=_MESH_TYPES[fmt])
 
 
 @router.get("/streamlines")

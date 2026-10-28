@@ -3,9 +3,14 @@ import { api, caseName, download, fmt, toCsv, type Project, type ProjectCase, ty
 import ProjectMetaEditor from "./ProjectMeta";
 import { useUser } from "./user";
 
-// Key settings shown as columns (matched by prefix).
-const KEY_SETTINGS = ["Volume [L]", "Agitator speed [rpm]", "Simulated time (input runtime)", "Wall time", "Iterations",
-  "Fluid 1 name", "Fluid 2 name", "dx [m]", "Impeller diameter", "Surface tension", "Max Courant"];
+// Key settings shown as columns (matched by prefix); columns that are blank for every case are dropped.
+const KEY_SETTINGS = ["Volume [L]", "Agitator speed [rpm]", "Simulated time (input runtime)", "Wall time",
+  "Fluid 1 name", "Fluid 1 density", "Fluid 1 dynamic viscosity", "Fluid 2 name", "Fluid 2 density", "Fluid 2 dynamic viscosity",
+  "dx [m]", "Impeller diameter", "Surface tension", "Max Courant"];
+// significant digits per column (prefix match); default 4
+const DIGITS: [string, number][] = [["Wall time", 3], ["Impeller diameter", 3], ["Max Courant", 2], ["Fluid 1 density", 4], ["Fluid 2 density", 4],
+  ["Fluid 1 dynamic viscosity", 3], ["Fluid 2 dynamic viscosity", 3]];
+const digitsOf = (k: string) => DIGITS.find(([p]) => k.startsWith(p))?.[1] ?? 4;
 const END = "Simulated time (end) [s]", RUNTIME = "Simulated time (input runtime) [s]",
       WALL = "Wall time (cumulative) [h]", ITER = "Iterations [count]";
 const num = (v: unknown) => (typeof v === "number" ? v : null);
@@ -51,7 +56,28 @@ function settingCols(cases: ProjectCase[]): string[] {
   for (const pre of KEY_SETTINGS) {
     for (const k of keys) if (k.startsWith(pre) && !out.includes(k)) out.push(k);
   }
-  return out;
+  const blank = (v: unknown) => v === undefined || v === null || v === "";
+  return out.filter((k) => cases.some((c) => !blank(c.info?.settings?.[k])));
+}
+
+// One-line summary of the output kinds ("Volume, 2 slices, 3 surfaces"); the full list expands on click.
+function Outputs({ kinds }: { kinds: string[] }) {
+  if (!kinds.length) return <span className="muted">none</span>;
+  const n = (re: RegExp) => kinds.filter((k) => re.test(k)).length;
+  const parts: string[] = [];
+  if (kinds.includes("Volume")) parts.push("Volume");
+  const slices = n(/^Slice/i), surfaces = n(/Surface/i), bodies = n(/MovingBody/i);
+  if (slices) parts.push(`${slices} slice${slices > 1 ? "s" : ""}`);
+  if (surfaces) parts.push(`${surfaces} surface${surfaces > 1 ? "s" : ""}`);
+  if (bodies) parts.push(`${bodies} bod${bodies > 1 ? "ies" : "y"}`);
+  const other = kinds.length - (kinds.includes("Volume") ? 1 : 0) - slices - surfaces - bodies;
+  if (other > 0) parts.push(`${other} other`);
+  return (
+    <details className="outputs" onClick={(e) => e.stopPropagation()}>
+      <summary title={kinds.join("\n")}>{parts.join(", ")} <span className="muted">({kinds.length})</span></summary>
+      <div className="tags">{kinds.map((k) => <span key={k} className="tag">{k}</span>)}</div>
+    </details>
+  );
 }
 
 const ago = (s: number | undefined) => s === undefined ? "" : s < 90 ? `${Math.round(s)} s ago`
@@ -210,9 +236,8 @@ export default function CasesView({ project, onChange, active = true }: {
                   {c.uid ?? ""}{c.id_written === false && <span className="tag">not in folder</span>}</td>
                 <td className="nowrap"><SolveTag s={solves?.[c.id]} /></td>
                 <td className="num">{fmt(simTime(c).end)}</td>
-                <td className="small">{(c.info?.output_kinds ?? []).map((k) =>
-                  <span key={k} className="tag">{k}</span>)}</td>
-                {cols.map((k) => <td key={k} className={typeof c.info?.settings?.[k] === "number" ? "num" : ""}>{fmt(c.info?.settings?.[k])}</td>)}
+                <td className="small nowrap"><Outputs kinds={c.info?.output_kinds ?? []} /></td>
+                {cols.map((k) => <td key={k} className={typeof c.info?.settings?.[k] === "number" ? "num" : ""}>{fmt(c.info?.settings?.[k], digitsOf(k))}</td>)}
               </tr>
             )),
           ])}

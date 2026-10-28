@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 
@@ -245,8 +247,37 @@ def _plane_meta(h: dict, a: dict, axis: int, idx: int, dims, so, sp, values) -> 
         "vmax": float(finite.max()) if finite.size else 0.0,
         "p01": float(np.percentile(finite, 1)) if finite.size else 0.0,
         "p99": float(np.percentile(finite, 99)) if finite.size else 0.0,
+        "mean": float(finite.mean()) if finite.size else 0.0,
         "unit": a["unit"], "time": h["time"],
     }
+
+
+def volume_mean(path: Path, name: str, comp: str, mask: bool = True) -> dict:
+    """Mean of a scalar (or vector magnitude/component) over the fluid cells of the whole
+    .vti (solid = all 'Volume Fraction' arrays ~0, as in the planes), cached per file."""
+    st = path.stat()
+    return _volume_mean(str(path), st.st_mtime_ns, name, comp, mask)
+
+
+@lru_cache(maxsize=512)
+def _volume_mean(path_s: str, mtime_ns: int, name: str, comp: str, mask: bool) -> dict:
+    path = Path(path_s)
+    h = header(path)
+    a = find_array(h, name)
+    arr = volume_array(path, name)
+    fr = _fraction_names(h, a["assoc"]) if mask else []
+    fracs = [volume_array(path, n) for n in fr] if len(fr) >= 2 else []
+    total, count = 0.0, 0
+    step = max(1, int(2e7 // max(1, arr.shape[1] * arr.shape[2])))  # ~20 M cells per slab
+    for z in range(0, arr.shape[0], step):
+        v = reduce_comp(np.asarray(arr[z:z + step]), comp, a["ncomp"]).astype(np.float64)
+        ok = np.isfinite(v)
+        if fracs:
+            ok &= sum(np.asarray(f[z:z + step], np.float32) for f in fracs) >= 0.5
+        total += float(v[ok].sum())
+        count += int(ok.sum())
+    return {"mean": total / count if count else None, "n_cells": count, "unit": a["unit"],
+            "time": h["time"], "masked": bool(fracs)}
 
 
 def extract_plane(path: Path, name: str, comp: str, axis: int | None,
@@ -372,8 +403,8 @@ def _cache_path(kind: str, *key, ext: str = ".stl") -> Path:
     return d / f"{digest}{ext}"
 
 
-def _write_stl(poly, out: Path) -> None:
-    """Binary STL of the triangles of poly (degenerate ones dropped)."""
+def _triangles(poly):
+    """(points float32 (n, 3), faces uint32 (m, 3)) of poly, degenerate triangles dropped."""
     import vtk
     from vtk.util import numpy_support
     tri = vtk.vtkTriangleFilter()
@@ -382,16 +413,37 @@ def _write_stl(poly, out: Path) -> None:
     tri.PassLinesOff()
     tri.Update()
     t = tri.GetOutput()
-    if t.GetNumberOfPolys():
-        pts = numpy_support.vtk_to_numpy(t.GetPoints().GetData()).astype(np.float32)
-        f = numpy_support.vtk_to_numpy(t.GetPolys().GetConnectivityArray()).reshape(-1, 3)
-        v = pts[f]
+    if not t.GetNumberOfPolys():
+        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint32)
+    pts = numpy_support.vtk_to_numpy(t.GetPoints().GetData()).astype(np.float32)
+    f = numpy_support.vtk_to_numpy(t.GetPolys().GetConnectivityArray()).reshape(-1, 3)
+    v = pts[f]
+    keep = np.linalg.norm(np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0]), axis=1) > 0
+    return pts, f[keep].astype(np.uint32)
+
+
+def _write_mesh(poly, out: Path) -> None:
+    """Indexed binary mesh, ~3x smaller than STL: b'MPM1', uint32 n_points, uint32
+    n_triangles, float32 xyz[n_points], uint32 index[n_triangles * 3] (little-endian)."""
+    pts, f = _triangles(poly)
+    tmp = out.with_suffix(".tmp")
+    with open(tmp, "wb") as fh:
+        fh.write(b"MPM1")
+        fh.write(np.array([len(pts), len(f)], "<u4").tobytes())
+        fh.write(np.ascontiguousarray(pts, "<f4").tobytes())
+        fh.write(np.ascontiguousarray(f, "<u4").tobytes())
+    tmp.replace(out)
+
+
+def _write_stl(poly, out: Path) -> None:
+    """Binary STL of the triangles of poly (degenerate ones dropped)."""
+    pts, f = _triangles(poly)
+    v = pts[f]
+    if len(v):
         nrm = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])
-        ln = np.linalg.norm(nrm, axis=1)
-        keep = ln > 0
-        v, nrm = v[keep], nrm[keep] / ln[keep, None]
+        nrm /= np.linalg.norm(nrm, axis=1)[:, None]
     else:
-        v, nrm = np.zeros((0, 3, 3), np.float32), np.zeros((0, 3), np.float32)
+        nrm = np.zeros((0, 3), np.float32)
     rec = np.zeros(len(v), dtype=[("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")])
     rec["n"], rec["v"] = nrm, v
     tmp = out.with_suffix(".tmp")
@@ -402,8 +454,13 @@ def _write_stl(poly, out: Path) -> None:
     tmp.replace(out)
 
 
+_WRITERS = {"stl": (_write_stl, ".stl"), "mesh": (_write_mesh, ".mesh")}
+
+
 def _simplify(poly, max_tris: int):
-    """Fast grid-based (quadric clustering) reduction to about max_tris triangles."""
+    """Fast grid-based (quadric clustering) reduction to about max_tris triangles.
+    The grid is capped at 256 divisions per axis: the filter's cost grows with the number
+    of bins (629^3 took 9 s on a 370k-triangle free surface, 192^3 0.5 s)."""
     import vtk
     from vtk.util import numpy_support
     n = poly.GetNumberOfCells()
@@ -418,32 +475,69 @@ def _simplify(poly, max_tris: int):
     cell = max(edge, 1e-12) * np.sqrt(n / max_tris) * 1.2
     qc = vtk.vtkQuadricClustering()
     qc.SetInputData(poly)
-    qc.SetNumberOfDivisions(*(int(min(2048, max(2, (b[2 * a + 1] - b[2 * a]) / cell)))
+    qc.SetNumberOfDivisions(*(int(min(256, max(2, (b[2 * a + 1] - b[2 * a]) / cell)))
                               for a in range(3)))
     qc.AutoAdjustNumberOfDivisionsOff()
     qc.Update()
     return qc.GetOutput()
 
 
-def surface_stl(path: Path, max_tris: int = 400_000) -> Path:
-    """A .vtp/.stl/.vtk surface as a (simplified) binary STL, cached on disk."""
+def surface_stl(path: Path, max_tris: int = 400_000, fmt: str = "stl") -> Path:
+    """A .vtp/.stl/.vtk surface as a (simplified) binary STL or indexed mesh, cached on disk."""
+    write, ext = _WRITERS[fmt]
     st = path.stat()
-    out = _cache_path("surf", str(path), st.st_mtime_ns, max_tris)
+    out = _cache_path("surf", str(path), st.st_mtime_ns, max_tris, ext=ext)
     if out.is_file():
         return out
     import pyvista as pv
     mesh = pv.read(str(path))
     if not isinstance(mesh, pv.PolyData):
         mesh = mesh.extract_surface()
-    _write_stl(_simplify(mesh, max_tris), out)
+    write(_simplify(mesh, max_tris), out)
     return out
 
 
+_warm_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mesh-warm")
+_warm_pending: set[str] = set()
+_warm_lock = threading.Lock()
+
+
+def warm_surfaces(paths: list[Path], max_tris: int, fmt: str = "mesh") -> int:
+    """Convert surfaces in the background (one at a time) so stepping through time is
+    served from the disk cache; returns the number newly queued."""
+    queued = 0
+    for p in paths:
+        key = f"{p}|{max_tris}|{fmt}"
+        with _warm_lock:
+            if key in _warm_pending:
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if _cache_path("surf", str(p), st.st_mtime_ns, max_tris, ext=_WRITERS[fmt][1]).is_file():
+                continue
+            _warm_pending.add(key)
+
+        def run(p=p, key=key):
+            try:
+                surface_stl(p, max_tris, fmt)
+            except Exception:
+                pass
+            finally:
+                with _warm_lock:
+                    _warm_pending.discard(key)
+        _warm_pool.submit(run)
+        queued += 1
+    return queued
+
+
 def isosurface_stl(path: Path, name: str, comp: str, level: float,
-                   stride: int = 1, max_tris: int = 600_000) -> Path:
-    """Isosurface of a .vti array at level (flying edges), cached as STL."""
+                   stride: int = 1, max_tris: int = 600_000, fmt: str = "stl") -> Path:
+    """Isosurface of a .vti array at level (flying edges), cached as STL or indexed mesh."""
+    write, ext = _WRITERS[fmt]
     st = path.stat()
-    out = _cache_path("iso", str(path), st.st_mtime_ns, name, comp, level, stride, max_tris)
+    out = _cache_path("iso", str(path), st.st_mtime_ns, name, comp, level, stride, max_tris, ext=ext)
     if out.is_file():
         return out
     import vtk
@@ -464,7 +558,7 @@ def isosurface_stl(path: Path, name: str, comp: str, level: float,
     fe.SetValue(0, level)
     fe.ComputeNormalsOff()
     fe.Update()
-    _write_stl(_simplify(fe.GetOutput(), max_tris), out)
+    write(_simplify(fe.GetOutput(), max_tris), out)
     return out
 
 
