@@ -170,7 +170,7 @@ export default function FilesView() {
   const download = (paths: string[]) => {
     const files = paths.filter((p) => listing?.entries.some((e) => e.path === p && !e.dir));
     if (files.length < paths.length) setNote(`${paths.length - files.length} folder${paths.length - files.length === 1 ? "" : "s"} skipped: only files can be downloaded`);
-    if (files.length) api.download(files, files.length > 1 ? listing?.path.split("/").pop() || "files" : undefined);
+    if (files.length) api.download(files, files.length > 1 ? listing?.path.split("/").pop() || "files" : undefined, setError);
   };
   const remove = async () => {
     if (!pending) return;

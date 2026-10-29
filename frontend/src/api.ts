@@ -133,18 +133,28 @@ export const api = {
     req<{ dest: string; moved: string[]; skipped: { path: string; reason: string }[] }>("/api/fs/move", json("POST", { paths, dest })),
   // one file as an attachment, several as a zip (name = zip file name without extension);
   // a hidden form post so the browser saves the stream and long selections do not hit the URL limit
-  download: (paths: string[], name?: string) => {
-    // the response goes to a hidden iframe so an error reply never replaces the app page
-    let fr = document.getElementById("dl-sink") as HTMLIFrameElement | null;
-    if (!fr) {
-      fr = document.createElement("iframe");
-      fr.id = "dl-sink"; fr.name = "dl-sink"; fr.style.display = "none";
-      document.body.appendChild(fr);
-    }
+  download: (paths: string[], name?: string, onError?: (msg: string) => void) => {
+    // the response goes to a hidden iframe so an error reply never replaces the app page;
+    // an attachment does not fire "load", an error reply does (same origin, so readable)
+    const target = `dl-sink-${Date.now()}`;
+    const fr = document.createElement("iframe");
+    fr.name = target; fr.style.display = "none";
+    fr.addEventListener("load", () => {
+      const text = fr.contentDocument?.body?.textContent?.trim() ?? "";
+      if (text) {
+        let msg = text;
+        try { const j = JSON.parse(text); msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail ?? j); } catch { /* not JSON */ }
+        if (/not authenticated|log in/i.test(msg)) window.dispatchEvent(new Event("mstar_post:login-needed"));
+        onError?.(`download failed: ${msg}`);
+      }
+      fr.remove();
+    });
+    setTimeout(() => fr.remove(), 10 * 60 * 1000);
+    document.body.appendChild(fr);
     const f = document.createElement("form");
     f.method = "post";
     f.action = "/api/fs/download";
-    f.target = "dl-sink";
+    f.target = target;
     f.style.display = "none";
     const add = (k: string, v: string) => {
       const i = document.createElement("input");
