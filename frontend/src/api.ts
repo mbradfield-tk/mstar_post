@@ -131,6 +131,40 @@ export const api = {
     req<{ path: string }>("/api/fs/rename", json("POST", { path, name })),
   movePaths: (paths: string[], dest: string) =>
     req<{ dest: string; moved: string[]; skipped: { path: string; reason: string }[] }>("/api/fs/move", json("POST", { paths, dest })),
+  // one file as an attachment, several as a zip (name = zip file name without extension);
+  // a hidden form post so the browser saves the stream and long selections do not hit the URL limit
+  download: (paths: string[], name?: string) => {
+    // the response goes to a hidden iframe so an error reply never replaces the app page
+    let fr = document.getElementById("dl-sink") as HTMLIFrameElement | null;
+    if (!fr) {
+      fr = document.createElement("iframe");
+      fr.id = "dl-sink"; fr.name = "dl-sink"; fr.style.display = "none";
+      document.body.appendChild(fr);
+    }
+    const f = document.createElement("form");
+    f.method = "post";
+    f.action = "/api/fs/download";
+    f.target = "dl-sink";
+    f.style.display = "none";
+    const add = (k: string, v: string) => {
+      const i = document.createElement("input");
+      i.type = "hidden"; i.name = k; i.value = v;
+      f.appendChild(i);
+    };
+    for (const p of paths) add("path", p);
+    if (name) add("name", name);
+    document.body.appendChild(f);
+    f.submit();
+    f.remove();
+  },
+  uploadFiles: (parent: string, files: File[], overwrite = false) => {
+    const fd = new FormData();
+    fd.append("parent", parent);
+    fd.append("overwrite", String(overwrite));
+    for (const f of files) fd.append("files", f, f.name);
+    return req<{ parent: string; saved: { name: string; bytes: number }[]; skipped: { name: string; reason: string }[] }>(
+      "/api/fs/upload", { method: "POST", body: fd });
+  },
   readFile: (path: string, offset = 0, tail = false, limit = 256 << 10) =>
     req<FileChunk>(`/api/fs/read?${qs({ path, offset, tail, limit })}`),
   imageUrl: (path: string) => `/api/fs/image?${qs({ path })}`,

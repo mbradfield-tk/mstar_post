@@ -160,6 +160,16 @@ def test_helpers_as_user(client, tmp_path, monkeypatch):
     assert (client.root / "R2" / "viahelper").is_dir()
     assert client.get("/api/fs/read", params={"path": str(client.root / "R1" / "caseA" / "input.xml")}).json()["text"].startswith("<input>")
     assert client.get("/api/fs/browse", params={"path": "/etc"}).status_code == 403
+    # streaming ops through the helper process: upload (put) and download (cat, also zipped)
+    r = client.post("/api/fs/upload", data={"parent": str(client.root / "R2")},
+                    files=[("files", ("h.bin", bytes(range(256)) * 5000, "application/octet-stream"))]).json()
+    assert r["saved"] == [{"name": "h.bin", "bytes": 1280000}] and (client.root / "R2" / "h.bin").stat().st_size == 1280000
+    r = client.get("/api/fs/download", params={"path": str(client.root / "R2" / "h.bin")})
+    assert r.status_code == 200 and len(r.content) == 1280000 and r.content[:3] == b"\x00\x01\x02"
+    assert client.get("/api/fs/download", params={"path": "/etc/passwd"}).status_code == 403
+    import io, zipfile
+    r = client.get("/api/fs/download", params={"path": [str(client.root / "R2" / "h.bin"), str(client.root / "R1" / "caseA" / "input.xml")]})
+    assert zipfile.ZipFile(io.BytesIO(r.content)).namelist() == ["h.bin", "input.xml"]
     p = client.post("/api/projects", json={"name": "hosted", "root": str(client.root)}).json()
     assert all(c["id_written"] for c in p["cases"])  # marker written through the helper
     run_dir = config.PROJECTS_DIR / p["id"] / "runs"
@@ -310,6 +320,26 @@ def test_fs_create_and_delete(client, monkeypatch):
     r = client.post("/api/fs/move", json={"paths": [str(client.root)], "dest": str(d / "taken")}).json()
     assert r["moved"] == [] and r["skipped"][0]["reason"].startswith(("refusing", "outside"))
     assert client.post("/api/fs/move", json={"paths": [str(d / "new")], "dest": "/etc"}).status_code == 403
+    # upload (never overwrites unless asked) and download (single file, zip of several)
+    r = client.post("/api/fs/upload", data={"parent": str(d)}, files=[("files", ("up.txt", b"hello", "text/plain")),
+                                                                   ("files", ("big.bin", bytes(3000), "application/octet-stream"))]).json()
+    assert [s["name"] for s in r["saved"]] == ["up.txt", "big.bin"] and (d / "up.txt").read_text() == "hello"
+    r = client.post("/api/fs/upload", data={"parent": str(d)}, files=[("files", ("up.txt", b"again", "text/plain"))]).json()
+    assert r["skipped"][0]["reason"].startswith("already exists") and (d / "up.txt").read_text() == "hello"
+    r = client.post("/api/fs/upload", data={"parent": str(d), "overwrite": "true"}, files=[("files", ("up.txt", b"again", "text/plain"))]).json()
+    assert r["saved"] and (d / "up.txt").read_text() == "again"
+    assert client.post("/api/fs/upload", data={"parent": "/etc"}, files=[("files", ("x", b"1"))]).json()["skipped"][0]["reason"].startswith(("not writable", "outside"))
+    r = client.get("/api/fs/download", params={"path": str(d / "up.txt")})
+    assert r.status_code == 200 and r.content == b"again" and "up.txt" in r.headers["content-disposition"]
+    assert client.get("/api/fs/download", params={"path": str(d)}).status_code == 422
+    r = client.get("/api/fs/download", params={"path": [str(d / "up.txt"), str(d / "big.bin")]})
+    import io, zipfile
+    z = zipfile.ZipFile(io.BytesIO(r.content))
+    assert r.headers["content-type"] == "application/zip" and z.namelist() == ["up.txt", "big.bin"] \
+        and z.read("up.txt") == b"again" and len(z.read("big.bin")) == 3000
+    r = client.post("/api/fs/download", data={"path": [str(d / "up.txt"), str(d / "big.bin")], "name": "pick"})
+    assert r.status_code == 200 and "pick.zip" in r.headers["content-disposition"] \
+        and zipfile.ZipFile(io.BytesIO(r.content)).namelist() == ["up.txt", "big.bin"]
     assert client.post("/api/fs/delete", json={"path": str(client.root), "recursive": True}).status_code == 403
     assert client.post("/api/fs/delete", json={"path": str(d / ".." / "R1")}).status_code == 422
     assert client.post("/api/fs/mkdirs", json={"parent": "/etc", "names": ["x"]}).status_code == 403

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import base64
 import time
+import zipfile
+from pathlib import PurePosixPath
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends
-from fastapi.responses import Response
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from app import config, fsops
@@ -141,3 +144,98 @@ def move(body: MoveRequest, me: Identity = Depends(require_user)) -> dict:
 def fs_whoami(me: Identity = Depends(require_user)) -> dict:
     """Account the file operations run as (sanity check of the helper setup)."""
     return {**fsops.run_as(me.user, "whoami"), "mode": config.HELPER_MODE}
+
+
+def _attachment(name: str) -> dict:
+    safe = name.encode("ascii", "replace").decode().replace('"', "_")
+    return {"Content-Disposition": f"attachment; filename=\"{safe}\"; filename*=UTF-8''{quote(name)}"}
+
+
+class _Sink:
+    """Write target for zipfile that hands finished bytes to a generator."""
+    def __init__(self) -> None:
+        self.buf = bytearray()
+        self.pos = 0
+    def write(self, b: bytes) -> int:
+        self.buf += b
+        self.pos += len(b)
+        return len(b)
+    def tell(self) -> int:
+        return self.pos
+    def flush(self) -> None:
+        pass
+    def take(self) -> bytes:
+        out = bytes(self.buf)
+        self.buf.clear()
+        return out
+
+
+@router.get("/download")
+def download(path: list[str] = Query(...), name: str | None = None, me: Identity = Depends(require_user)):
+    """One file as an attachment, or several files (repeat `path`) streamed as a zip
+    (stored, no compression; folders are not accepted). Read as the logged-in user."""
+    return _download(path, name, me)
+
+
+@router.post("/download")
+def download_form(path: list[str] = Form(...), name: str | None = Form(None), me: Identity = Depends(require_user)):
+    """Same as GET /download as a form post (the browser submits a hidden form, so long
+    selections are not limited by the URL length)."""
+    return _download(path, name, me)
+
+
+def _download(path: list[str], name: str | None, me: Identity):
+    if len(path) > 500:
+        raise HTTPException(422, "at most 500 files per download")
+    if len(path) == 1:
+        hdr, chunks = fsops.open_as(me.user, path[0])
+        return StreamingResponse(chunks, media_type="application/octet-stream",
+                                 headers={**_attachment(hdr["name"]), "Content-Length": str(hdr["size"])})
+    # open every file first so permission errors become a normal HTTP error, not a broken zip
+    opened = [fsops.open_as(me.user, p) for p in path]
+    names: dict[str, int] = {}
+
+    def unique(n: str) -> str:
+        k = names.get(n, 0)
+        names[n] = k + 1
+        if not k:
+            return n
+        stem, dot, ext = n.rpartition(".")
+        return f"{stem} ({k}).{ext}" if dot and stem else f"{n} ({k})"
+
+    def gen():
+        sink = _Sink()
+        with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
+            for hdr, chunks in opened:
+                info = zipfile.ZipInfo(unique(hdr["name"]), time.localtime(hdr["mtime"])[:6])
+                info.file_size = hdr["size"]
+                with z.open(info, "w", force_zip64=True) as dst:
+                    for b in chunks:
+                        dst.write(b)
+                        if sink.pos and len(sink.buf) >= 1 << 20:
+                            yield sink.take()
+                yield sink.take()
+        yield sink.take()
+    zip_name = (name or (PurePosixPath(path[0]).parent.name or "files")) + ".zip"
+    return StreamingResponse(gen(), media_type="application/zip", headers=_attachment(zip_name))
+
+
+@router.post("/upload")
+async def upload(parent: str = Form(...), overwrite: bool = Form(False), files: list[UploadFile] = File(...),
+                 me: Identity = Depends(require_user)) -> dict:
+    """Store uploaded files in `parent` (inside the writable roots) as the logged-in user;
+    existing names are skipped unless overwrite. Per-file results in saved / skipped."""
+    if len(files) > 200:
+        raise HTTPException(422, "at most 200 files per upload")
+    saved, skipped = [], []
+    for f in files:
+        fname = PurePosixPath(f.filename or "").name
+        try:
+            r = fsops.put_as(me.user, parent, fname, f.file, overwrite)
+            saved.append({"name": fname, "bytes": r["bytes"]})
+        except HTTPException as e:
+            skipped.append({"name": fname, "reason": str(e.detail)})
+        finally:
+            await f.close()
+    _du_cache.clear()
+    return {"parent": parent, "saved": saved, "skipped": skipped}

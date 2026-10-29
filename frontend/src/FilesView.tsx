@@ -43,6 +43,11 @@ export default function FilesView() {
   const [dropAt, setDropAt] = useState<string | null>(null);
   // move confirmation (drag-and-drop or "Move to"): paths -> destination folder
   const [moving, setMoving] = useState<{ paths: string[]; dest: string; busy: boolean; error: string | null } | null>(null);
+  // upload from the browser into the current folder (button or files dropped from the desktop)
+  const [overwrite, setOverwrite] = useState(false);
+  const [uploading, setUploading] = useState<{ n: number; bytes: number } | null>(null);
+  const [osDrop, setOsDrop] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
   const reload = () => setTick((x) => x + 1);
   useEffect(() => {
     if (!note) return;
@@ -130,6 +135,42 @@ export default function FilesView() {
       setNewText("");
       reload();
     } catch (e) { setError((e as Error).message); }
+  };
+  const upload = async (files: File[]) => {
+    if (!listing?.writable || !files.length || uploading) return;
+    setError(null);
+    setUploading({ n: files.length, bytes: files.reduce((s, f) => s + f.size, 0) });
+    try {
+      const r = await api.uploadFiles(listing.path, files, overwrite);
+      const total = r.saved.reduce((s, f) => s + f.bytes, 0);
+      setNote(`uploaded ${r.saved.length} file${r.saved.length === 1 ? "" : "s"} (${fmtBytes(total)})`
+        + (r.skipped.length ? `; skipped: ${r.skipped.map((s) => `${s.name} (${s.reason})`).join(", ")}` : ""));
+      setUsage((u) => { const { [listing.path]: _, ...rest } = u; return rest; });
+      reload();
+    } catch (e) { setError((e as Error).message); }
+    setUploading(null);
+  };
+  // files dragged in from the desktop (not a row move): drop anywhere on the listing
+  const osDragProps = listing?.writable && !dragging ? {
+    onDragOver: (ev: DragEvent) => {
+      if (!ev.dataTransfer.types.includes("Files")) return;
+      ev.preventDefault(); ev.dataTransfer.dropEffect = "copy";
+      if (!osDrop) setOsDrop(true);
+    },
+    onDragLeave: (ev: DragEvent) => { if (!ev.currentTarget.contains(ev.relatedTarget as Node | null)) setOsDrop(false); },
+    onDrop: (ev: DragEvent) => {
+      if (!ev.dataTransfer.types.includes("Files")) return;
+      ev.preventDefault(); setOsDrop(false);
+      // folders arrive as size-0 entries without a type: the browser cannot upload them
+      const files = Array.from(ev.dataTransfer.files).filter((f) => f.size > 0 || f.type);
+      if (files.length < ev.dataTransfer.files.length) setError("folders cannot be uploaded: select the files inside");
+      void upload(files);
+    },
+  } : {};
+  const download = (paths: string[]) => {
+    const files = paths.filter((p) => listing?.entries.some((e) => e.path === p && !e.dir));
+    if (files.length < paths.length) setNote(`${paths.length - files.length} folder${paths.length - files.length === 1 ? "" : "s"} skipped: only files can be downloaded`);
+    if (files.length) api.download(files, files.length > 1 ? listing?.path.split("/").pop() || "files" : undefined);
   };
   const remove = async () => {
     if (!pending) return;
@@ -263,11 +304,21 @@ export default function FilesView() {
               <button className="primary" disabled={!newName.trim()} onClick={createOne}>Create</button>
             </>
           )}
+          <span className="grow" />
+          <input ref={fileInput} type="file" multiple style={{ display: "none" }}
+                 onChange={(e) => { void upload(Array.from(e.target.files ?? [])); e.target.value = ""; }} />
+          <button disabled={!!uploading} onClick={() => fileInput.current?.click()}
+                  title="upload files from this computer into the current folder (or drop them onto the list)">
+            {uploading ? `Uploading ${uploading.n} file${uploading.n === 1 ? "" : "s"} (${fmtBytes(uploading.bytes)})...` : "Upload files"}</button>
+          <label title="replace files of the same name (otherwise they are skipped)">
+            <input type="checkbox" checked={overwrite} onChange={(e) => setOverwrite(e.target.checked)} /> overwrite</label>
         </div>
-      ) : <div className="small muted">Read-only here (create and delete only inside the writable roots).</div>)}
-      {listing?.writable && selected.length > 0 && (
+      ) : <div className="small muted">Read-only here (create, upload and delete only inside the writable roots).</div>)}
+      {listing && selected.length > 0 && (
         <div className="row small card">
           <b>{selected.length} selected</b>
+          <button onClick={() => download(selected)} title="one file as is, several files as a zip (folders are skipped)">Download selected</button>
+          {listing.writable && <>
           <label title="create this sub-folder in the current folder (if needed) and move the selection into it">Combine in sub-folder{" "}
             <input className="mono" placeholder="new sub-folder name" value={subName}
                    onChange={(e) => setSubName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && combine()} /></label>
@@ -280,8 +331,9 @@ export default function FilesView() {
                 {listing.parent && <option value={listing.parent}>.. (parent folder)</option>}
                 {folders.filter((f) => !selected.includes(f.path)).map((f) => <option key={f.path} value={f.path}>{f.name}/</option>)}
               </select></label>)}
+          </>}
           <button onClick={() => setSelected([])}>Clear selection</button>
-          <span className="muted">or drag rows onto a folder, a breadcrumb or Up</span>
+          {listing.writable && <span className="muted">or drag rows onto a folder, a breadcrumb or Up</span>}
         </div>
       )}
       {listing?.writable && tool === "file" && (
@@ -314,12 +366,13 @@ export default function FilesView() {
         </div>
       )}
       {listing && (
-        <div className="tablewrap">
+        <div className={`tablewrap${osDrop ? " droptarget" : ""}`} {...osDragProps}>
+          {osDrop && <div className="small muted">Drop to upload into {listing.path}</div>}
           <table className="grid">
-            <thead><tr>{listing.writable && <th><input type="checkbox" checked={allSelected} title="select all"
-                onChange={(e) => setSelected(e.target.checked ? entries.map((x) => x.path) : [])} /></th>}
+            <thead><tr><th><input type="checkbox" checked={allSelected} title="select all"
+                onChange={(e) => setSelected(e.target.checked ? entries.map((x) => x.path) : [])} /></th>
               {head("name", "name")}{head("size", "size")}<th>share</th>{head("mtime", "modified")}
-              {listing.writable && <th>actions</th>}</tr></thead>
+              <th>actions</th></tr></thead>
             <tbody>
               {entries.map((e) => {
                 const s = sizeOf(e), u = usage[e.path];
@@ -327,8 +380,8 @@ export default function FilesView() {
                 return (
                   <tr key={e.path} draggable={listing.writable} onDragStart={dragStart(e)} onDragEnd={() => { setDragging(null); setDropAt(null); }}
                       {...drop} className={[viewing === e.path ? "selected" : "", selected.includes(e.path) ? "checked" : "", drop.className ?? ""].join(" ").trim()}>
-                    {listing.writable && <td><input type="checkbox" checked={selected.includes(e.path)}
-                      onChange={(ev) => setSelected(ev.target.checked ? [...selected, e.path] : selected.filter((p) => p !== e.path))} /></td>}
+                    <td><input type="checkbox" checked={selected.includes(e.path)}
+                      onChange={(ev) => setSelected(ev.target.checked ? [...selected, e.path] : selected.filter((p) => p !== e.path))} /></td>
                     <td className="mono">{e.dir
                       ? <a onClick={() => !e.link && setPath(e.path)}>{e.name}/</a>
                       : <a title="view contents" onClick={() => setViewing(e.path)}>{e.name}</a>}
@@ -342,16 +395,18 @@ export default function FilesView() {
                       <div className="sharebar" title={`${((100 * s) / known).toFixed(1)}% of the measured entries`}>
                         <div style={{ width: `${(100 * s) / known}%` }} /></div>)}</td>
                     <td className="small">{when(e.mtime)}</td>
-                    {listing.writable && <td className="nowrap">
-                      {!e.dir && <><button className="small" onClick={() => setViewing(e.path)}>View</button>{" "}</>}
+                    <td className="nowrap">
+                      {!e.dir && <><button className="small" onClick={() => setViewing(e.path)}>View</button>{" "}
+                        <button className="small" title={`download ${e.name}`} onClick={() => download([e.path])}>Download</button>{" "}</>}
+                      {listing.writable && <>
                       <button className="small" title={`rename ${e.name}`}
                         onClick={() => setRenaming({ e, name: e.name, busy: false, error: null })}>Rename</button>{" "}
                       <button className="danger small" title={`delete ${e.name}`}
-                      onClick={() => setPending({ e, step: "confirm", typed: "", busy: false })}>Delete</button></td>}
+                      onClick={() => setPending({ e, step: "confirm", typed: "", busy: false })}>Delete</button></>}</td>
                   </tr>
                 );
               })}
-              {!entries.length && <tr><td colSpan={listing.writable ? 6 : 4} className="muted">(empty folder)</td></tr>}
+              {!entries.length && <tr><td colSpan={6} className="muted">(empty folder{listing.writable ? ": drop files here to upload" : ""})</td></tr>}
             </tbody>
           </table>
           {listing.truncated && <div className="muted small">Only the first 5000 entries are listed.</div>}

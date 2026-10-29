@@ -469,16 +469,92 @@ def handle(req: dict) -> dict:
         return {"ok": False, "status": 500, "error": f"{type(e).__name__}: {e}"}
 
 
+# Streaming ops: the request is one JSON line; "cat" answers with a JSON header line
+# followed by the raw file bytes, "put" reads the raw bytes that follow the request line.
+CHUNK = 1 << 20
+MAX_PUT = 16 << 30
+
+
+def open_cat(req: dict):
+    """(header dict, open binary file) for a cat request; raises Fail."""
+    ctx = Ctx(req)
+    p = ctx.safe(req["path"])
+    if not p.is_file():
+        raise Fail(422, "not a file")
+    try:
+        fh = open(p, "rb")
+    except PermissionError:
+        raise Fail(403, f"permission denied: {req['path']}")
+    st = p.stat()
+    return {"ok": True, "name": p.name, "size": st.st_size, "mtime": st.st_mtime}, fh
+
+
+def put_from(req: dict, src, limit: int | None = None) -> dict:
+    """Write the bytes of src (a binary file-like) to <parent>/<name>; never overwrites
+    unless req['overwrite']. Returns {path, bytes}."""
+    ctx = Ctx(req)
+    d = ctx.writable_dir(req["parent"])
+    p = d / check_name(req["name"])
+    if p.is_symlink() or (p.exists() and not req.get("overwrite")):
+        raise Fail(409, f"already exists: {p.name}")
+    if p.exists() and p.is_dir():
+        raise Fail(409, f"a folder named {p.name} exists")
+    cap = min(limit or MAX_PUT, MAX_PUT)
+    tmp = d / f".{p.name}.upload-{os.getpid()}"
+    n = 0
+    try:
+        with open(tmp, "wb") as out:
+            while True:
+                b = src.read(CHUNK)
+                if not b:
+                    break
+                n += len(b)
+                if n > cap:
+                    raise Fail(413, f"file larger than {cap >> 30} GB")
+                out.write(b)
+        os.replace(tmp, p)
+    except Fail:
+        tmp.unlink(missing_ok=True)
+        raise
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        raise Fail(403 if isinstance(e, PermissionError) else 500, str(e))
+    return {"path": str(p), "bytes": n}
+
+
+def _emit(reply: dict) -> None:
+    sys.stdout.buffer.write((json.dumps(reply) + "\n").encode())
+    sys.stdout.buffer.flush()
+
+
 def main() -> int:
     if os.geteuid() == 0:
         print(json.dumps({"ok": False, "status": 500, "error": "refusing to run as root"}))
         return 2
     try:
-        req = json.loads(sys.stdin.read() or "{}")
+        req = json.loads(sys.stdin.buffer.readline().decode() or "{}")
     except ValueError:
         print(json.dumps({"ok": False, "status": 422, "error": "invalid JSON request"}))
         return 2
     os.umask(0o002)  # files made on the user's behalf stay deletable by the service group
+    if req.get("op") == "cat":
+        try:
+            hdr, fh = open_cat(req)
+        except Fail as e:
+            _emit({"ok": False, "status": e.status, "error": str(e)})
+            return 1
+        _emit(hdr)
+        with fh:
+            shutil.copyfileobj(fh, sys.stdout.buffer, CHUNK)
+        sys.stdout.buffer.flush()
+        return 0
+    if req.get("op") == "put":
+        try:
+            _emit({"ok": True, "result": put_from(req, sys.stdin.buffer, req.get("limit"))})
+        except Fail as e:
+            _emit({"ok": False, "status": e.status, "error": str(e)})
+            return 1
+        return 0
     print(json.dumps(handle(req)))
     return 0
 
