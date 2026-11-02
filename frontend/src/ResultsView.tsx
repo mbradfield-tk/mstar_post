@@ -9,6 +9,8 @@ import RunSummary from "./RunSummary";
 import StatsSeries from "./StatsSeries";
 import TaskComparison from "./TaskComparison";
 import AllResults from "./AllResults";
+import CaseSelect from "./CaseSelect";
+import { fileForCases, runHasCases, selectedCaseIds } from "./results";
 
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : "");
 // stats_plots/<stem>.html name of a Stats file, as written by mstar_stats_summary.make_plots
@@ -52,7 +54,11 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
   useEffect(() => localStorage.setItem(`mstar_post.results.group.${project.id}`, groupBy), [groupBy, project.id]);
   const [compareTask, setCompareTask] = useState<string | null>(null);
   const [cmpSection, setCmpSection] = useState<CmpSection>("key");
-  const run = compareTask ? null : runs.find((r) => r.name === runName) ?? null;
+  // Project > selected cases > job type: only runs and files of the selected cases are listed
+  const selIds = selectedCaseIds(project);
+  const shownRuns = runs.filter((r) => runHasCases(r, selIds));
+  const run = compareTask ? null : shownRuns.find((r) => r.name === runName) ?? null;
+  const runFiles = run ? [...run.csvs, ...run.htmls, ...run.images].filter((f) => fileForCases(project, f, selIds)) : [];
   const ui = useDialog();
   const me = useUser();
   const runIds = run?.params?.cases;
@@ -60,19 +66,21 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
   const openFile = (f: string) => { setFile(f); setSection("files"); };
   const openRun = (name: string) => { setCompareTask(null); onRunChange(name); };
   const taskLabel = (id: string | null) => tasks.find((t) => t.id === id)?.label ?? id ?? "unknown job type";
-  const byTask = runs.reduce((m, r) => m.set(r.task ?? "", [...(m.get(r.task ?? "") ?? []), r]), new Map<string, Run[]>());
+  const byTask = shownRuns.reduce((m, r) => m.set(r.task ?? "", [...(m.get(r.task ?? "") ?? []), r]), new Map<string, Run[]>());
 
   useEffect(() => { api.tasks().then(setTasks).catch(() => undefined); }, []);
 
   const reload = () => api.runs(project.id).then((rs) => {
     setRuns(rs);
-    if (!runName && rs.length) onRunChange(rs[0].name);
+    const first = rs.find((r) => runHasCases(r, selectedCaseIds(project)));
+    if (!runName && first) onRunChange(first.name);
   }).catch((e) => setError(e.message));
   useEffect(() => { if (active) reload(); }, [project.id, active]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!run) { setFile(null); return; }
-    const pick = PREFERRED.find((p) => run.csvs.includes(p)) ?? run.csvs[0] ?? run.htmls[0] ?? null;
+    const csvs = run.csvs.filter((f) => fileForCases(project, f, selIds));
+    const pick = PREFERRED.find((p) => csvs.includes(p)) ?? csvs[0] ?? runFiles.find((f) => f.endsWith(".html")) ?? null;
     setFile(pick);
   }, [run?.name]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -135,7 +143,9 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
       <div className="side">
         <div className="row"><h3 className="grow">Runs</h3><button onClick={reload}>Refresh</button>
           <button onClick={() => { setCompareTask(null); onReset(); }} title="newest run, default file, no table filters">Reset</button></div>
-        {runs.length > 1 && <div className="row small">
+        <CaseSelect project={project} onChange={onProjectChange} />
+        {runs.length > shownRuns.length && <div className="small muted">{runs.length - shownRuns.length} run{runs.length - shownRuns.length === 1 ? "" : "s"} hidden: none of their cases is selected</div>}
+        {shownRuns.length > 1 && <div className="row small">
           <span className="muted">group</span>
           <span className="seg">
             <button className={groupBy === "task" ? "primary" : ""} onClick={() => setGroupBy("task")} title="runs grouped by job type, with a comparison of all cases per type">by job type</button>
@@ -146,7 +156,7 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
                   title="rename M-Star's 'Moving Body' / 'agitator' to 'Agitator' in the result files of every run">
             {renaming ? "Renaming..." : "Moving Body \u2192 Agitator (all runs)"}</button></div>}
         {renameNote && <div className="note small" onClick={() => setRenameNote(null)}>{renameNote}</div>}
-        {(groupBy === "task" ? [...byTask.entries()] : [["", runs] as [string, Run[]]]).map(([tid, rs]) => (
+        {(groupBy === "task" ? [...byTask.entries()] : [["", shownRuns] as [string, Run[]]]).map(([tid, rs]) => (
           <div key={tid || "all"} className="run-group">
             {groupBy === "task" && (
               <div className={`taskcard compare${compareTask === tid ? " active" : ""}`} onClick={() => setCompareTask(tid)}
@@ -163,11 +173,11 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
             ))}
           </div>
         ))}
-        {!runs.length && <div className="muted">No runs yet: start a calculation on the Run tab.</div>}
+        {!shownRuns.length && <div className="muted">{runs.length ? "No run includes a selected case." : "No runs yet: start a calculation on the Run tab."}</div>}
         {run && (
           <>
             <h3>Files</h3>
-            {[...group([...run.csvs, ...run.htmls, ...run.images])].map(([d, fs]) => (
+            {[...group(runFiles)].map(([d, fs]) => (
               <details key={d} open={d === "(run)"}>
                 <summary className="small mono">{d === "(run)" ? "run folder" : caseName(project, d)}</summary>
                 <ul className="filelist">

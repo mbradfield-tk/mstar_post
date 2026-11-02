@@ -615,6 +615,16 @@ def test_run_timeseries(client):
     assert list(s) == ["R2/caseA"] and s["R2/caseA"]["t"] == [0, 1, 2, 4]  # bucket extremes kept
     assert client.get(f"{base}/series", params={"file": "../../jobs.db",
                                                 "columns": ["E"]}).status_code == 422
+    (run / "batch_summary_means.csv").write_text("case,Power Number [W/W]\nR1/caseA,1\nR2/caseA,2\n")
+    (run / "batch_summary.csv").write_text("case,file,variable,mean,std\nR1/caseA,Fluid.txt,Mean Velocity [m/s],1,0\n"
+                                           "R2/caseA,Fluid.txt,Mean Velocity [m/s],2,0\n")
+    v = {(e["path"]): e for e in client.get(f"/api/projects/{p['id']}/variables").json()}
+    assert v["batch_summary_means.csv"] == {"run": "r1", "path": "batch_summary_means.csv", "case": None, "kind": "table",
+                                            "columns": ["Power Number [W/W]"], "cases": ["R1/caseA", "R2/caseA"]}
+    assert v["batch_summary.csv"]["kind"] == "long" and v["batch_summary.csv"]["columns"] == [["Mean Velocity [m/s]", "Fluid.txt"]]
+    assert v["R1/caseA/ua.csv"]["kind"] == "series" and v["R1/caseA/ua.csv"]["case"] == "R1/caseA"
+    assert v["R1/caseA/velocity/profiles.csv"]["kind"] == "table" and v["R1/caseA/velocity/profiles.csv"]["case"] == "R1/caseA"
+    assert v["R1/caseA/holdup_profile.csv"]["kind"] == "table"
 
 
 def test_run_timeseries_single_case(client):

@@ -1,19 +1,23 @@
 import { useEffect, useMemo, useState } from "react";
 import type Plotly from "plotly.js-dist-min";
-import { api, caseName, download, fmt, toCsv, type CsvTable, type Project, type Run, type RunSeriesFile,
+import { api, caseName, copyText, download, fmt, toCsv, type CsvTable, type Project, type Run, type RunSeriesFile,
          type StatsFile, type TaskDef } from "./api";
 import CaseNames from "./CaseNames";
+import CaseSelect from "./CaseSelect";
 import { useDialog } from "./Dialog";
 import Plot from "./Plot";
 import { caseColor, PlotStyleEditor, usePlotStyle, type PlotStyle } from "./PlotStyle";
 import StatsSeries from "./StatsSeries";
+import VariableSearch from "./VariableSearch";
 import ZonesPlot from "./ZonesPlot";
-import { loadRunResults, type Cell } from "./results";
+import { loadRunResults, runHasCases, selectedCaseIds, shortName, unitOf, type Cell } from "./results";
 
-type Mode = "series" | "single" | "bars" | "scatter" | "detail" | "zones";
-const MODE_LABEL: Record<Mode, string> = { series: "Time series", single: "Case time series",
+type Mode = "find" | "series" | "single" | "bars" | "scatter" | "detail" | "zones";
+const MODES: Mode[] = ["find", "series", "single", "bars", "scatter", "detail", "zones"];
+const MODE_LABEL: Record<Mode, string> = { find: "Find variable", series: "Time series", single: "Case time series",
   bars: "Compare means", scatter: "Trend (x-y)", detail: "Case detail", zones: "Zones" };
 const MODE_HELP: Record<Mode, string> = {
+  find: "search a variable in every result of the selected cases (M-Star Stats files, job tables and time series) and plot it",
   series: "M-Star Stats variables (or run metrics) over time for several cases in stacked panels",
   single: "one case: pick a Stats file or a job's time-series CSV (e.g. ua.csv) and its variables to plot over time",
   bars: "steady-state means per case as bars",
@@ -36,11 +40,18 @@ export default function PlotsView({ project, onProjectChange, active, onReset }:
   // Plots-only reference for % differences; the project reference case is the default
   const [ref, setRef] = useState<string>(() => localStorage.getItem(refKey) ?? project.ref_case ?? project.cases[0]?.id ?? "");
   useEffect(() => localStorage.setItem(refKey, ref), [refKey, ref]);
+  // a variable found by the search becomes a new Time series panel
+  const plotSeries = (src: string, file: string, col: string) => {
+    const ps = loadPanels(project.id);
+    const key = Math.max(0, ...ps.map((p) => p.key)) + 1;
+    localStorage.setItem(`mstar_post.plots.${project.id}`, JSON.stringify([...ps, { key, src, file, cols: [col], win: 0, logY: false }]));
+    setMode("series");
+  };
   return (
     <div className="panel">
       <div className="row">
         <h2 className="grow">Plots</h2>
-        {(["series", "single", "bars", "scatter", "detail", "zones"] as Mode[]).map((m) => (
+        {MODES.map((m) => (
           <button key={m} className={mode === m ? "primary" : ""} title={MODE_HELP[m]} onClick={() => setMode(m)}>{MODE_LABEL[m]}</button>
         ))}
         <label title="baseline for '% vs ref' in all plot modes (the project reference case is set on the Cases tab)">Reference case{" "}
@@ -52,14 +63,16 @@ export default function PlotsView({ project, onProjectChange, active, onReset }:
           body: <p>All panels, sources, case selections and the reference case go back to the defaults. Plot style and case names are kept.</p> }) && onReset()}>Reset</button>
         {ui.dialog}
       </div>
+      <CaseSelect project={project} onChange={onProjectChange} />
       <CaseNames project={project} onChange={onProjectChange} />
       <PlotStyleEditor style={style} setStyle={setStyle} project={project}
                        caseIds={project.cases.map((c) => c.id)} />
       <div className="small muted">{MODE_LABEL[mode]}: {MODE_HELP[mode]}.</div>
+      {mode === "find" && <VariableSearch project={project} style={style} refCase={ref} onPlotSeries={plotSeries} />}
       {mode === "series" && <SeriesPlot project={project} style={style} active={active} refCase={ref} />}
       {mode === "single" && <StatsSeries project={project} style={style} />}
       {mode === "zones" && <ZonesPlot project={project} style={style} active={active} refCase={ref} />}
-      {mode !== "series" && mode !== "single" && mode !== "zones" && <MeansPlots project={project} view={mode} style={style} active={active} refCase={ref} />}
+      {(mode === "bars" || mode === "scatter" || mode === "detail") && <MeansPlots project={project} view={mode} style={style} active={active} refCase={ref} />}
     </div>
   );
 }
@@ -129,6 +142,8 @@ function SeriesPlot({ project, style, active, refCase }: { project: Project; sty
   const [tss, setTss] = useState<number | "">("");
   const [cache, setCache] = useState<Record<string, SeriesMap>>({});
   const [error, setError] = useState<string | null>(null);
+  const selIds = selectedCaseIds(project);
+  const runFilesSel = (name: string) => (runFiles[name] ?? []).filter((f) => f.cases.some((id) => selIds.has(id)));
 
   useEffect(() => {
     setPanels(loadPanels(project.id));
@@ -181,7 +196,7 @@ function SeriesPlot({ project, style, active, refCase }: { project: Project; sty
   }, [panels, project.id]);
 
   const filesOf = (src: string): { file: string; columns: string[] }[] =>
-    src === "stats" ? statsFiles : runFiles[src.slice(4)] ?? [];
+    src === "stats" ? statsFiles : runFilesSel(src.slice(4));
 
   // saved panels may name columns from before unit labels: "E" -> "E = a/a0 [...]"
   useEffect(() => {
@@ -318,14 +333,14 @@ function SeriesPlot({ project, style, active, refCase }: { project: Project; sty
             <div key={p.key} className="row panel-row">
               <b>{i + 1}</b>
               <label>Source <select value={p.src === "stats" ? "stats" : "jobs"} onChange={(e) => {
-                const r = runs.find((x) => runFiles[x.name]?.length);
+                const r = runs.find((x) => runFilesSel(x.name).length);
                 const src = e.target.value === "stats" ? "stats" : r ? `run:${r.name}` : null;
                 if (!src) return;
                 const f = filesOf(src)[0];
                 update(p.key, { src, file: f?.file ?? "", cols: f ? [f.columns[0]] : [] });
               }}>
                 <option value="stats">M-Star Stats</option>
-                <option value="jobs" disabled={!runs.some((r) => runFiles[r.name]?.length)}>App script outputs</option>
+                <option value="jobs" disabled={!runs.some((r) => runFilesSel(r.name).length)}>App script outputs</option>
               </select></label>
               {p.src === "stats" ? (
                 <label>File <select value={p.file} onChange={(e) => {
@@ -343,9 +358,9 @@ function SeriesPlot({ project, style, active, refCase }: { project: Project; sty
                   update(p.key, { src, file, cols: f ? [f.columns[0]] : [] });
                 }}>
                   {!files.some((f) => f.file === p.file) && <option value={`${p.src.slice(4)}|${p.file}`}>{p.file || "-"}</option>}
-                  {runs.filter((r) => runFiles[r.name]?.length).map((r) => (
+                  {runs.filter((r) => runFilesSel(r.name).length).map((r) => (
                     <optgroup key={r.name} label={`${r.label ?? r.name} (${r.name.slice(0, 15)})`}>
-                      {runFiles[r.name].map((f) => <option key={f.file} value={`${r.name}|${f.file}`}>{f.file}</option>)}
+                      {runFilesSel(r.name).map((f) => <option key={f.file} value={`${r.name}|${f.file}`}>{f.file}</option>)}
                     </optgroup>))}
                 </select></label>
               )}
@@ -378,7 +393,7 @@ function SeriesPlot({ project, style, active, refCase }: { project: Project; sty
         <label>Steady from [s] <input type="number" step="any" value={tss}
                                       onChange={(e) => setTss(e.target.value === "" ? "" : Number(e.target.value))} /></label>
         <button onClick={exportCsv}>Export CSV</button>
-        {!runs.some((r) => runFiles[r.name]?.length) && <span className="muted">No app script outputs yet: run an add-on (Liquid-liquid dispersion, Heat transfer UA) to plot its time series.</span>}
+        {!runs.some((r) => runFilesSel(r.name).length) && <span className="muted">No app script outputs for the selected cases yet: run an add-on (Liquid-liquid dispersion, Heat transfer UA) to plot its time series.</span>}
       </div>
       {error && <div className="error">{error}</div>}
       {panels.some((p) => (p.rel ?? "none") !== "none") && !cases.some((c) => c.id === refCase) &&
@@ -478,11 +493,14 @@ function MeansPlots({ project, view, style, active, refCase }: {
     localStorage.setItem(store, JSON.stringify({ srcs, excluded, pctMode, heat, focus, srcMode, taskId }));
   }, [store, srcs, excluded, pctMode, heat, focus, srcMode, taskId]);
 
-  const byTask = runs.reduce((m, r) => m.set(r.task ?? "", [...(m.get(r.task ?? "") ?? []), r]), new Map<string, Run[]>());
+  const selIds = selectedCaseIds(project);
+  const visRuns = runs.filter((r) => runHasCases(r, selIds));
+  const selKey = [...selIds].join("|");
+  const byTask = visRuns.reduce((m, r) => m.set(r.task ?? "", [...(m.get(r.task ?? "") ?? []), r]), new Map<string, Run[]>());
   const taskLabel = (id: string) => tasks.find((t) => t.id === id)?.label ?? id ?? "unknown job type";
   const taskRuns = (byTask.get(taskId) ?? []).filter((r) => r.status === "done" || r.status === "unknown");
 
-  const options = runs.flatMap((r) => r.csvs.filter((c) => c.endsWith("_means.csv") || c.endsWith("_settings.csv"))
+  const options = visRuns.flatMap((r) => r.csvs.filter((c) => c.endsWith("_means.csv") || c.endsWith("_settings.csv"))
     .map((c) => ({ value: `${r.path}/${c}`, label: `${r.label ?? r.name} (${r.name.slice(0, 15)}): ${c}` })));
 
   useEffect(() => {
@@ -527,7 +545,7 @@ function MeansPlots({ project, view, style, active, refCase }: {
       if (!num.includes(yCol)) setYCol(num.find((c) => /power number/i.test(c)) ?? num[1] ?? "");
     });
     return () => { stale = true; };
-  }, [srcMode, taskId, srcs.join("|"), runs]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [srcMode, taskId, srcs.join("|"), runs, selKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // cases deselected on the Cases tab are left out; cases unknown to the project (e.g. renamed) stay
   const deselected = new Set(project.cases.filter((c) => !c.included).map((c) => c.id));
@@ -589,7 +607,7 @@ function MeansPlots({ project, view, style, active, refCase }: {
             ) : (
               <>
             <div className="checklist">
-              {runs.map((r) => {
+              {visRuns.map((r) => {
                 const opts = options.filter((o) => o.value.startsWith(`${r.path}/`));
                 if (!opts.length) return null;
                 const n = opts.filter((o) => srcs.includes(o.value)).length;
@@ -674,6 +692,8 @@ function MeansPlots({ project, view, style, active, refCase }: {
                 );
               })}
             </div>
+            {sel.length > 0 && <MeansTable project={project} cases={cases} sel={sel} colVals={colVals} refVal={refVal}
+                                           refCase={refCase} refName={refName} origin={(c) => merged!.origin[merged!.rows.findIndex((r) => r[0] === c)] ?? ""} />}
         </div>
       )}
       {merged && view === "detail" && (
@@ -687,6 +707,69 @@ function MeansPlots({ project, view, style, active, refCase }: {
                     numeric={numeric} setX={setXCol} setY={setYCol} fit={fit} setFit={setFit}
                     logAxes={logAxes} setLogAxes={setLogAxes} />
       )}
+    </>
+  );
+}
+
+// The plotted means as text: absolute values and % vs ref as two tables, cases as rows (or variables as rows).
+function MeansTable({ project, cases, sel, colVals, refVal, refCase, refName, origin }: {
+  project: Project; cases: string[]; sel: string[]; colVals: (c: string) => Cell[]; refVal: (c: string) => Cell | undefined;
+  refCase: string; refName: string; origin: (c: string) => string;
+}) {
+  const [transpose, setTranspose] = useState(false);
+  const num = (v: Cell | undefined) => (typeof v === "number" ? v : null);
+  const val = (s: string, i: number) => num(colVals(s)[i]);
+  const pctOf = (s: string, i: number) => pctDiff(val(s, i), refVal(s));
+  const names = cases.map((c) => caseName(project, c));
+  const build = (cell: (s: string, i: number) => number | null, withUnit: boolean) => transpose
+    ? { header: ["variable", ...(withUnit ? ["unit"] : []), ...names],
+        rows: sel.map((s) => [shortName(s), ...(withUnit ? [unitOf(s)] : []), ...cases.map((_, i) => cell(s, i))]) }
+    : { header: ["case", ...(withUnit ? sel : sel.map(shortName))], rows: cases.map((_, i) => [names[i], ...sel.map((s) => cell(s, i))]) };
+  const refIdx = cases.indexOf(refCase);
+  return (
+    <details className="card">
+      <summary><b>Values tables</b> <span className="small muted">{sel.length} variable{sel.length === 1 ? "" : "s"} &times; {cases.length} case{cases.length === 1 ? "" : "s"}, reference {refName}</span></summary>
+      <div className="row small">
+        <label><input type="checkbox" checked={transpose} onChange={(e) => setTranspose(e.target.checked)} /> variables as rows</label>
+      </div>
+      <TextTable title="Absolute values" file="means_values.csv" {...build(val, true)} transpose={transpose}
+                 refIdx={refIdx} labelOffset={transpose ? 2 : 1} tips={cases.map((c) => `${c}\n${origin(c)}`)} />
+      <TextTable title={`% difference vs ${refName}`} file="means_pct_vs_ref.csv" {...build(pctOf, false)} transpose={transpose}
+                 refIdx={refIdx} labelOffset={1} tips={cases.map((c) => `${c}\n${origin(c)}`)} />
+    </details>
+  );
+}
+
+function TextTable({ title, file, header, rows, transpose, refIdx, labelOffset, tips }: {
+  title: string; file: string; header: string[]; rows: (string | number | null)[][]; transpose: boolean;
+  refIdx: number; labelOffset: number; tips: string[];
+}) {
+  const [copied, setCopied] = useState<boolean | null>(null);
+  const copy = async () => {
+    const txt = [header, ...rows].map((r) => r.map((v) => (v === null ? "" : String(v))).join("\t")).join("\n");
+    setCopied(await copyText(txt));
+    setTimeout(() => setCopied(null), 1500);
+  };
+  const isRefCol = (j: number) => transpose && j - labelOffset === refIdx;
+  return (
+    <>
+      <div className="row small">
+        <b className="grow">{title}</b>
+        <button onClick={copy} title="tab-separated, pastes into Excel">{copied === null ? "Copy table" : copied ? "Copied" : "Copy failed: use Export CSV"}</button>
+        <button onClick={() => download(file, toCsv(header, rows))}>Export CSV</button>
+      </div>
+      <div className="tablewrap">
+        <table className="grid">
+          <thead><tr>{header.map((h, j) => <th key={j} className={isRefCol(j) ? "refrow" : ""}
+            title={transpose && j >= labelOffset ? tips[j - labelOffset] : undefined}>{h}</th>)}</tr></thead>
+          <tbody>{rows.map((r, i) => (
+            <tr key={i} className={!transpose && i === refIdx ? "refrow" : ""}>
+              {r.map((v, j) => j < labelOffset
+                ? <td key={j} className={j ? "small" : "mono"} title={!transpose && !j ? tips[i] : undefined}>{v}</td>
+                : <td key={j} className={`num${isRefCol(j) ? " refrow" : ""}`}>{fmt(v)}</td>)}
+            </tr>))}</tbody>
+        </table>
+      </div>
     </>
   );
 }

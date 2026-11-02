@@ -15,6 +15,9 @@ export const KEY_METRICS: [RegExp, string][] = [
   [/^Kolmogorov Scale at Mean Resolved Dissipation \[/, "Kolmogorov"],
   [/^Mixing Time/i, "Mixing time"],
   [/^Specific Interfacial Area \[/, "a"],
+  [/^Interfacial Area A_int \[/, "A_int"],
+  [/^Overall K_oc a, circulating drops/, "K_oc a (circ.)"],
+  [/^Extraction Time t90 = ln10\/k, circulating drops/, "t90 extraction (circ.)"],
   [/^Interface Enhancement E/, "E = a/a0"],
   [/^Sauter Diameter d32 \(/, "d32"],
   [/^Dispersion Time t95/, "t95 disp"],
@@ -80,6 +83,26 @@ export const caseSummaryFilesOf = (run: Run) => run.csvs.filter((f) => f.include
 // case id of a per-case output path (<case id>/[<sub dir>/]<file>); case ids contain "/", so match by prefix
 const caseOfPath = (project: Project, f: string) =>
   project.cases.find((c) => f.startsWith(`${c.id}/`))?.id ?? (project.single ? project.cases[0]?.id : undefined) ?? f.slice(0, f.lastIndexOf("/"));
+
+// the cases the user works on: the selected ones, or all when none is selected
+export const selectedCaseIds = (p: Project) => {
+  const s = p.cases.filter((c) => c.included);
+  return new Set((s.length ? s : p.cases).map((c) => c.id));
+};
+export const runCaseIds = (r: Run): string[] | null =>
+  Array.isArray(r.params?.cases) && r.params.cases.length ? r.params.cases as string[] : null;
+// runs without a case list (old runs) are kept
+export const runHasCases = (r: Run, ids: Set<string>) => {
+  const rc = runCaseIds(r);
+  return !rc || rc.some((id) => ids.has(id));
+};
+// the case a run file belongs to (longest matching id prefix), null for run-level files
+export const fileCase = (p: Project, f: string): string | null => p.single ? null
+  : p.cases.filter((c) => f.startsWith(`${c.id}/`)).sort((a, b) => b.id.length - a.id.length)[0]?.id ?? null;
+export const fileForCases = (p: Project, f: string, ids: Set<string>) => {
+  const c = fileCase(p, f);
+  return !c || ids.has(c);
+};
 
 // One row per case of a run: merged root *_means.csv (first file wins per column), or
 // the final value of every key column of the per-case time series.

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, download, fmt, toCsv, type CatalogCase } from "./api";
+import { api, copyText, download, fmt, toCsv, type CatalogCase } from "./api";
 
 // Key settings shown as columns (matched by prefix), as in the project Cases tab.
 const KEY_SETTINGS = ["Volume [L]", "Agitator speed [rpm]", "dx [m]", "Fluid 1 name", "Fluid 2 name",
@@ -38,7 +38,7 @@ export default function CaseCatalog({ onOpenProject }: { onOpenProject: (id: str
   const head = (k: SortKey, label: string, title?: string) => (
     <th className="sortable" title={title} onClick={() => setSort({ key: k, asc: sort.key === k ? !sort.asc : true })}>
       {label}{sort.key === k ? (sort.asc ? " \u25b2" : " \u25bc") : ""}</th>);
-  const copy = (uid: string) => navigator.clipboard?.writeText(uid).then(() => { setCopied(uid); setTimeout(() => setCopied(null), 1500); });
+  const copy = (uid: string) => copyText(uid).then((ok) => { if (ok) { setCopied(uid); setTimeout(() => setCopied(null), 1500); } });
   const exportCsv = () => download("mstar_post_cases.csv", toCsv(
     ["case_id", "name", "folder", "projects", "simulated_end_s", ...cols],
     shown.map((r) => [r.uid, r.name, r.path, r.projects.map((p) => `${p.name}:${p.case_id}`).join("; "),

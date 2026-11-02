@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { download, fmt, toCsv, type CsvTable } from "./api";
+import { copyText, download, fmt, toCsv, type CsvTable } from "./api";
 
 type Cell = string | number | null;
 
@@ -59,7 +59,7 @@ export default function CsvTableView({ table, name, refCase, caseLabel }: {
     transpose ? toCsv(["variable", ...view.map((r) => String(r[0]))],
                       cols.slice(1).map((c, j) => [c, ...view.map((r) => r[j + 1])]))
               : toCsv(cols, view));
-  const copyTsv = () => navigator.clipboard.writeText(
+  const copyTsv = () => copyText(
     [cols, ...view].map((r) => r.map((v) => (v === null ? "" : String(v))).join("\t")).join("\n"));
 
   const shade = (j: number, v: Cell) => {

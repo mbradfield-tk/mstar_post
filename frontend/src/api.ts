@@ -63,6 +63,9 @@ export type SolveState = {
   wall_h?: number; eta_h?: number; iterations?: number; mups?: number; last_lines?: string[]; note?: string; error?: string;
 };
 export type RunSeriesFile = { file: string; columns: string[]; cases: string[] };
+// one result CSV of a run; long tables list [variable, source Stats file] pairs
+export type VarEntry = { run: string; path: string; case: string | null; kind: "series" | "table" | "long";
+  columns: (string | [string, string])[]; cases: string[] };
 export type Series = { t: number[]; columns: Record<string, (number | null)[]> };
 export type CsvTable = { columns: string[]; rows: (string | number | null)[][]; truncated: boolean };
 export type BrowseEntry = { name: string; path: string; dir: boolean; link: boolean; size: number | null;
@@ -203,6 +206,7 @@ export const api = {
   csv: (id: string, path: string) => req<CsvTable>(`/api/projects/${id}/csv?${qs({ path })}`),
   runTimeseries: (id: string, run: string) =>
     req<RunSeriesFile[]>(`/api/projects/${id}/runs/${encodeURIComponent(run)}/timeseries`),
+  variables: (id: string) => req<VarEntry[]>(`/api/projects/${id}/variables`),
   runSeries: (id: string, run: string, file: string, columns: string[], cases?: string[]) =>
     req<Record<string, Series>>(
       `/api/projects/${id}/runs/${encodeURIComponent(run)}/series?${qs({ file, columns, cases })}`),
@@ -257,6 +261,24 @@ export function download(filename: string, text: string, type = "text/csv") {
   a.download = filename;
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// navigator.clipboard only exists on https/localhost; plain http on the server name needs execCommand
+export async function copyText(text: string): Promise<boolean> {
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(text); return true; } catch { /* fall back */ }
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch { ok = false; }
+  ta.remove();
+  return ok;
 }
 
 export function toCsv(columns: string[], rows: unknown[][]): string {

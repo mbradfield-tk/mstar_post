@@ -353,7 +353,81 @@ def list_runs(pid: str) -> list[dict]:
     return out
 
 
-@router.delete("/{pid}/runs/{name}")
+# file path + (mtime, size) -> index entry; result files do not change once a run is done
+_VAR_CACHE: dict[str, tuple[tuple[int, int], dict]] = {}
+_VAR_SCAN_MAX = 50 << 20
+
+
+def _case_of(p: dict, rel: str) -> str | None:
+    ids = sorted((c["id"] for c in p["cases"]), key=len, reverse=True)
+    hit = next((cid for cid in ids if rel.startswith(f"{cid}/")), None)
+    return hit or (p["cases"][0]["id"] if p["single"] and p["cases"] else None)
+
+
+def _index_csv(f: Path) -> dict:
+    """kind series (time-first), long (file/variable/mean rows) or table, its variables
+    (long: [variable, source file]) and the case ids of a "case" column."""
+    st = f.stat()
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _VAR_CACHE.get(str(f))
+    if hit and hit[0] == key:
+        return hit[1]
+    out: dict = {"kind": "table", "columns": [], "cases": []}
+    with open(f, newline="") as fh:
+        reader = csv.reader(fh)
+        hdr = next(reader, [])
+        low = [h.strip().lower() for h in hdr]
+        if hdr and _is_time(hdr[0]) and f.name not in _NOT_SERIES:
+            out = {"kind": "series", "columns": hdr[1:], "cases": []}
+        elif {"variable", "mean"} <= set(low) and st.st_size <= _VAR_SCAN_MAX:
+            iv, i_f = low.index("variable"), low.index("file") if "file" in low else None
+            ic = low.index("case") if "case" in low else None
+            seen: dict[tuple[str, str], None] = {}
+            cs: dict[str, None] = {}
+            for r in reader:
+                if len(r) > iv:
+                    seen[(r[iv], r[i_f] if i_f is not None and len(r) > i_f else "")] = None
+                if ic is not None and len(r) > ic:
+                    cs[r[ic]] = None
+            out = {"kind": "long", "columns": [list(k) for k in seen], "cases": list(cs)}
+        else:
+            cs = {}
+            if low[:1] == ["case"] and st.st_size <= _VAR_SCAN_MAX:
+                cs = {r[0]: None for r in reader if r}
+            out = {"kind": "table", "columns": hdr[1:] if low[:1] == ["case"] else hdr, "cases": list(cs)}
+    if len(_VAR_CACHE) > 5000:
+        _VAR_CACHE.clear()
+    _VAR_CACHE[str(f)] = (key, out)
+    return out
+
+
+@router.get("/{pid}/variables")
+def run_variables(pid: str) -> list[dict]:
+    """Every variable of every result CSV of the project's runs, for the variable search:
+    {run, path (relative to the run), case (per-case output folder), kind, columns, cases}.
+    Time series are only "series" when they sit directly in the case folder (readable by /series)."""
+    p = load(pid)
+    base = _dir(pid) / "runs"
+    out = []
+    for r in sorted(base.glob("*"), reverse=True) if base.is_dir() else []:
+        if not r.is_dir():
+            continue
+        case_dirs = {str(d): cid for cid, d in _case_dirs(p, r).items()}
+        for root, _dirs, files in os.walk(r):
+            for name in sorted(files):
+                if not name.endswith(".csv"):
+                    continue
+                f = Path(root) / name
+                rel = f.relative_to(r).as_posix()
+                try:
+                    e = dict(_index_csv(f))
+                except (OSError, UnicodeDecodeError, csv.Error):
+                    continue
+                cid = _case_of(p, rel) if "/" in rel or p["single"] else None
+                if e["kind"] == "series" and case_dirs.get(root) is None:
+                    e["kind"] = "table"
+                out.append({"run": r.name, "path": rel, "case": cid, **e})
+    return out
 def delete_run(pid: str, name: str, me: Identity = Depends(require_user)) -> dict:
     r = safe_child(_dir(pid) / "runs", name)
     p = load(pid)

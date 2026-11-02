@@ -164,6 +164,8 @@ def _dispersion_build(project: dict, cases: list[dict], prm: dict, run: Path) ->
                        ("vessel_diameter", "--vessel-diameter"),
                        ("min_d_dx", "--min-d-dx"), ("min_voxels", "--min-voxels"),
                        ("eps_ratio", "--eps-ratio"), ("k_phi", "--k-phi"),
+                       ("diff_c", "--diff-c"), ("diff_d", "--diff-d"),
+                       ("partition", "--partition"), ("dc0", "--dc0"),
                        ("zone_scales", "--zone-scales"), ("vertical_axis", "--vertical-axis")):
         _opt(argv, flag, prm.get(name))
     cmds = [{"argv": argv}]
@@ -178,7 +180,9 @@ DISPERSION = Task(
                 "kinetics (a0, a_ss, E, t90/t95, tau), drop statistics from the VOF "
                 "surface (n_drops, d32, F_disp, coverage), the Hinze resolution check "
                 "and, optionally, phase uniformity (zonal CoV, segregation index, "
-                "continuity). Writes batch_summary_dispersion*.csv / _uniformity*.csv "
+                "continuity) and a two-film mass-transfer estimate from global averages "
+                "(k_c, k_d, K_oc a, extraction time; give the diffusivities and m). "
+                "Writes batch_summary_dispersion*.csv / _uniformity*.csv "
                 "and per-case time series (dispersion_timeseries, vof_structures, "
                 "phase_uniformity, phase_continuity); the base Stats summary is not repeated.",
     params=[
@@ -196,6 +200,13 @@ DISPERSION = Task(
         P("min_voxels", "Min drop volume [voxels]", default=8.0, group="Dispersion"),
         P("eps_ratio", "Local/mean eps ratio", default=1.0, group="Dispersion"),
         P("k_phi", "Holdup correction k_phi", default=0.0, group="Dispersion"),
+        P("diff_c", "Solute diffusivity, continuous phase [m2/s]", group="Mass transfer",
+          help="enables the two-film estimate (global averages): k_c, k_d, K_oc a, extraction time; typical liquids 1e-9"),
+        P("diff_d", "Solute diffusivity, dispersed phase [m2/s]", group="Mass transfer"),
+        P("partition", "Distribution coefficient m = C_d*/C_c* [-]", group="Mass transfer",
+          help="equilibrium ratio dispersed/continuous; needed for K_oc a and the extraction time"),
+        P("dc0", "Initial driving force C_c - C_d/m [mol/m3]", group="Mass transfer",
+          help="optional: initial transfer rate N0 [mol/s]"),
         P("uniformity", "Phase uniformity metrics", "bool", True,
           help="zonal CoV, segregation index, holdup profile, continuity (.vti)", group="Uniformity"),
         P("zone_scales", "Zone scales NZxNR", "list", "10x3", group="Uniformity"),
