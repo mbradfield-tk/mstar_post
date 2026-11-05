@@ -467,6 +467,46 @@ def test_planes(client, case_id):
         "path": case, "file": vol, "array": "Velocity Vector (m/s)", "comp": "0",
         "p0": "0.005,0.005,0.005", "p1": "0.055,0.005,0.005", "n": 6}).json()
     assert line["value"] == [float(i) for i in range(6)]
+    pt = lambda p, **kw: client.post("/api/case/point", json={"path": case, "files": [vol], "array": "Velocity Vector (m/s)",
+                                                              "comp": "0", "p": p, **kw})
+    r = pt([0.026, 0.014, 0.015]).json()["points"][0]
+    assert r["value"] == 38.0 and r["cell"] == [2, 1, 1] and r["solid"] is False and r["inside"]
+    assert r["center"] == pytest.approx([0.025, 0.015, 0.015])
+    assert pt([0.005, 0.005, 0.005]).json()["points"][0]["solid"] is True
+    r = pt([1.0, 0.0, 0.0]).json()["points"][0]
+    assert r["inside"] is False and r["value"] is None
+    assert pt([0.0, 0.0]).status_code == 422
+    assert pt([0.0, 0.0, 0.0], array="nope").status_code == 404
+
+
+def test_fluid_weighted_mean(tmp_path):
+    """Global mean over the fluid like M-Star: fraction-weighted (two-fluid), else cells with a
+    non-zero velocity (free surface / single phase); whole grid when everything is at rest."""
+    from app import vtkio
+
+    def vti(name: str, vel: np.ndarray, fracs: list[np.ndarray] | None = None) -> Path:
+        img = pv.ImageData(dimensions=(5, 3, 2), spacing=(0.1, 0.1, 0.1))  # 4 x 2 x 1 cells
+        img.cell_data["Velocity Magnitude (m/s)"] = vel.astype(np.float32)
+        img.cell_data["Energy Dissipation Rate (W/kg)"] = np.arange(8, dtype=np.float32)
+        for i, f in enumerate(fracs or []):
+            img.cell_data[f"Fluid {i + 1} Volume Fraction (-)"] = f.astype(np.float32)
+        p = tmp_path / name
+        img.save(p)
+        return p
+
+    vel = np.array([0, 0, 1, 2, 3, 0, 4, 5], float)
+    r = vtkio.volume_mean(vti("fs.vti", vel), "Energy Dissipation Rate (W/kg)", "", True)
+    assert r["mask"] == "non-zero velocity" and r["n_cells"] == 5
+    assert r["mean"] == pytest.approx((2 + 3 + 4 + 6 + 7) / 5) and r["fluid_volume"] == pytest.approx(5e-3)
+    r = vtkio.volume_mean(vti("rest.vti", np.zeros(8)), "Energy Dissipation Rate (W/kg)", "", True)
+    assert r["mask"] == "none" and r["n_cells"] == 8 and r["mean"] == pytest.approx(3.5)
+    f1 = np.array([1, 1, 0.5, 0, 0, 0, 0, 0]); f2 = np.array([0, 0, 0, 0.5, 1, 1, 0, 0])
+    p = vti("two.vti", np.ones(8), [f1, f2])
+    r = vtkio.volume_mean(p, "Energy Dissipation Rate (W/kg)", "", True)
+    w = f1 + f2
+    assert r["mask"] == "volume fractions" and r["mean"] == pytest.approx(float((w * np.arange(8)).sum() / w.sum()))
+    assert vtkio.point_value(p, "Energy Dissipation Rate (W/kg)", "", [0.25, 0.15, 0.05])["solid"] is True
+    assert vtkio.point_value(p, "Energy Dissipation Rate (W/kg)", "", [0.25, 0.05, 0.05])["solid"] is False
 
 
 def test_meshes(client):

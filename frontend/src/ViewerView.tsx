@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, AXES, download, fmt, toCsv, type Inventory, type OutputKind, type Project } from "./api";
+import { api, AXES, copyText, download, fmt, toCsv, type Inventory, type OutputKind, type PointValue, type Project } from "./api";
 import { SolveTag, useSolves } from "./CasesView";
 import { traceStreamlines, type Vec2 } from "./flow";
 import { runLic } from "./lic";
 import { fetchPlane, type Plane } from "./plane";
 import Plot from "./Plot";
-import SliceCanvas, { type Overlay } from "./SliceCanvas";
+import SliceCanvas, { type Overlay, type Region, type Tool } from "./SliceCanvas";
 import Viewer3D, { CameraSync, layerColor, prefetchMesh, type LineLayer, type MeshLayer } from "./Viewer3D";
 
 const MAX_CASES = 4;
@@ -45,6 +45,38 @@ const surfDefaults = (inv: Inventory): Record<string, SurfOpt> => Object.fromEnt
 // triangle budget per surface: lower = faster conversion, download and rendering; "full" skips simplification
 const DETAIL: [number, string][] = [[100000, "low (~100k triangles)"], [250000, "medium (~250k)"], [4000000, "full (as exported)"]];
 
+type RegionStats = { mean: number | null; std: number | null; min: number | null; max: number | null;
+                     n: number; nAll: number; du: number; dv: number };
+// statistics of the plane cells whose centres lie inside the polygon (world coordinates); NaN = solid
+function regionStats(p: Plane, poly: number[][]): RegionStats {
+  const pts = poly.map((q) => [q[p.uAxis], q[p.vAxis]]);
+  const inside = (x: number, y: number) => {
+    let c = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++)
+      if ((pts[i][1] > y) !== (pts[j][1] > y)
+          && x < (pts[j][0] - pts[i][0]) * (y - pts[i][1]) / (pts[j][1] - pts[i][1]) + pts[i][0]) c = !c;
+    return c;
+  };
+  const us = pts.map((q) => q[0]), vs = pts.map((q) => q[1]);
+  const c0 = Math.max(0, Math.floor((Math.min(...us) - p.u0) / p.du)), c1 = Math.min(p.w - 1, Math.ceil((Math.max(...us) - p.u0) / p.du));
+  const r0 = Math.max(0, Math.floor((Math.min(...vs) - p.v0) / p.dv)), r1 = Math.min(p.h - 1, Math.ceil((Math.max(...vs) - p.v0) / p.dv));
+  let n = 0, nAll = 0, s = 0, s2 = 0, mn = Infinity, mx = -Infinity;
+  for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
+    if (!inside(p.u0 + c * p.du, p.v0 + r * p.dv)) continue;
+    nAll++;
+    const v = p.data[r * p.w + c];
+    if (!Number.isFinite(v)) continue;
+    n++; s += v; s2 += v * v;
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
+  const mean = n ? s / n : null;
+  return { mean, std: n > 1 ? Math.sqrt(Math.max(0, (s2 - n * mean! * mean!) / (n - 1))) : null,
+           min: n ? mn : null, max: n ? mx : null, n, nAll, du: p.du, dv: p.dv };
+}
+const polyArea = (poly: number[][], ua: number, va: number) =>
+  Math.abs(poly.reduce((a, q, i) => { const r = poly[(i + 1) % poly.length]; return a + q[ua] * r[va] - r[ua] * q[va]; }, 0)) / 2;
+
 export default function ViewerView({ project, onRefresh, active = true }: { project: Project; onRefresh: () => Promise<unknown>; active?: boolean }) {
   const cases = project.cases.filter((c) => c.included);
   const solves = useSolves(project.id, active);
@@ -79,7 +111,11 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const lastAdvance = useRef(0);
   const [error, setError] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
-  const [lineMode, setLineMode] = useState(false);
+  const [tool, setTool] = useState<Tool>("none");
+  const [region, setRegion] = useState<(Region & { axis: number }) | null>(null);
+  const [probe, setProbe] = useState<[string, string, string]>(["", "", ""]);
+  const [pointVals, setPointVals] = useState<Record<string, PointValue | string>>({});
+  const [pointSeries, setPointSeries] = useState<{ p: number[]; rows: { id: string; t: number[]; v: (number | null)[] }[] } | "busy" | null>(null);
   const [profiles, setProfiles] = useState<Profile[] | null>(null);
   // 3D state
   const [geo, setGeo] = useState<Record<string, { on: boolean; opacity: number }>>({});
@@ -251,7 +287,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   }, [urlsKey, layout, planeIn3d]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // global (fluid-volume) mean of the shown field per case and extra view, keyed by the mean URL
-  const [vmeans, setVmeans] = useState<Record<string, number | null>>({});
+  const [vmeans, setVmeans] = useState<Record<string, { mean: number | null; mask: string } | null>>({});
   const meanKey = (id: string, arrName: string, c: string) => {
     const f = frameOf(id);
     return f && arrName && f[0].type === "volume" ? `${pathOf(id)}|${f[0].files[f[1]][0]}|${arrName}|${c}|${mask}` : null;
@@ -264,7 +300,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
       if (k in vmeans) continue;
       const [path, file, arrName, c, m] = k.split("|");
       api.volumeMean(path, file, arrName, c, m === "true")
-        .then((r) => live && setVmeans((v) => ({ ...v, [k]: r.mean })))
+        .then((r) => live && setVmeans((v) => ({ ...v, [k]: { mean: r.mean, mask: r.mask } })))
         .catch(() => live && setVmeans((v) => ({ ...v, [k]: null })));
     }
     return () => { live = false; };
@@ -273,7 +309,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
     const out: string[] = [];
     if (p && Number.isFinite(p.mean)) out.push(`plane mean ${fmt(p.mean, 4)}`);
     const g = key ? vmeans[key] : undefined;
-    if (typeof g === "number") out.push(`global mean ${fmt(g, 4)}`);
+    if (g && typeof g.mean === "number") out.push(`global mean ${fmt(g.mean, 4)} (${g.mask === "none" ? "whole grid" : "fluid"})`);
     else if (key && g === undefined) out.push("global mean ...");
     return out;
   };
@@ -477,6 +513,57 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const lines3dBy: Record<string, LineLayer[]> = useMemo(() => Object.fromEntries(Object.entries(lines3d)
     .map(([id, ls]) => [id, ls.map((l) => ({ ...l, range }))])), [lines3dKey, range]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // region average: a polygon drawn on the plane, applied to every pane with the same normal axis
+  const addRegionPoint = (p: number[]) => setRegion((r) => {
+    if (!r || r.closed || r.axis !== axis) return { axis, pts: [p], closed: false };
+    const last = r.pts[r.pts.length - 1];
+    return last.every((x, i) => x === p[i]) ? r : { ...r, pts: [...r.pts, p] };
+  });
+  const closeRegion = () => setRegion((r) => (r && r.pts.length >= 3 ? { ...r, closed: true } : r));
+  const regionFor = (p: Plane | null) => (region && p && region.axis === p.axis ? region : null);
+  const regionRows = useMemo(() => {
+    if (!region?.closed) return [];
+    const rowsOut: { id: string; label: string; unit: string; s: RegionStats }[] = [];
+    sel.forEach((id) => { const p = planes[id]; if (p && p.axis === region.axis) rowsOut.push({ id, label: labelOf(array, comp, arr?.ncomp ?? 1), unit: p.unit, s: regionStats(p, region.pts) }); });
+    shownExtras.forEach((e) => {
+      const p = xPlanes[e.key];
+      if (p && p.axis === region.axis) rowsOut.push({ id: e.id, label: labelOf(e.array, extraComp(e), extraArr(e)?.ncomp ?? 1), unit: p.unit, s: regionStats(p, region.pts) });
+    });
+    return rowsOut;
+  }, [region, planes, xPlanes, sel.join("|"), extraKey, array, comp]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // point probe: value of the cell nearest to (x, y, z) in the current frame of every shown case and extra view
+  const probeP = probe.every((s) => s.trim() !== "" && Number.isFinite(Number(s))) ? probe.map(Number) : null;
+  const pointReqs = probeP ? [
+    ...sel.map((id) => ({ key: `m|${id}`, id, array, comp, label: labelOf(array, comp, arr?.ncomp ?? 1) })),
+    ...shownExtras.map((e) => ({ key: `x|${e.key}`, id: e.id, array: e.array, comp: extraComp(e),
+                                 label: labelOf(e.array, extraComp(e), extraArr(e)?.ncomp ?? 1) })),
+  ].flatMap((q) => { const f = frameOf(q.id); return f && q.array ? [{ ...q, file: f[0].files[f[1]][0] }] : []; }) : [];
+  const pointKey = JSON.stringify([probeP, mask, pointReqs.map((q) => [q.key, q.file, q.array, q.comp])]);
+  useEffect(() => {
+    if (!probeP) return;
+    let live = true;
+    pointReqs.forEach((q) => api.point(pathOf(q.id), [q.file], q.array, q.comp, probeP, mask)
+      .then((r) => live && setPointVals((m) => ({ ...m, [q.key]: r.points[0] })))
+      .catch((e) => live && setPointVals((m) => ({ ...m, [q.key]: (e as Error).message }))));
+    return () => { live = false; };
+  }, [pointKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const pointOverTime = async () => {
+    if (!probeP) return;
+    setPointSeries("busy");
+    try {
+      const rowsOut = await Promise.all(sel.map(async (id) => {
+        const k = invs[id]?.kinds.find((x) => x.kind === kindName);
+        if (!k || !array) return null;
+        const r = await api.point(pathOf(id), k.files.map((f) => f[0]), array, comp, probeP, mask);
+        return { id, t: k.times, v: r.points.map((x) => x.value) };
+      }));
+      setPointSeries({ p: probeP, rows: rowsOut.filter((x): x is NonNullable<typeof x> => !!x) });
+    } catch (e) { setError((e as Error).message); setPointSeries(null); }
+  };
+  const markerFor = (p: Plane | null) => probeP && p
+    && Math.abs(probeP[p.axis] - p.pos) <= 0.5 * (kind?.spacing?.[p.axis] ?? Math.max(p.du, p.dv)) + 1e-12 ? probeP : null;
+
   if (!cases.length) return <div className="panel muted">Include at least one case on the Cases tab.</div>;
   const imgKinds = invA?.kinds.filter((k) => k.type === "volume" || k.type === "slice") ?? [];
   const volKind = invA?.kinds.find((k) => k.type === "volume");
@@ -572,12 +659,40 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                   </div>
                 )}
                 <label><input type="checkbox" checked={log} onChange={(e) => setLog(e.target.checked)} /> log scale</label>
-                <label><input type="checkbox" checked={mask} onChange={(e) => setMask(e.target.checked)} /> mask solids</label>
+                <label title="blank cells that hold no liquid: solids, outside the vessel and (free surface) the headspace. Fluid = the volume fractions (two-fluid output), else a non-zero velocity. The plane and global means use the same cells.">
+                  <input type="checkbox" checked={mask} onChange={(e) => setMask(e.target.checked)} /> mask non-fluid cells</label>
                 <label title="VTK-style cell-to-point shading as in M-Star Post: 1-2-1 average over the neighbouring cells in all three directions, then bilinear interpolation; solid edges stay sharp. Hover values are then smoothed too; the line probe stays raw.">
                   <input type="checkbox" checked={smooth} onChange={(e) => setSmooth(e.target.checked)} /> smooth shading</label>
-                <label><input type="checkbox" checked={lineMode} onChange={(e) => setLineMode(e.target.checked)} /> line probe (2 clicks)</label>
+                <label title="what a click on the 2D plane does">Click tool <select value={tool} onChange={(e) => setTool(e.target.value as Tool)}>
+                  <option value="none">none (drag pans when zoomed)</option>
+                  <option value="line">line profile (2 clicks)</option>
+                  <option value="region">region average (polygon)</option>
+                  <option value="point">point probe (pick x, y, z)</option></select></label>
               </>
             )}
+          </Section>
+        )}
+        {kind && (
+          <Section id="probes" title="Region and point">
+            <div className="small"><b>Region average</b>{" "}
+              <span className="muted">{region ? `${region.pts.length} corners${region.closed ? "" : " (open: double-click to close)"}, ${AXES[region.axis]}-normal planes`
+                : "none: choose Click tool 'region average' and click the corners on a 2D pane"}</span></div>
+            <div className="row small">
+              {tool !== "region" && <button onClick={() => setTool("region")}>Draw region</button>}
+              <button disabled={!region} onClick={() => setRegion(null)}>Clear region</button>
+            </div>
+            <div className="small"><b>Point probe</b> <span className="muted">x, y, z [m]; nearest cell</span></div>
+            <div className="row small">
+              {[0, 1, 2].map((i) => (
+                <input key={i} type="number" step="any" className="short" placeholder={AXES[i]} value={probe[i]} title={`${AXES[i]} [m]`}
+                       onChange={(e) => setProbe(probe.map((s, j) => (j === i ? e.target.value : s)) as [string, string, string])} />))}
+            </div>
+            <div className="row small">
+              {tool !== "point" && <button onClick={() => setTool("point")} title="then click a 2D pane">Pick on plane</button>}
+              <button disabled={!probeP || pointSeries === "busy"} onClick={pointOverTime}
+                      title="the field at this point in every frame of the shown cases">{pointSeries === "busy" ? "Reading frames..." : "Over time"}</button>
+              <button disabled={!probe.some((s) => s)} onClick={() => { setProbe(["", "", ""]); setPointVals({}); setPointSeries(null); }}>Clear</button>
+            </div>
           </Section>
         )}
         {kind && vecArrays.length > 0 && (
@@ -765,7 +880,10 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                   <div className={`viewer-row${both ? " both" : ""}`}>
                     {layout !== "3d" && (
                       <SliceCanvas plane={planes[id] ?? null} cmap={cmap} range={range} log={log} height={paneH}
-                                   lineMode={lineMode} onLine={onLine} legend={legend} overlay={overlayOf(id)}
+                                   tool={tool} onLine={onLine} legend={legend} overlay={overlayOf(id)}
+                                   region={regionFor(planes[id] ?? null)} onRegionPoint={addRegionPoint} onRegionClose={closeRegion}
+                                   onPoint={(p) => setProbe(p.map((x) => String(Number(x.toPrecision(6)))) as [string, string, string])}
+                                   marker={markerFor(planes[id] ?? null)}
                                    background={bg} smooth={smooth}
                                    exportName={`${id}_${kindName}_t${fmt(t)}`} />
                     )}
@@ -795,7 +913,10 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                   <div className={`viewer-row${both ? " both" : ""}`}>
                     {layout !== "3d" && (
                       <SliceCanvas plane={p} cmap={e.cmap} range={r} log={e.log} height={paneH}
-                                   lineMode={false} onLine={onLine} legend={lg} overlay={overlayOf(e.id)}
+                                   tool={tool === "line" ? "none" : tool} onLine={onLine} legend={lg} overlay={overlayOf(e.id)}
+                                   region={regionFor(p)} onRegionPoint={addRegionPoint} onRegionClose={closeRegion}
+                                   onPoint={(q) => setProbe(q.map((x) => String(Number(x.toPrecision(6)))) as [string, string, string])}
+                                   marker={markerFor(p)}
                                    background={bg} smooth={smooth} exportName={`${e.id}_${e.array}_t${fmt(t)}`} />
                     )}
                     {layout !== "2d" && invs[e.id] && (
@@ -812,6 +933,13 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
             })}
           </div>
         </div>
+        {region?.closed && (
+          <RegionCard rows={regionRows} region={region} t={t} smooth={smooth} onClear={() => setRegion(null)} />
+        )}
+        {probeP && (
+          <PointCard p={probeP} t={t} rows={pointReqs.map((q) => ({ key: q.key, id: q.id, label: q.label, r: pointVals[q.key] }))}
+                     series={pointSeries} fieldLabel={fieldLabel} onCloseSeries={() => setPointSeries(null)} />
+        )}
         {profiles && (
           <div className="card">
             <div className="row"><b className="grow">Line profile</b>
@@ -856,6 +984,91 @@ function SliderNum({ label, min, max, step, value, onChange, num, numMin, numMax
     </span>
   );
   return label ? <label>{label}{body}</label> : body;
+}
+
+// Region average results: one row per pane of the region's plane orientation.
+function RegionCard({ rows, region, t, smooth, onClear }: {
+  rows: { id: string; label: string; unit: string; s: RegionStats }[];
+  region: Region & { axis: number }; t: number; smooth: boolean; onClear: () => void;
+}) {
+  const [copied, setCopied] = useState<boolean | null>(null);
+  const [ua, va] = [0, 1, 2].filter((a) => a !== region.axis);
+  const polyA = polyArea(region.pts, ua, va);
+  const header = ["case", "field", "unit", "mean", "std", "min", "max", "fluid cells [count]", "fluid area [m^2]",
+                  "region area (cells) [m^2]", "fluid share [%]"];
+  const table = rows.map((r) => {
+    const cellA = r.s.du * r.s.dv;
+    return [r.id, r.label, r.unit, r.s.mean, r.s.std, r.s.min, r.s.max, r.s.n, r.s.n * cellA, r.s.nAll * cellA,
+            r.s.nAll ? (100 * r.s.n) / r.s.nAll : null];
+  });
+  const copy = async () => {
+    setCopied(await copyText([header, ...table].map((r) => r.map((v) => (v === null ? "" : String(v))).join("\t")).join("\n")));
+    setTimeout(() => setCopied(null), 1500);
+  };
+  return (
+    <div className="card">
+      <div className="row"><b className="grow">Region average</b>
+        <button onClick={copy}>{copied === null ? "Copy table" : copied ? "Copied" : "Copy failed"}</button>
+        <button onClick={() => download("region_average.csv", toCsv(header, table))}>Export CSV</button>
+        <button onClick={onClear}>Clear</button></div>
+      <div className="small muted">
+        Mean over the fluid cells of the current plane whose centres lie inside the polygon ({region.pts.length} corners,
+        polygon area {fmt(polyA, 4)} m^2, {AXES[region.axis]}-normal) at t = {fmt(t)} s. Cells are equal in size, so this
+        is the area-weighted mean; solid (masked) cells are left out.{smooth ? " Smooth shading is on: the values are the smoothed ones." : ""}
+      </div>
+      <div className="tablewrap">
+        <table className="grid">
+          <thead><tr>{header.map((h) => <th key={h}>{h}</th>)}</tr></thead>
+          <tbody>{table.map((r, i) => (
+            <tr key={i}>{r.map((v, j) => j < 3 ? <td key={j} className={j ? "small" : "mono"}>{v}</td>
+              : <td key={j} className="num">{fmt(v as number | null)}</td>)}</tr>))}
+            {!rows.length && <tr><td colSpan={header.length} className="muted">no plane with this orientation is shown</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// Point probe results for the current frame, plus the optional time series at the point.
+function PointCard({ p, t, rows, series, fieldLabel, onCloseSeries }: {
+  p: number[]; t: number; fieldLabel: string; onCloseSeries: () => void;
+  rows: { key: string; id: string; label: string; r: PointValue | string | undefined }[];
+  series: { p: number[]; rows: { id: string; t: number[]; v: (number | null)[] }[] } | "busy" | null;
+}) {
+  const status = (r: PointValue) => !r.inside ? "outside the output grid" : r.solid ? "not fluid (solid, outside or headspace)" : "";
+  const header = ["case", "field", "value", "unit", "cell centre x [m]", "cell centre y [m]", "cell centre z [m]", "note"];
+  const table = rows.map((x) => typeof x.r === "object"
+    ? [x.id, x.label, x.r.value, x.r.unit, ...x.r.center, status(x.r)]
+    : [x.id, x.label, null, "", null, null, null, x.r ?? "loading..."]);
+  const s = series && series !== "busy" ? series : null;
+  return (
+    <div className="card">
+      <div className="row"><b className="grow">Point probe at ({p.map((v) => fmt(v)).join(", ")}) m, t = {fmt(t)} s</b>
+        <button onClick={() => download("point_probe.csv", toCsv(header, table))}>Export CSV</button></div>
+      <div className="small muted">Value of the cell nearest to the point (cell data, no interpolation); the marker shows on 2D panes whose plane contains it.</div>
+      <div className="tablewrap">
+        <table className="grid">
+          <thead><tr>{header.map((h) => <th key={h}>{h}</th>)}</tr></thead>
+          <tbody>{table.map((r, i) => (
+            <tr key={i}>{r.map((v, j) => typeof v === "number" || v === null
+              ? <td key={j} className="num">{fmt(v)}</td> : <td key={j} className={j ? "small" : "mono"}>{v}</td>)}</tr>))}</tbody>
+        </table>
+      </div>
+      {s && (
+        <>
+          <div className="row"><b className="grow">{fieldLabel} at ({s.p.map((v) => fmt(v)).join(", ")}) m over time</b>
+            <button onClick={() => download("point_series.csv", toCsv(["case", "time [s]", fieldLabel],
+              s.rows.flatMap((r) => r.t.map((tt, i) => [r.id, tt, r.v[i]]))))}>Export CSV</button>
+            <button onClick={onCloseSeries}>Close</button></div>
+          <Plot height={300} exportName="point_series" data={s.rows.map((r) => (
+            { type: "scatter" as const, mode: "lines+markers" as const, x: r.t, y: r.v, name: r.id }))}
+            layout={{ xaxis: { title: { text: "time [s]" } }, yaxis: { title: { text: fieldLabel } },
+                      shapes: [{ type: "line", x0: t, x1: t, yref: "paper", y0: 0, y1: 1, line: { dash: "dot", color: "grey" } }] }} />
+        </>
+      )}
+    </div>
+  );
 }
 
 // Collapsible sidebar section; open state remembered in localStorage.

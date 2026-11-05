@@ -63,6 +63,8 @@ export type SolveState = {
   wall_h?: number; eta_h?: number; iterations?: number; mups?: number; last_lines?: string[]; note?: string; error?: string;
 };
 export type RunSeriesFile = { file: string; columns: string[]; cases: string[] };
+export type PointValue = { file: string; value: number | null; cell: number[]; center: number[]; inside: boolean;
+  solid: boolean | null; unit: string; time: number | null };
 // one result CSV of a run; long tables list [variable, source Stats file] pairs
 export type VarEntry = { run: string; path: string; case: string | null; kind: "series" | "table" | "long";
   columns: (string | [string, string])[]; cases: string[] };
@@ -244,8 +246,12 @@ export const api = {
     req<{ lo: number[]; hi: number[]; center: number[]; source: string }>(
       `/api/case/fluid_center?${qs({ path, file })}`),
   volumeMean: (path: string, file: string, array: string, comp: string, mask = true) =>
-    req<{ mean: number | null; n_cells: number; unit: string; time: number | null; masked: boolean }>(
+    req<{ mean: number | null; n_cells: number; unit: string; time: number | null; masked: boolean;
+          mask: string; fluid_volume: number }>(
       `/api/case/mean?${qs({ path, file, array, comp, mask })}`),
+  // value of the cell nearest to p in each file (one file = current frame, many = time series)
+  point: (path: string, files: string[], array: string, comp: string, p: number[], mask = true) =>
+    req<{ points: PointValue[] }>("/api/case/point", json("POST", { path, files, array, comp, p, mask })),
   surfaceUrl: (path: string, file: string, max_tris = 400000, fmt: "stl" | "mesh" = "stl") =>
     `/api/case/surface?${qs({ path, file, max_tris, fmt })}`,
   surfaceWarm: (path: string, files: string[], max_tris = 400000) =>

@@ -228,12 +228,50 @@ def _plane_geom(h: dict, a: dict, axis: int | None, pos: float | None):
 
 
 def _solid(path: Path, h: dict, assoc: str, axis: int, idx: int) -> np.ndarray | None:
-    """Solid cells of a plane (all 'Volume Fraction' arrays ~0), None if unknown."""
+    """Non-fluid cells of a plane (see _weight), None if unknown."""
+    w, _ = _weight(path, h, assoc, lambda a: _take(a, axis, idx))
+    return None if w is None else w < 0.5
+
+
+def _velocity_array(h: dict, assoc: str) -> dict | None:
+    """Instantaneous velocity array (magnitude preferred), not a time average."""
+    cands = [a for a in h["arrays"] if a["assoc"] == assoc and re.match(r"velocity", a["name"], re.I)]
+    return next((a for a in cands if a["ncomp"] == 1), None) or next((a for a in cands if a["ncomp"] == 3), None)
+
+
+def _moving(path: Path, assoc: str) -> bool:
+    st = path.stat()
+    return _moving_cached(str(path), st.st_mtime_ns, assoc)
+
+
+@lru_cache(maxsize=512)
+def _moving_cached(path_s: str, mtime_ns: int, assoc: str) -> bool:
+    """Whether any cell has a non-zero velocity (False at rest, e.g. t = 0)."""
+    path = Path(path_s)
+    va = _velocity_array(header(path), assoc)
+    if va is None:
+        return False
+    arr = volume_array(path, va["name"])
+    step = max(1, int(2e7 // max(1, arr.shape[1] * arr.shape[2] * va["ncomp"])))
+    return any(np.any(np.asarray(arr[z:z + step]) != 0) for z in range(0, arr.shape[0], step))
+
+
+def _weight(path: Path, h: dict, assoc: str, take) -> tuple[np.ndarray | None, str]:
+    """Liquid weight (0..1) of the cells take(array) selects, like M-Star's fluid-volume
+    averages: the sum of the 'Volume Fraction' arrays (two-fluid output); without fractions
+    1 where the velocity is non-zero (M-Star writes zeros in solids, outside the vessel and
+    in the free-surface headspace). None = unknown (no velocity, or the whole file at rest)."""
     fr = _fraction_names(h, assoc)
-    if len(fr) < 2:
-        return None
-    total = sum(np.asarray(_take(volume_array(path, n), axis, idx), np.float32) for n in fr)
-    return total < 0.5
+    if len(fr) >= 2:
+        return np.clip(sum(np.asarray(take(volume_array(path, n)), np.float32) for n in fr), 0.0, 1.0), \
+            "volume fractions"
+    va = _velocity_array(h, assoc)
+    if va is None or not _moving(path, assoc):
+        return None, "none"
+    v = np.asarray(take(volume_array(path, va["name"])), np.float32)
+    if va["ncomp"] > 1:
+        v = np.abs(v).sum(axis=-1)
+    return (v != 0).astype(np.float32), "non-zero velocity"
 
 
 def _plane_meta(h: dict, a: dict, axis: int, idx: int, dims, so, sp, values) -> dict:
@@ -253,8 +291,8 @@ def _plane_meta(h: dict, a: dict, axis: int, idx: int, dims, so, sp, values) -> 
 
 
 def volume_mean(path: Path, name: str, comp: str, mask: bool = True) -> dict:
-    """Mean of a scalar (or vector magnitude/component) over the fluid cells of the whole
-    .vti (solid = all 'Volume Fraction' arrays ~0, as in the planes), cached per file."""
+    """Mean of a scalar (or vector magnitude/component) over the fluid of the whole .vti,
+    weighted by the liquid weight of each cell (_weight), as M-Star's Stats means; cached per file."""
     st = path.stat()
     return _volume_mean(str(path), st.st_mtime_ns, name, comp, mask)
 
@@ -265,19 +303,19 @@ def _volume_mean(path_s: str, mtime_ns: int, name: str, comp: str, mask: bool) -
     h = header(path)
     a = find_array(h, name)
     arr = volume_array(path, name)
-    fr = _fraction_names(h, a["assoc"]) if mask else []
-    fracs = [volume_array(path, n) for n in fr] if len(fr) >= 2 else []
-    total, count = 0.0, 0
+    total, wsum, count, source = 0.0, 0.0, 0, "none"
     step = max(1, int(2e7 // max(1, arr.shape[1] * arr.shape[2])))  # ~20 M cells per slab
     for z in range(0, arr.shape[0], step):
         v = reduce_comp(np.asarray(arr[z:z + step]), comp, a["ncomp"]).astype(np.float64)
-        ok = np.isfinite(v)
-        if fracs:
-            ok &= sum(np.asarray(f[z:z + step], np.float32) for f in fracs) >= 0.5
-        total += float(v[ok].sum())
+        w, source = _weight(path, h, a["assoc"], lambda x: x[z:z + step]) if mask else (None, "none")
+        w = np.ones_like(v) if w is None else w.astype(np.float64)
+        ok = np.isfinite(v) & (w > 0)
+        total += float((v[ok] * w[ok]).sum())
+        wsum += float(w[ok].sum())
         count += int(ok.sum())
-    return {"mean": total / count if count else None, "n_cells": count, "unit": a["unit"],
-            "time": h["time"], "masked": bool(fracs)}
+    cell = float(np.prod(h["spacing"]))
+    return {"mean": total / wsum if wsum else None, "n_cells": count, "unit": a["unit"],
+            "time": h["time"], "masked": source != "none", "mask": source, "fluid_volume": wsum * cell}
 
 
 def extract_plane(path: Path, name: str, comp: str, axis: int | None,
@@ -357,11 +395,13 @@ def _fluid_bounds(path_s: str, mtime_ns: int) -> dict:
     so, sp = np.array(sample_origin(h, assoc)), np.array(h["spacing"])
     fr = _fraction_names(h, assoc)
     lo_i, hi_i, source = np.zeros(3, int), np.array(dims) - 1, "grid"
-    if fr:
-        total = sum(np.asarray(volume_array(path, n), np.float32) for n in fr)
-        fluid = total >= 0.5  # (z, y, x)
+    w, how = _weight(path, h, assoc, lambda a: a) if len(fr) >= 2 or _velocity_array(h, assoc) else (None, "none")
+    if w is None and len(fr) == 1:
+        w, how = np.asarray(volume_array(path, fr[0]), np.float32), "volume fractions"
+    if w is not None:
+        fluid = w >= 0.5  # (z, y, x)
         if fluid.any():
-            source = "volume fractions"
+            source = how
             for ax, other in ((0, (0, 1)), (1, (0, 2)), (2, (1, 2))):
                 idx = np.flatnonzero(fluid.any(axis=other))
                 lo_i[ax], hi_i[ax] = idx[0], idx[-1]
@@ -392,6 +432,33 @@ def line_profile(path: Path, name: str, comp: str, p0: list[float], p1: list[flo
     return {"distance": dist.tolist(),
             "value": [None if not np.isfinite(v) else float(v) for v in vals],
             "unit": a["unit"]}
+
+
+def point_value(path: Path, name: str, comp: str, p: list[float], mask: bool = True) -> dict:
+    """Value of the cell (or sample) nearest to world point p: {value, cell, center, inside,
+    solid (fractions sum < 0.5; None when the case has no two-fluid fractions), unit, time}.
+    A 2D slice file uses its single layer along the thin axis."""
+    h = header(path)
+    if "extent" not in h:
+        raise ValueError("not image data")
+    a = find_array(h, name)
+    dims = np.array(grid_dims(h, a["assoc"]))
+    so, sp = np.array(sample_origin(h, a["assoc"])), np.array(h["spacing"], float)
+    ijk = np.rint((np.asarray(p, float) - so) / sp).astype(int)
+    ijk[dims == 1] = 0
+    inside = bool(np.all((ijk >= 0) & (ijk < dims)))
+    out = {"cell": ijk.tolist(), "center": (so + ijk * sp).tolist(), "inside": inside,
+           "value": None, "solid": None, "unit": a["unit"], "time": h["time"]}
+    if not inside:
+        return out
+    i, j, k = (int(x) for x in ijk)
+    raw = np.asarray(volume_array(path, name)[k, j, i], np.float64)
+    v = float(raw) if raw.ndim == 0 else float(np.linalg.norm(raw)) if comp in ("", "mag") else float(raw[int(comp)])
+    out["value"] = v if np.isfinite(v) else None
+    w, _ = _weight(path, h, a["assoc"], lambda x: x[k, j, i]) if mask else (None, "none")
+    if w is not None:
+        out["solid"] = bool(float(w) < 0.5)
+    return out
 
 
 # ------------------------------------------------------------------ meshes

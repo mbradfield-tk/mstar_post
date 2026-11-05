@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from app import cases, vtkio
 from app.paths import safe_child, safe_path
@@ -138,6 +139,35 @@ def line(path: str, file: str, array: str, p0: str, p1: str, comp: str = "mag",
 
 
 _MESH_TYPES = {"stl": "model/stl", "mesh": "application/octet-stream"}
+
+
+class PointReq(BaseModel):
+    path: str
+    files: list[str]
+    array: str
+    p: list[float]
+    comp: str = "mag"
+    mask: bool = True
+
+
+@router.post("/point")
+def point(body: PointReq) -> dict:
+    """Value of the cell nearest to point p in each of the given .vti files (one file =
+    the current frame, many = a time series at the point)."""
+    case = _case(body.path)
+    if len(body.p) != 3:
+        raise HTTPException(422, "p must be [x, y, z]")
+    if not body.files or len(body.files) > 5000:
+        raise HTTPException(422, "1 to 5000 files")
+    rows = []
+    for f in body.files:
+        try:
+            rows.append({"file": f, **vtkio.point_value(_vtk_file(case, f), body.array, body.comp, body.p, body.mask)})
+        except KeyError:
+            raise HTTPException(404, f"no array '{body.array}' in {f}")
+        except ValueError as e:
+            raise HTTPException(422, f"{f}: {e}")
+    return {"points": rows}
 
 
 def _fmt(fmt: str) -> str:
