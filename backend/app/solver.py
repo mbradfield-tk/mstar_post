@@ -15,6 +15,7 @@ from pathlib import Path
 HEAD = 6 * 1024
 TAIL = 12 * 1024
 STALL_S = 30 * 60  # a running solve whose log was not written for this long is flagged
+_LAUNCHERS = {b"mpirun", b"mpiexec", b"orterun", b"prterun", b"srun", b"hydra_pmi_proxy"}
 
 _NUM = r"([-+0-9.eE]+)"
 _PROGRESS = {
@@ -44,9 +45,14 @@ def pid_alive(pid: int | None) -> bool:
         cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
         return False
-    # the executable itself (mstar, mstar-cfd-mgpu), not a path argument containing "mstar"
-    exe = cmd.split(b"\0", 1)[0].rsplit(b"/", 1)[-1].lower()
-    return exe.startswith(b"mstar")
+    # the executable itself (mstar, mstar-cfd-mgpu), not a path argument containing "mstar";
+    # multi-GPU solves log the PID of the MPI launcher (mpirun -n 2 .../mstar-cfd-mgpu)
+    argv = [a.rsplit(b"/", 1)[-1].lower() for a in cmd.split(b"\0") if a]
+    if not argv:
+        return False
+    if argv[0].startswith(b"mstar"):
+        return True
+    return argv[0] in _LAUNCHERS and any(a.startswith(b"mstar") for a in argv[1:])
 
 
 def logs_of(case: Path) -> list[Path]:

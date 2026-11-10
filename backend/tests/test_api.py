@@ -477,6 +477,13 @@ def test_planes(client, case_id):
     assert r["inside"] is False and r["value"] is None
     assert pt([0.0, 0.0]).status_code == 422
     assert pt([0.0, 0.0, 0.0], array="nope").status_code == 404
+    rs = client.post("/api/case/region_series", json={
+        "path": case, "files": [vol, vol], "array": "Velocity Vector (m/s)", "comp": "0", "axis": 2, "pos": 0.015,
+        "poly": [[0.01, 0.01], [0.03, 0.01], [0.03, 0.03], [0.01, 0.03]]}).json()["frames"]
+    assert len(rs) == 2 and rs[0]["n"] == 4 and rs[0]["mean"] == pytest.approx((37 + 38 + 43 + 44) / 4)
+    assert rs[0]["min"] == 37 and rs[0]["max"] == 44
+    assert client.post("/api/case/region_series", json={"path": case, "files": [vol], "array": "Velocity Vector (m/s)",
+                                                        "poly": [[0, 0], [1, 1]]}).status_code == 422
 
 
 def test_fluid_weighted_mean(tmp_path):
@@ -829,3 +836,24 @@ class monkeypatch_alive:
         self.mod.pid_alive = lambda pid: self.value
     def __exit__(self, *a):
         self.mod.pid_alive = self.old
+
+
+def test_multi_block_volume(tmp_path):
+    """Multi-GPU output: blockN folders hold same-named pieces of one grid, stitched by vtkio."""
+    from app import vtkio
+    v = tmp_path / "Volume"
+    a0 = write_vti(v / "block0" / "Volume.1.00000e+00.vti", (3, 5, 4), (-0.03, 0, 0), True, 1.0)
+    a1 = write_vti(v / "block1" / "Volume.1.00000e+00.vti", (3, 5, 4), (0.0, 0, 0), True, 1.0)
+    f = v / "block0" / "Volume.1.00000e+00.vti"
+    h = vtkio.header(f)
+    assert h["extent"] == [0, 6, 0, 5, 0, 4] and h["origin"][0] == pytest.approx(-0.03)
+    full = np.concatenate([a0, a1], axis=2)
+    arr = vtkio.volume_array(f, "Velocity Vector (m/s)")
+    assert arr.shape == (4, 5, 6, 3)
+    assert np.array_equal(np.asarray(arr)[..., 0], full)
+    assert np.array_equal(arr[1, :, 2:5][..., 0], full[1, :, 2:5])
+    assert np.array_equal(arr[::2, 3, ::2][..., 0], full[::2, 3, ::2])
+    assert arr[2, 1, 4][0] == full[2, 1, 4]
+    assert np.array_equal(arr[[0, 3], [1, 2], [0, 5]][:, 0], full[[0, 3], [1, 2], [0, 5]])
+    p = vtkio.extract_plane(f, "Velocity Vector (m/s)", "0", 2, 0.015, mask=False)
+    assert p["data"].shape == (5, 6) and np.array_equal(p["data"], full[1])

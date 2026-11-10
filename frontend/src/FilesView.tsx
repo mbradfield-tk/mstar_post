@@ -49,6 +49,9 @@ export default function FilesView() {
   const [osDrop, setOsDrop] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const reload = () => setTick((x) => x + 1);
+  // a change inside a folder changes its size and that of every folder above it
+  const stale = (...paths: string[]) => setUsage((u) => Object.fromEntries(Object.entries(u).filter(([k]) =>
+    !paths.some((p) => k === p || k.startsWith(`${p}/`) || p.startsWith(`${k}/`)))));
   useEffect(() => {
     if (!note) return;
     const id = setTimeout(() => setNote(null), 6000);
@@ -67,14 +70,14 @@ export default function FilesView() {
       return;
     }
     setRenaming(null);
-    setUsage((u) => { const { [e.path]: _, ...rest } = u; return rest; });
+    stale(e.path);
     setNote(`renamed ${e.name} to ${name.trim()}`);
     reload();
   };
 
   const doMove = async (paths: string[], dest: string) => {
     const r = await api.movePaths(paths, dest);
-    setUsage((u) => { const rest = { ...u }; for (const p of paths) delete rest[p]; delete rest[dest]; return rest; });
+    stale(...paths, dest);
     setSelected((s) => s.filter((p) => !r.moved.some((m) => m.endsWith(`/${p.split("/").pop()}`))));
     const where = dest === listing?.path ? "here" : `to ${dest.split("/").pop()}`;
     setNote(`moved ${r.moved.length} item${r.moved.length === 1 ? "" : "s"} ${where}`
@@ -130,6 +133,7 @@ export default function FilesView() {
         const r = await api.mkdirs(listing.path, [newName]);
         if (r.skipped.length) throw new Error(`${r.skipped[0].name}: ${r.skipped[0].reason}`);
       } else await api.newFile(listing.path, newName, newText);
+      stale(listing.path);
       setNote(`created ${newName.trim()}`);
       setNewName("");
       setNewText("");
@@ -145,7 +149,7 @@ export default function FilesView() {
       const total = r.saved.reduce((s, f) => s + f.bytes, 0);
       setNote(`uploaded ${r.saved.length} file${r.saved.length === 1 ? "" : "s"} (${fmtBytes(total)})`
         + (r.skipped.length ? `; skipped: ${r.skipped.map((s) => `${s.name} (${s.reason})`).join(", ")}` : ""));
-      setUsage((u) => { const { [listing.path]: _, ...rest } = u; return rest; });
+      stale(listing.path);
       reload();
     } catch (e) { setError((e as Error).message); }
     setUploading(null);
@@ -187,7 +191,7 @@ export default function FilesView() {
       return;
     }
     setPending(null);
-    setUsage((u) => { const { [e.path]: _, ...rest } = u; return rest; });
+    stale(e.path);
     setNote(`deleted ${e.name}`);
     reload();
   };
@@ -212,10 +216,11 @@ export default function FilesView() {
     }).catch((e) => setError(e.message));
   }, [path, hidden, tick]);
 
-  const measure = async (p: string, refresh = false) => {
+  // always a fresh scan: files change outside the app (solves, shells), which no cache can notice
+  const measure = async (p: string) => {
     setUsage((u) => ({ ...u, [p]: "busy" }));
     try {
-      const r = await api.du(p, refresh);
+      const r = await api.du(p, true);
       setUsage((u) => ({ ...u, [p]: r }));
     } catch (e) {
       setUsage((u) => { const { [p]: _, ...rest } = u; return rest; });
@@ -228,8 +233,7 @@ export default function FilesView() {
     setScanning(true);
     for (const e of listing.entries.filter((x) => x.dir && !x.link)) {
       if (stop.current) break;
-      const u = usage[e.path];
-      if (!u || u === "busy") await measure(e.path);
+      await measure(e.path);
     }
     if (!stop.current) await measure(listing.path);
     setScanning(false);
@@ -278,7 +282,8 @@ export default function FilesView() {
         <button disabled={!listing?.parent} onClick={() => listing?.parent && setPath(listing.parent)}
                 title={dragging ? "drop here to move into the parent folder" : undefined}
                 {...dropProps(listing?.parent, !!listing?.writable)}>Up</button>
-        <button onClick={reload}>Refresh</button>
+        <button onClick={() => { if (listing) stale(listing.path); reload(); }}
+                title="reload the listing; measured sizes of this folder, its sub-folders and the folders above it are dropped">Refresh</button>
         <label className="small"><input type="checkbox" checked={hidden} onChange={(e) => setHidden(e.target.checked)} /> hidden</label>
       </div>
       {listing && (
@@ -341,7 +346,7 @@ export default function FilesView() {
                   onChange={(e) => setNewText(e.target.value)} />
       )}
       {listing?.writable && tool === "batch" && (
-        <BatchFolders parent={listing.path} existing={listing.entries.map((e) => e.name)} onDone={reload} />
+        <BatchFolders parent={listing.path} existing={listing.entries.map((e) => e.name)} onDone={() => { stale(listing.path); reload(); }} />
       )}
       {disk && (
         <div className="card">
@@ -357,11 +362,12 @@ export default function FilesView() {
             {here === "busy" ? <span className="muted">measuring...</span>
               : here ? <span>{fmtBytes(here.bytes)} on disk ({fmtBytes(here.apparent)} apparent), {here.files.toLocaleString()} files,{" "}
                   {here.dirs.toLocaleString()} folders{here.truncated && " (incomplete: time limit reached)"}
-                  {here.cached ? " (cached)" : ` (${here.seconds} s)`}</span>
+                  {` (${here.seconds} s scan)`}</span>
               : <span className="muted">not measured</span>}
-            <button disabled={scanning} onClick={measureAll} title="recursive size of every sub-folder and of this folder">Measure folder sizes</button>
+            <button disabled={scanning} onClick={measureAll} title="recursive size of every sub-folder and of this folder (fresh scan)">
+              {folders.some((f) => usage[f.path] && usage[f.path] !== "busy") ? "Re-measure folder sizes" : "Measure folder sizes"}</button>
             {scanning && <button onClick={() => { stop.current = true; }}>Stop</button>}
-            {here && here !== "busy" && <button onClick={() => listing && measure(listing.path, true)}>Re-measure</button>}
+            {here && here !== "busy" && <button disabled={scanning} onClick={() => listing && measure(listing.path)}>Re-measure this folder</button>}
           </div>
         </div>
       )}
@@ -390,7 +396,9 @@ export default function FilesView() {
                     <td className="num">{e.dir && !e.link && u === undefined
                       ? <button className="small" onClick={() => measure(e.path)}>measure</button>
                       : u === "busy" ? <span className="muted">...</span>
-                      : <>{fmtBytes(s)}{u && u.truncated ? "+" : ""}</>}</td>
+                      : e.dir && !e.link && u ? <a title={`measured ${u.seconds} s scan; click to re-measure`} onClick={() => measure(e.path)}>
+                          {fmtBytes(s)}{u.truncated ? "+" : ""}</a>
+                      : <>{fmtBytes(s)}</>}</td>
                     <td>{s !== null && known > 0 && (
                       <div className="sharebar" title={`${((100 * s) / known).toFixed(1)}% of the measured entries`}>
                         <div style={{ width: `${(100 * s) / known}%` }} /></div>)}</td>

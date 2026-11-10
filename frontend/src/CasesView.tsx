@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, caseName, download, fmt, toCsv, type Project, type ProjectCase, type SolveState } from "./api";
+import { api, caseName, download, fmt, toCsv, type Project, type ProjectCase, type Run, type SolveState } from "./api";
 import ProjectMetaEditor from "./ProjectMeta";
 import { useUser } from "./user";
 
@@ -126,6 +126,49 @@ export function useSolves(pid: string, active: boolean) {
   return solves;
 }
 
+type CaseJob = { task: string; label: string; done: number; other: number; runs: Run[] };
+
+// Per case: the job types whose runs included it (from each run's params.cases), refreshed when the tab is shown.
+function useCaseJobs(pid: string, active: boolean) {
+  const [out, setOut] = useState<Record<string, CaseJob[]> | null>(null);
+  useEffect(() => {
+    if (!active) return;
+    let live = true;
+    Promise.all([api.runs(pid), api.tasks()]).then(([runs, tasks]) => {
+      const label = (t: string) => tasks.find((x) => x.id === t)?.label ?? t;
+      const m: Record<string, Record<string, CaseJob>> = {};
+      for (const r of runs) {
+        const cases = (r.params as { cases?: unknown }).cases;
+        if (!r.task || !Array.isArray(cases)) continue;
+        for (const id of cases as string[]) {
+          const j = ((m[id] ??= {})[r.task] ??= { task: r.task, label: label(r.task), done: 0, other: 0, runs: [] });
+          if (r.status === "done") j.done++; else j.other++;
+          j.runs.push(r);
+        }
+      }
+      if (live) setOut(Object.fromEntries(Object.entries(m).map(([id, t]) => [id, Object.values(t)])));
+    }).catch(() => undefined);
+    return () => { live = false; };
+  }, [pid, active]);
+  return out;
+}
+
+const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : "");
+
+function JobTags({ jobs }: { jobs: CaseJob[] | undefined }) {
+  if (!jobs) return <span className="muted">none</span>;
+  return (
+    <span className="tags">
+      {jobs.map((j) => (
+        <span key={j.task} className={`tag${j.done ? "" : " warn"}`}
+              title={j.runs.map((r) => `${r.label ?? r.name}: ${r.status}${r.user ? `, ${r.user}` : ""}, ${when(r.finished_at ?? r.created_at)}`).join("\n")}>
+          {j.label}{j.done > 1 ? ` x${j.done}` : ""}{j.other ? <span className="muted"> (+{j.other} not done)</span> : null}
+        </span>
+      ))}
+    </span>
+  );
+}
+
 export default function CasesView({ project, onChange, active = true }: {
   project: Project;
   onChange: (p: Project) => void;
@@ -136,6 +179,7 @@ export default function CasesView({ project, onChange, active = true }: {
   const [error, setError] = useState<string | null>(null);
   const [showDiff, setShowDiff] = useState(false);
   const solves = useSolves(project.id, active);
+  const jobs = useCaseJobs(project.id, active);
   const cols = useMemo(() => settingCols(project.cases), [project]);
   const shown = project.cases.filter((c) => c.id.toLowerCase().includes(filter.toLowerCase()));
   const groups = useMemo(() => {
@@ -167,8 +211,9 @@ export default function CasesView({ project, onChange, active = true }: {
   };
 
   const exportTable = () => download(`${project.id}_cases.csv`, toCsv(
-    ["case", "case_id", "included", "solver", "completion_pct", "end_time_s", ...cols],
+    ["case", "case_id", "included", "solver", "completion_pct", "jobs", "end_time_s", ...cols],
     project.cases.map((c) => [c.id, c.uid ?? "", c.included, solves?.[c.id]?.state ?? "", solves?.[c.id]?.completion_pct ?? "",
+      (jobs?.[c.id] ?? []).map((j) => `${j.label} (${j.done} done${j.other ? `, ${j.other} other` : ""})`).join("; "),
       c.info?.end_time_s ?? "", ...cols.map((k) => c.info?.settings?.[k] ?? "")])));
 
   const nIncl = project.cases.filter((c) => c.included).length;
@@ -211,6 +256,7 @@ export default function CasesView({ project, onChange, active = true }: {
             <th title="reference case for % differences">ref</th>
             <th>case</th><th title="unique case ID across all projects (stored in mstar_post_case.json in the case folder)">ID</th>
             <th title="M-Star solver state from the newest mstar-run-*.txt log in the case folder (hover a tag for details); refreshed every 30 s">solver</th>
+            <th title="jobs (Run tab) that included this case: count of finished runs per job type; hover for the runs">jobs run</th>
             <th>simulated [s]</th><th>outputs</th>
             {cols.map((k) => <th key={k}>{k}</th>)}
           </tr>
@@ -221,7 +267,7 @@ export default function CasesView({ project, onChange, active = true }: {
               <tr key={`g-${g}`} className="group">
                 <td><input type="checkbox" checked={cs.every((c) => c.included)} disabled={ro}
                            onChange={(e) => setIncluded(cs.map((c) => c.id), e.target.checked)} /></td>
-                <td colSpan={6 + cols.length}><b>{g}</b> <span className="muted">({cs.length})</span></td>
+                <td colSpan={7 + cols.length}><b>{g}</b> <span className="muted">({cs.length})</span></td>
               </tr>
             ),
             ...cs.map((c) => (
@@ -235,13 +281,14 @@ export default function CasesView({ project, onChange, active = true }: {
                 <td className="mono small nowrap" title={c.id_written === false ? "the case folder is not writable: the id is stored in the project only" : "written to mstar_post_case.json in the case folder"}>
                   {c.uid ?? ""}{c.id_written === false && <span className="tag">not in folder</span>}</td>
                 <td className="nowrap"><SolveTag s={solves?.[c.id]} /></td>
+                <td className="small"><JobTags jobs={jobs?.[c.id]} /></td>
                 <td className="num">{fmt(simTime(c).end)}</td>
                 <td className="small nowrap"><Outputs kinds={c.info?.output_kinds ?? []} /></td>
                 {cols.map((k) => <td key={k} className={typeof c.info?.settings?.[k] === "number" ? "num" : ""}>{fmt(c.info?.settings?.[k], digitsOf(k))}</td>)}
               </tr>
             )),
           ])}
-          {!shown.length && <tr><td colSpan={7 + cols.length} className="muted">
+          {!shown.length && <tr><td colSpan={8 + cols.length} className="muted">
             {project.cases.length ? "No case matches the filter." : "No cases found under this folder: check the path or use Rediscover."}</td></tr>}
         </tbody>
       </table>

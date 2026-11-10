@@ -16,7 +16,9 @@ export type Overlay = {
 };
 
 export type Tool = "none" | "line" | "region" | "point";
-export type Region = { pts: number[][]; closed: boolean };
+export type RegionShape = "polygon" | "rectangle" | "square" | "circle";
+// pts = outline in world coordinates (circles as a fine polygon), used for drawing and statistics
+export type Region = { pts: number[][]; closed: boolean; shape?: RegionShape; info?: string };
 
 // 2D plane on a canvas, colormapped client-side and fitted into a box of the
 // given height; legend inside the box, optional LIC shading and streamlines,
@@ -24,7 +26,7 @@ export type Region = { pts: number[][]; closed: boolean };
 // line, polygon region, probe point; world coordinates) and PNG export of the full plane.
 export default function SliceCanvas({ plane, cmap, range, log, title, onLine, tool = "none", height = 480,
                                       legend, overlay, exportName = "slice", background = "#f8fafc", smooth = false,
-                                      region, onRegionPoint, onRegionClose, onPoint, marker }: {
+                                      region, regionShape = "polygon", onRegionPoint, onRegionClose, onRegionDrag, onPoint, marker }: {
   plane: Plane | null;
   cmap: string;
   range: [number, number];
@@ -41,6 +43,8 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, to
   region?: Region | null;
   onRegionPoint?: (p: number[]) => void;
   onRegionClose?: () => void;
+  regionShape?: RegionShape;
+  onRegionDrag?: (start: number[], end: number[], done: boolean) => void;  // press-drag-release shapes
   onPoint?: (p: number[]) => void;
   marker?: number[] | null;
 }) {
@@ -55,6 +59,7 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, to
   const [line, setLine] = useState<[number[], number[]] | null>(null);
   const [zv, setZv] = useState({ s: 1, tx: 0, ty: 0 });
   const drag = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
+  const shapeStart = useRef<number[] | null>(null);
 
   useEffect(() => { setPick(null); if (!lineMode) setLine(null); }, [lineMode]);
   useEffect(() => { setZv({ s: 1, tx: 0, ty: 0 }); }, [plane?.w, plane?.h]);
@@ -145,8 +150,14 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, to
     p[plane.axis] = plane.pos;
     p[plane.uAxis] = plane.u0 + c * plane.du;
     p[plane.vAxis] = plane.v0 + rr * plane.dv;
-    return { c, rr, p };
+    // unsnapped position for drawing shapes
+    const pe = [0, 0, 0];
+    pe[plane.axis] = plane.pos;
+    pe[plane.uAxis] = plane.u0 - plane.du / 2 + (e.clientX - r.left) / r.width * plane.w * plane.du;
+    pe[plane.vAxis] = plane.v0 - plane.dv / 2 + (1 - (e.clientY - r.top) / r.height) * plane.h * plane.dv;
+    return { c, rr, p, pe };
   };
+  const dragShape = tool === "region" && regionShape !== "polygon";
 
   const exportPng = async () => {
     const lut = await cmapLut(cmap);
@@ -187,7 +198,8 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, to
           {AX[plane.axis]} = {fmt(plane.pos)} m ({plane.index}/{plane.count})
           {plane.time !== null && <> | t = {fmt(plane.time)} s</>}
           {lineMode ? <> | {pick ? "click the end point" : "click the start point"}</>
-            : tool === "region" ? <> | {region?.closed ? `region: ${region.pts.length} corners (click to start a new one)` : "click corners, double-click to close"}</>
+            : tool === "region" ? <> | {dragShape ? `press and drag to draw a ${regionShape}${regionShape === "circle" ? " (from its centre)" : ""}`
+                : region?.closed ? `region: ${region.pts.length} corners (click to start a new one)` : "click corners, double-click to close"}</>
             : tool === "point" ? <> | click to set the probe point</>
             : <> | {hover || "hover for values"}</>}
         </span>
@@ -196,15 +208,24 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, to
         <div ref={stack} className="slice-stack"
              style={{ width: cw, height: ch, transform: `translate(${zv.tx}px, ${zv.ty}px) scale(${zv.s})` }}
              onPointerDown={(e) => {
+               if (dragShape && e.button === 0) {
+                 shapeStart.current = world(e).pe;
+                 e.currentTarget.setPointerCapture(e.pointerId);
+                 return;
+               }
                if (tool !== "none" || (zv.s === 1 && !zv.tx && !zv.ty) || e.button !== 0) return;
                drag.current = { x: e.clientX, y: e.clientY, tx: zv.tx, ty: zv.ty };
                e.currentTarget.setPointerCapture(e.pointerId);
              }}
              onPointerMove={(e) => {
+               if (shapeStart.current) { onRegionDrag?.(shapeStart.current, world(e).pe, false); return; }
                const d = drag.current;
                if (d) setZv((v) => ({ ...v, tx: d.tx + e.clientX - d.x, ty: d.ty + e.clientY - d.y }));
              }}
-             onPointerUp={() => { drag.current = null; }}>
+             onPointerUp={(e) => {
+               if (shapeStart.current) { onRegionDrag?.(shapeStart.current, world(e).pe, true); shapeStart.current = null; }
+               drag.current = null;
+             }}>
           <canvas ref={ref} className={`slice-canvas${smooth ? " smooth" : ""}${tool !== "none" ? " crosshair" : zv.s !== 1 ? " grab" : ""}`}
                   style={{ width: cw, height: ch }}
                   onMouseMove={(e) => {
@@ -214,7 +235,7 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, to
                     setHover(`${AX[plane.uAxis]}=${fmt(p[plane.uAxis])} ${AX[plane.vAxis]}=${fmt(p[plane.vAxis])} m : ${Number.isFinite(v) ? fmt(v) : "solid"} ${plane.unit}${smooth && Number.isFinite(v) ? " (smoothed)" : ""}`);
                   }}
                   onClick={(e) => {
-                    if (tool === "region") { onRegionPoint?.(world(e).p); return; }
+                    if (tool === "region") { if (!dragShape) onRegionPoint?.(world(e).p); return; }
                     if (tool === "point") { onPoint?.(world(e).p); return; }
                     if (!lineMode) return;
                     const { p } = world(e);
@@ -223,7 +244,7 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, to
                     setPick(null);
                     onLine?.(pick, p);
                   }}
-                  onDoubleClick={() => { if (tool === "region") onRegionClose?.(); }} />
+                  onDoubleClick={() => { if (tool === "region" && !dragShape) onRegionClose?.(); }} />
           <canvas ref={over} className="slice-overlay" style={{ width: cw, height: ch }} />
         </div>
         {legend && <ColorLegend cmap={cmap} range={range} log={log} dark={luminance(background) < 0.5} {...legend} />}
@@ -274,10 +295,12 @@ function drawOverlay(ctx: CanvasRenderingContext2D, plane: Plane, W: number, H: 
     const pts = region.pts.map(px);
     ctx.beginPath();
     pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
-    if (region.closed) {
+    if (region.closed || (region.shape && region.shape !== "polygon")) {
       ctx.closePath();
-      ctx.fillStyle = "rgba(255,255,255,0.15)";
-      ctx.fill();
+      if (region.closed) {
+        ctx.fillStyle = "rgba(255,255,255,0.15)";
+        ctx.fill();
+      }
     }
     ctx.setLineDash([6 * k, 4 * k]);
     for (const [c, w] of [["#000", 3], ["#fff", 1.5]] as const) {
@@ -287,7 +310,7 @@ function drawOverlay(ctx: CanvasRenderingContext2D, plane: Plane, W: number, H: 
     }
     ctx.setLineDash([]);
     ctx.fillStyle = "#fff";
-    for (const [x, y] of pts) ctx.fillRect(x - 2 * k, y - 2 * k, 4 * k, 4 * k);
+    if (!region.shape || region.shape === "polygon") for (const [x, y] of pts) ctx.fillRect(x - 2 * k, y - 2 * k, 4 * k, 4 * k);
   }
   if (marker) {
     const [x, y] = px(marker), r = 7 * k;

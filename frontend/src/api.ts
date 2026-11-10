@@ -252,6 +252,12 @@ export const api = {
   // value of the cell nearest to p in each file (one file = current frame, many = time series)
   point: (path: string, files: string[], array: string, comp: string, p: number[], mask = true) =>
     req<{ points: PointValue[] }>("/api/case/point", json("POST", { path, files, array, comp, p, mask })),
+  // region statistics (polygon in the plane's u, v axes) for each file
+  regionSeries: (path: string, files: string[], array: string, comp: string, axis: number | null, pos: number | null,
+                 poly: number[][], mask = true, smooth = false) =>
+    req<{ frames: { file: string; time: number | null; mean: number | null; std: number | null; min: number | null;
+                    max: number | null; n: number; n_region: number; unit: string }[] }>(
+      "/api/case/region_series", json("POST", { path, files, array, comp, axis, pos, poly, mask, smooth })),
   surfaceUrl: (path: string, file: string, max_tris = 400000, fmt: "stl" | "mesh" = "stl") =>
     `/api/case/surface?${qs({ path, file, max_tris, fmt })}`,
   surfaceWarm: (path: string, files: string[], max_tris = 400000) =>

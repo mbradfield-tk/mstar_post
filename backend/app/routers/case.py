@@ -141,6 +141,37 @@ def line(path: str, file: str, array: str, p0: str, p1: str, comp: str = "mag",
 _MESH_TYPES = {"stl": "model/stl", "mesh": "application/octet-stream"}
 
 
+class RegionReq(BaseModel):
+    path: str
+    files: list[str]
+    array: str
+    poly: list[list[float]]
+    comp: str = "mag"
+    axis: int | None = None
+    pos: float | None = None
+    mask: bool = True
+    smooth: bool = False
+
+
+@router.post("/region_series")
+def region_series(body: RegionReq) -> dict:
+    """Region statistics on a plane (polygon in the plane's u, v axes) for each file:
+    the region mean over time."""
+    case = _case(body.path)
+    if len(body.poly) < 3 or any(len(q) != 2 for q in body.poly):
+        raise HTTPException(422, "poly must be at least 3 [u, v] points")
+    if not body.files or len(body.files) > 5000:
+        raise HTTPException(422, "1 to 5000 files")
+    try:
+        rows = vtkio.region_series([_vtk_file(case, f) for f in body.files], body.array, body.comp,
+                                   body.axis, body.pos, body.poly, body.mask, body.smooth)
+    except KeyError:
+        raise HTTPException(404, f"no array '{body.array}'")
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return {"frames": [{"file": f, **r} for f, r in zip(body.files, rows)]}
+
+
 class PointReq(BaseModel):
     path: str
     files: list[str]

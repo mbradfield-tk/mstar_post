@@ -7,6 +7,7 @@ import { useUser } from "./user";
 const when = (t: number) => new Date(t * 1000).toLocaleDateString();
 const FILTER_KEY = "mstar_post.dashboard.filters";
 type Filters = Partial<Record<keyof ProjectMeta, string>>;
+type SortKey = keyof ProjectMeta | "name" | "root" | "cases" | "runs" | "created";
 
 // Start page: every project as a card; open one, create or delete.
 export default function Dashboard({ projects, current, lastOpened, onOpen, onNew, onDelete, onFiles, onTheory, onGpus }: {
@@ -28,6 +29,9 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
   });
   useEffect(() => localStorage.setItem(FILTER_KEY, JSON.stringify(meta)), [meta]);
   const [runs, setRuns] = useState<Record<string, number>>({});
+  const [layout, setLayout] = useState<"tiles" | "table">(() => (localStorage.getItem("mstar_post.dashboard.layout") as "table" | null) ?? "tiles");
+  useEffect(() => localStorage.setItem("mstar_post.dashboard.layout", layout), [layout]);
+  const [sort, setSort] = useState<{ key: SortKey; asc: boolean } | null>(null);
   useEffect(() => {
     let live = true;
     projects.forEach((p) => api.runs(p.id).then((rs) => live && setRuns((m) => ({ ...m, [p.id]: rs.length }))).catch(() => undefined));
@@ -41,6 +45,16 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
       || META_FIELDS.some(({ key }) => (p[key] ?? "").toLowerCase().includes(q))))
     .sort((a, b) => (a.id === lastOpened ? -1 : b.id === lastOpened ? 1 : b.created - a.created));
   const anyFilter = !!q || META_FIELDS.some(({ key }) => meta[key]);
+  const sortVal = (p: ProjectSummary, k: SortKey): string | number => k === "cases" ? p.n_included : k === "runs" ? runs[p.id] ?? -1
+    : k === "created" ? p.created : (k === "name" ? p.name : k === "root" ? p.root : p[k] ?? "").toLowerCase();
+  const rows = sort ? [...shown].sort((a, b) => {
+    const x = sortVal(a, sort.key), y = sortVal(b, sort.key);
+    const c = typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y));
+    return sort.asc ? c : -c;
+  }) : shown;
+  const head = (k: SortKey, label: string) => (
+    <th className="sortable" onClick={() => setSort({ key: k, asc: sort?.key === k ? !sort.asc : k !== "created" && k !== "runs" && k !== "cases" })}>
+      {label}{sort?.key === k ? (sort.asc ? " \u25b2" : " \u25bc") : ""}</th>);
 
   return (
     <div className="dashboard">
@@ -84,10 +98,40 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
           })}
           <input placeholder="search name, folder, owner..." value={filter} onChange={(e) => setFilter(e.target.value)} />
           {anyFilter && <button onClick={() => { setFilter(""); setMeta({}); }}>Clear</button>}
+          <span className="seg">
+            <button className={layout === "tiles" ? "primary" : ""} onClick={() => setLayout("tiles")} title="one card per project">Tiles</button>
+            <button className={layout === "table" ? "primary" : ""} onClick={() => setLayout("table")} title="one row per project, sortable columns">Table</button>
+          </span>
         </div>
         {!projects.length && <div className="muted">No projects yet. Create one from a study folder (all cases below it are found) or from a single case folder.</div>}
         {projects.length > 0 && !shown.length && <div className="muted">No project matches the filters.</div>}
-        <div className="project-grid">
+        {layout === "table" && shown.length > 0 && (
+          <div className="tablewrap">
+            <table className="grid project-table">
+              <thead><tr>{head("name", "name")}{head("owner", "owner")}{head("program", "project")}{head("purpose", "purpose")}
+                {head("cases", "cases selected")}{head("runs", "runs")}{head("created", "created")}{head("root", "folder")}<th /></tr></thead>
+              <tbody>{rows.map((p) => (
+                <tr key={p.id} className={`clickable${p.id === current ? " selected" : ""}`} onClick={() => onOpen(p.id)}>
+                  <td><b>{p.name}</b>{" "}
+                    {p.id === current ? <span className="tag">open</span> : p.id === lastOpened ? <span className="tag">last opened</span> : null}
+                    {p.single && <span className="tag">single case</span>}</td>
+                  {META_FIELDS.map(({ key, label }) => (
+                    <td key={key} className="small">{p[key] && (
+                      <span className={`chip meta${meta[key] === p[key] ? " on" : ""}`} title={`${label}: ${p[key]} (click to filter)`}
+                            onClick={(e) => { e.stopPropagation(); setMeta({ ...meta, [key]: meta[key] === p[key] ? undefined : p[key] }); }}>{p[key]}</span>)}</td>))}
+                  <td className="num">{p.n_included} / {p.n_cases}</td>
+                  <td className="num">{runs[p.id] ?? "\u2026"}</td>
+                  <td className="small">{when(p.created)}</td>
+                  <td className="small mono muted" title={p.root}>{p.root}</td>
+                  <td className="nowrap">
+                    <button className="primary small" onClick={(e) => { e.stopPropagation(); onOpen(p.id); }}>{p.id === current ? "Continue" : "Open"}</button>{" "}
+                    {me.canManage(p.owner) && <button className="danger small" onClick={(e) => { e.stopPropagation(); onDelete(p); }}
+                      title="delete the project and its run outputs; case folders are not touched">Delete</button>}</td>
+                </tr>))}</tbody>
+            </table>
+          </div>
+        )}
+        {layout === "tiles" && <div className="project-grid">
           {shown.map((p) => (
             <div key={p.id} className={`project-card${p.id === current ? " active" : ""}`} onClick={() => onOpen(p.id)}
                  role="button" tabIndex={0} onKeyDown={(e) => e.key === "Enter" && onOpen(p.id)}>
@@ -116,7 +160,7 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
               </div>
             </div>
           ))}
-        </div>
+        </div>}
       </div>}
     </div>
   );

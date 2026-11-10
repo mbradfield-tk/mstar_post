@@ -5,7 +5,7 @@ import { traceStreamlines, type Vec2 } from "./flow";
 import { runLic } from "./lic";
 import { fetchPlane, type Plane } from "./plane";
 import Plot from "./Plot";
-import SliceCanvas, { type Overlay, type Region, type Tool } from "./SliceCanvas";
+import SliceCanvas, { type Overlay, type Region, type RegionShape, type Tool } from "./SliceCanvas";
 import Viewer3D, { CameraSync, layerColor, prefetchMesh, type LineLayer, type MeshLayer } from "./Viewer3D";
 
 const MAX_CASES = 4;
@@ -76,6 +76,43 @@ function regionStats(p: Plane, poly: number[][]): RegionStats {
 }
 const polyArea = (poly: number[][], ua: number, va: number) =>
   Math.abs(poly.reduce((a, q, i) => { const r = poly[(i + 1) % poly.length]; return a + q[ua] * r[va] - r[ua] * q[va]; }, 0)) / 2;
+type RegionSeries = { label: string; rows: { id: string; unit: string; t: number[]; mean: (number | null)[]; std: (number | null)[] }[] };
+// "10-20; 30-" -> [[10, 20], [30, Infinity]]; blank = the whole run
+const parseIntervals = (s: string): [number, number][] => {
+  const out = s.split(/[;,]/).map((x) => x.trim()).filter(Boolean).map((x) => {
+    const m = x.match(/^(-?[\d.eE+]*)\s*(?:-|to|\u2013)\s*(-?[\d.eE+]*)$/);
+    if (!m) return null;
+    const a = m[1] === "" ? -Infinity : Number(m[1]), b = m[2] === "" ? Infinity : Number(m[2]);
+    return Number.isFinite(a) || Number.isFinite(b) ? [a, b] as [number, number] : null;
+  }).filter((x): x is [number, number] => !!x && !Number.isNaN(x[0]) && !Number.isNaN(x[1]) && x[0] <= x[1]);
+  return out.length ? out : [[-Infinity, Infinity]];
+};
+
+const SHAPES: [RegionShape, string][] = [["rectangle", "rectangle (drag corner to corner)"], ["square", "square (drag corner to corner)"],
+  ["circle", "circle (drag from the centre)"], ["polygon", "polygon (click corners)"]];
+// outline of a dragged shape from press point a to the current point b on an axis-normal plane
+function shapeRegion(shape: RegionShape, a: number[], b: number[], axis: number): { pts: number[][]; info: string } | null {
+  const [ua, va] = [0, 1, 2].filter((x) => x !== axis);
+  const at = (u: number, v: number) => { const p = [...a]; p[ua] = u; p[va] = v; return p; };
+  let du = b[ua] - a[ua], dv = b[va] - a[va];
+  if (shape === "circle") {
+    const r = Math.hypot(du, dv);
+    if (!(r > 0)) return null;
+    const n = 96;
+    return { pts: Array.from({ length: n }, (_, i) => at(a[ua] + r * Math.cos((2 * Math.PI * i) / n), a[va] + r * Math.sin((2 * Math.PI * i) / n))),
+             info: `circle, centre ${AXES[ua]} = ${fmt(a[ua])}, ${AXES[va]} = ${fmt(a[va])} m, radius ${fmt(r)} m` };
+  }
+  if (shape === "square") {
+    const s = Math.max(Math.abs(du), Math.abs(dv));
+    du = Math.sign(du || 1) * s;
+    dv = Math.sign(dv || 1) * s;
+  }
+  if (!du || !dv) return null;
+  const [u0, u1] = [Math.min(a[ua], a[ua] + du), Math.max(a[ua], a[ua] + du)];
+  const [v0, v1] = [Math.min(a[va], a[va] + dv), Math.max(a[va], a[va] + dv)];
+  return { pts: [at(u0, v0), at(u1, v0), at(u1, v1), at(u0, v1)],
+           info: `${shape}, ${AXES[ua]} ${fmt(u0)} to ${fmt(u1)} m, ${AXES[va]} ${fmt(v0)} to ${fmt(v1)} m` };
+}
 
 export default function ViewerView({ project, onRefresh, active = true }: { project: Project; onRefresh: () => Promise<unknown>; active?: boolean }) {
   const cases = project.cases.filter((c) => c.included);
@@ -113,6 +150,11 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const [playing, setPlaying] = useState(false);
   const [tool, setTool] = useState<Tool>("none");
   const [region, setRegion] = useState<(Region & { axis: number }) | null>(null);
+  const [regionShape, setRegionShape] = useState<RegionShape>(() => (localStorage.getItem("mstar_post.viewer.regionShape") as RegionShape | null) ?? "rectangle");
+  useEffect(() => { localStorage.setItem("mstar_post.viewer.regionShape", regionShape); }, [regionShape]);
+  // typed shape size [m]: a = diameter / side / length (first in-plane axis), b = width; cu, cv = centre
+  const [sizeIn, setSizeIn] = useState({ a: "", b: "", cu: "", cv: "" });
+  const [regionSeries, setRegionSeries] = useState<RegionSeries | "busy" | null>(null);
   const [probe, setProbe] = useState<[string, string, string]>(["", "", ""]);
   const [pointVals, setPointVals] = useState<Record<string, PointValue | string>>({});
   const [pointSeries, setPointSeries] = useState<{ p: number[]; rows: { id: string; t: number[]; v: (number | null)[] }[] } | "busy" | null>(null);
@@ -515,12 +557,73 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
 
   // region average: a polygon drawn on the plane, applied to every pane with the same normal axis
   const addRegionPoint = (p: number[]) => setRegion((r) => {
-    if (!r || r.closed || r.axis !== axis) return { axis, pts: [p], closed: false };
+    if (!r || r.closed || r.axis !== axis) return { axis, pts: [p], closed: false, shape: "polygon" };
     const last = r.pts[r.pts.length - 1];
     return last.every((x, i) => x === p[i]) ? r : { ...r, pts: [...r.pts, p] };
   });
-  const closeRegion = () => setRegion((r) => (r && r.pts.length >= 3 ? { ...r, closed: true } : r));
+  const dragRegion = (a: number[], b: number[], done: boolean) => {
+    const s = shapeRegion(regionShape, a, b, axis);
+    if (!s) { if (done) setRegion(null); return; }
+    setRegion({ axis, pts: s.pts, closed: done, shape: regionShape, info: s.info });
+    if (done) {
+      setTool("none");
+      const [ua, va] = [0, 1, 2].filter((x) => x !== axis);
+      const us = s.pts.map((p) => p[ua]), vs = s.pts.map((p) => p[va]);
+      const num = (x: number) => String(Number(x.toPrecision(5)));
+      setSizeIn({ a: num(Math.max(...us) - Math.min(...us)), b: num(Math.max(...vs) - Math.min(...vs)),
+                  cu: num(regionShape === "circle" ? a[ua] : (Math.max(...us) + Math.min(...us)) / 2),
+                  cv: num(regionShape === "circle" ? a[va] : (Math.max(...vs) + Math.min(...vs)) / 2) });
+    }
+  };
+  // the plane the typed shape goes on: in-plane axes, centre of the shown plane and its normal position
+  const refPlane = planes[ref] ?? null;
+  const [sua, sva] = [0, 1, 2].filter((x) => x !== axis);
+  const planeCentre = refPlane ? [refPlane.u0 + ((refPlane.w - 1) / 2) * refPlane.du, refPlane.v0 + ((refPlane.h - 1) / 2) * refPlane.dv] : null;
+  const placeRegion = () => {
+    const a = Number(sizeIn.a), b = regionShape === "rectangle" ? Number(sizeIn.b) : a;
+    const cu = sizeIn.cu.trim() === "" ? planeCentre?.[0] : Number(sizeIn.cu);
+    const cv = sizeIn.cv.trim() === "" ? planeCentre?.[1] : Number(sizeIn.cv);
+    if (!(a > 0) || !(b > 0) || cu === undefined || cv === undefined || !Number.isFinite(cu) || !Number.isFinite(cv)) return;
+    const pt = (u: number, v: number) => { const p = [0, 0, 0]; p[axis] = refPlane?.pos ?? pos ?? 0; p[sua] = u; p[sva] = v; return p; };
+    const s = regionShape === "circle" ? shapeRegion("circle", pt(cu, cv), pt(cu + a / 2, cv), axis)
+      : shapeRegion(regionShape, pt(cu - a / 2, cv - b / 2), pt(cu + a / 2, cv + b / 2), axis);
+    if (!s) return;
+    setRegion({ axis, pts: s.pts, closed: true, shape: regionShape, info: s.info });
+    setTool((t) => (t === "region" ? "none" : t));
+  };
+  const sizeOk = Number(sizeIn.a) > 0 && (regionShape !== "rectangle" || Number(sizeIn.b) > 0) && (!!planeCentre || (sizeIn.cu !== "" && sizeIn.cv !== ""));
+  const closeRegion = () => {
+    if (!region || region.pts.length < 3) return;
+    setRegion({ ...region, closed: true });
+    setTool("none");
+  };
+  const clearRegion = () => {
+    setRegion(null);
+    setTool((t) => (t === "region" ? "none" : t));
+  };
+  const pickPoint = (p: number[]) => {
+    setProbe(p.map((x) => String(Number(x.toPrecision(6)))) as [string, string, string]);
+    setTool("none");
+  };
   const regionFor = (p: Plane | null) => (region && p && region.axis === p.axis ? region : null);
+  // region mean in every frame of the shown cases (main field); dropped when the region or the field changes
+  useEffect(() => { setRegionSeries(null); }, [region, array, comp, mask, smooth, kindName, axis, pos, sel.join("|")]);
+  const regionOverTime = async () => {
+    if (!region?.closed) return;
+    setRegionSeries("busy");
+    try {
+      const rowsOut = await Promise.all(sel.map(async (id) => {
+        const k = invs[id]?.kinds.find((x) => x.kind === kindName);
+        const p = planes[id];
+        if (!k || !array || !p || p.axis !== region.axis) return null;
+        const r = await api.regionSeries(pathOf(id), k.files.map((f) => f[0]), array, comp, isVolume ? axis : null,
+          isVolume ? pos : null, region.pts.map((q) => [q[p.uAxis], q[p.vAxis]]), mask, smooth);
+        return { id, unit: r.frames[0]?.unit ?? p.unit, t: r.frames.map((f, i) => f.time ?? k.times[i]),
+                 mean: r.frames.map((f) => f.mean), std: r.frames.map((f) => f.std) };
+      }));
+      setRegionSeries({ label: fieldLabel, rows: rowsOut.filter((x): x is NonNullable<typeof x> => !!x) });
+    } catch (e) { setError((e as Error).message); setRegionSeries(null); }
+  };
   const regionRows = useMemo(() => {
     if (!region?.closed) return [];
     const rowsOut: { id: string; label: string; unit: string; s: RegionStats }[] = [];
@@ -666,7 +769,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                 <label title="what a click on the 2D plane does">Click tool <select value={tool} onChange={(e) => setTool(e.target.value as Tool)}>
                   <option value="none">none (drag pans when zoomed)</option>
                   <option value="line">line profile (2 clicks)</option>
-                  <option value="region">region average (polygon)</option>
+                  <option value="region">region average (draw a shape)</option>
                   <option value="point">point probe (pick x, y, z)</option></select></label>
               </>
             )}
@@ -675,11 +778,39 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
         {kind && (
           <Section id="probes" title="Region and point">
             <div className="small"><b>Region average</b>{" "}
-              <span className="muted">{region ? `${region.pts.length} corners${region.closed ? "" : " (open: double-click to close)"}, ${AXES[region.axis]}-normal planes`
-                : "none: choose Click tool 'region average' and click the corners on a 2D pane"}</span></div>
+              <span className="muted">{region ? `${region.info ?? `polygon, ${region.pts.length} corners`}${region.closed ? "" : " (drawing)"}, ${AXES[region.axis]}-normal planes`
+                : "none: pick a shape, press Draw region and draw it on a 2D pane"}</span></div>
+            <label className="small">Shape <select value={regionShape} onChange={(e) => setRegionShape(e.target.value as RegionShape)}>
+              {SHAPES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select></label>
+            {regionShape !== "polygon" && (
+              <div className="size-grid small" title="or type the size and centre and press Place; drawing a shape fills these in">
+                <span>{regionShape === "circle" ? "diameter" : regionShape === "square" ? "side" : `length (${AXES[sua]})`} [m]</span>
+                <input type="number" step="any" min={0} className="short" value={sizeIn.a} onChange={(e) => setSizeIn({ ...sizeIn, a: e.target.value })} />
+                {regionShape === "rectangle" && <>
+                  <span>width ({AXES[sva]}) [m]</span>
+                  <input type="number" step="any" min={0} className="short" value={sizeIn.b} onChange={(e) => setSizeIn({ ...sizeIn, b: e.target.value })} /></>}
+                <span>centre {AXES[sua]}, {AXES[sva]} [m]</span>
+                <span className="row">
+                  <input type="number" step="any" className="short" value={sizeIn.cu} placeholder={planeCentre ? fmt(planeCentre[0]) : AXES[sua]}
+                         onChange={(e) => setSizeIn({ ...sizeIn, cu: e.target.value })} />
+                  <input type="number" step="any" className="short" value={sizeIn.cv} placeholder={planeCentre ? fmt(planeCentre[1]) : AXES[sva]}
+                         onChange={(e) => setSizeIn({ ...sizeIn, cv: e.target.value })} /></span>
+                <span />
+                <span className="row">
+                  <button className="primary" disabled={!sizeOk} onClick={placeRegion}
+                          title={`place the ${regionShape} on the ${AXES[axis]}-normal plane (blank centre = plane centre)`}>Place</button>
+                  {planeCentre && <button onClick={() => setSizeIn({ ...sizeIn, cu: String(Number(planeCentre[0].toPrecision(5))), cv: String(Number(planeCentre[1].toPrecision(5))) })}
+                                          title="centre of the shown plane">plane centre</button>}
+                </span>
+              </div>
+            )}
             <div className="row small">
-              {tool !== "region" && <button onClick={() => setTool("region")}>Draw region</button>}
-              <button disabled={!region} onClick={() => setRegion(null)}>Clear region</button>
+              {tool === "region"
+                ? <><span className="muted">{regionShape === "polygon" ? "click corners, double-click to close"
+                    : `press, drag and release on a 2D pane${regionShape === "circle" ? " (start at the centre)" : ""}`}</span>
+                    <button onClick={() => { setTool("none"); if (region && !region.closed) setRegion(null); }}>Cancel</button></>
+                : <button onClick={() => { if (region) setRegion(null); setTool("region"); }}>{region ? "Draw new region" : "Draw region"}</button>}
+              <button disabled={!region} onClick={clearRegion}>Clear region</button>
             </div>
             <div className="small"><b>Point probe</b> <span className="muted">x, y, z [m]; nearest cell</span></div>
             <div className="row small">
@@ -688,7 +819,9 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                        onChange={(e) => setProbe(probe.map((s, j) => (j === i ? e.target.value : s)) as [string, string, string])} />))}
             </div>
             <div className="row small">
-              {tool !== "point" && <button onClick={() => setTool("point")} title="then click a 2D pane">Pick on plane</button>}
+              {tool === "point"
+                ? <button onClick={() => setTool("none")} title="click a 2D pane to set the point">Cancel pick</button>
+                : <button onClick={() => setTool("point")} title="then click a 2D pane">Pick on plane</button>}
               <button disabled={!probeP || pointSeries === "busy"} onClick={pointOverTime}
                       title="the field at this point in every frame of the shown cases">{pointSeries === "busy" ? "Reading frames..." : "Over time"}</button>
               <button disabled={!probe.some((s) => s)} onClick={() => { setProbe(["", "", ""]); setPointVals({}); setPointSeries(null); }}>Clear</button>
@@ -882,7 +1015,8 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                       <SliceCanvas plane={planes[id] ?? null} cmap={cmap} range={range} log={log} height={paneH}
                                    tool={tool} onLine={onLine} legend={legend} overlay={overlayOf(id)}
                                    region={regionFor(planes[id] ?? null)} onRegionPoint={addRegionPoint} onRegionClose={closeRegion}
-                                   onPoint={(p) => setProbe(p.map((x) => String(Number(x.toPrecision(6)))) as [string, string, string])}
+                                   regionShape={regionShape} onRegionDrag={dragRegion}
+                                   onPoint={pickPoint}
                                    marker={markerFor(planes[id] ?? null)}
                                    background={bg} smooth={smooth}
                                    exportName={`${id}_${kindName}_t${fmt(t)}`} />
@@ -915,7 +1049,8 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                       <SliceCanvas plane={p} cmap={e.cmap} range={r} log={e.log} height={paneH}
                                    tool={tool === "line" ? "none" : tool} onLine={onLine} legend={lg} overlay={overlayOf(e.id)}
                                    region={regionFor(p)} onRegionPoint={addRegionPoint} onRegionClose={closeRegion}
-                                   onPoint={(q) => setProbe(q.map((x) => String(Number(x.toPrecision(6)))) as [string, string, string])}
+                                   regionShape={regionShape} onRegionDrag={dragRegion}
+                                   onPoint={pickPoint}
                                    marker={markerFor(p)}
                                    background={bg} smooth={smooth} exportName={`${e.id}_${e.array}_t${fmt(t)}`} />
                     )}
@@ -934,7 +1069,9 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
           </div>
         </div>
         {region?.closed && (
-          <RegionCard rows={regionRows} region={region} t={t} smooth={smooth} onClear={() => setRegion(null)} />
+          <RegionCard rows={regionRows} region={region} t={t} smooth={smooth} onClear={clearRegion}
+                      series={regionSeries} onOverTime={regionOverTime} onCloseSeries={() => setRegionSeries(null)}
+                      nFrames={kind?.times.length ?? 0} />
         )}
         {probeP && (
           <PointCard p={probeP} t={t} rows={pointReqs.map((q) => ({ key: q.key, id: q.id, label: q.label, r: pointVals[q.key] }))}
@@ -986,12 +1123,15 @@ function SliderNum({ label, min, max, step, value, onChange, num, numMin, numMax
   return label ? <label>{label}{body}</label> : body;
 }
 
-// Region average results: one row per pane of the region's plane orientation.
-function RegionCard({ rows, region, t, smooth, onClear }: {
+// Region average results: one row per pane of the region's plane orientation, plus the region mean over time.
+function RegionCard({ rows, region, t, smooth, onClear, series, onOverTime, onCloseSeries, nFrames }: {
   rows: { id: string; label: string; unit: string; s: RegionStats }[];
   region: Region & { axis: number }; t: number; smooth: boolean; onClear: () => void;
+  series: RegionSeries | "busy" | null; onOverTime: () => void; onCloseSeries: () => void; nFrames: number;
 }) {
   const [copied, setCopied] = useState<boolean | null>(null);
+  const [intervals, setIntervals] = useState("");
+  const [band, setBand] = useState(false);
   const [ua, va] = [0, 1, 2].filter((a) => a !== region.axis);
   const polyA = polyArea(region.pts, ua, va);
   const header = ["case", "field", "unit", "mean", "std", "min", "max", "fluid cells [count]", "fluid area [m^2]",
@@ -1005,6 +1145,24 @@ function RegionCard({ rows, region, t, smooth, onClear }: {
     setCopied(await copyText([header, ...table].map((r) => r.map((v) => (v === null ? "" : String(v))).join("\t")).join("\n")));
     setTimeout(() => setCopied(null), 1500);
   };
+  const s = series && series !== "busy" ? series : null;
+  const ivs = parseIntervals(intervals);
+  const tAll = s ? s.rows.flatMap((r) => r.t) : [];
+  const tMin = tAll.length ? Math.min(...tAll) : 0, tMax = tAll.length ? Math.max(...tAll) : 0;
+  const preset = (frac: number) => setIntervals(frac >= 1 ? "" : `${Number((tMax - frac * (tMax - tMin)).toPrecision(4))}-`);
+  const ivLabel = ([a, b]: [number, number]) => `${Number.isFinite(a) ? fmt(a) : fmt(tMin)} to ${Number.isFinite(b) ? fmt(b) : fmt(tMax)} s`;
+  const ivHeader = ["case", "field", "interval", "time-mean of region mean", "std over time", "CoV [%]", "min", "max", "frames [count]"];
+  const ivTable = s ? s.rows.flatMap((r) => ivs.map((iv) => {
+    const v = r.mean.filter((x, i): x is number => x !== null && r.t[i] >= iv[0] && r.t[i] <= iv[1]);
+    const m = v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+    const sd = m !== null && v.length > 1 ? Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / (v.length - 1)) : null;
+    return [r.id, `${s.label} [${r.unit}]`, ivLabel(iv), m, sd, m && sd !== null ? (100 * sd) / Math.abs(m) : null,
+            v.length ? Math.min(...v) : null, v.length ? Math.max(...v) : null, v.length];
+  })) : [];
+  const copyIv = async () => {
+    setCopied(await copyText([ivHeader, ...ivTable].map((r) => r.map((v) => (v === null ? "" : String(v))).join("\t")).join("\n")));
+    setTimeout(() => setCopied(null), 1500);
+  };
   return (
     <div className="card">
       <div className="row"><b className="grow">Region average</b>
@@ -1012,8 +1170,8 @@ function RegionCard({ rows, region, t, smooth, onClear }: {
         <button onClick={() => download("region_average.csv", toCsv(header, table))}>Export CSV</button>
         <button onClick={onClear}>Clear</button></div>
       <div className="small muted">
-        Mean over the fluid cells of the current plane whose centres lie inside the polygon ({region.pts.length} corners,
-        polygon area {fmt(polyA, 4)} m^2, {AXES[region.axis]}-normal) at t = {fmt(t)} s. Cells are equal in size, so this
+        Mean over the fluid cells of the current plane whose centres lie inside the region ({region.info ?? `polygon, ${region.pts.length} corners`},
+        area {fmt(polyA, 4)} m^2, {AXES[region.axis]}-normal) at t = {fmt(t)} s. Cells are equal in size, so this
         is the area-weighted mean; solid (masked) cells are left out.{smooth ? " Smooth shading is on: the values are the smoothed ones." : ""}
       </div>
       <div className="tablewrap">
@@ -1026,9 +1184,60 @@ function RegionCard({ rows, region, t, smooth, onClear }: {
           </tbody>
         </table>
       </div>
+      <div className="row">
+        <button disabled={series === "busy" || !rows.length} onClick={onOverTime}
+                title={`region mean of the main field in all ${nFrames} frames of the shown cases (same plane and region)`}>
+          {series === "busy" ? "Reading frames..." : s ? "Recompute over time" : "Region mean over time"}</button>
+        {s && <button onClick={onCloseSeries}>Close time course</button>}
+      </div>
+      {s && (
+        <>
+          <div className="row small">
+            <label title="one or more intervals [s], e.g. '10-20; 30-' (blank = whole run; open ends allowed)">Averaging intervals [s]{" "}
+              <input className="wide" value={intervals} placeholder="whole run, e.g. 10-20; 30-" onChange={(e) => setIntervals(e.target.value)} /></label>
+            <button onClick={() => preset(1)}>whole run</button>
+            <button onClick={() => preset(0.5)}>last 50%</button>
+            <button onClick={() => preset(0.25)}>last 25%</button>
+            <label><input type="checkbox" checked={band} onChange={(e) => setBand(e.target.checked)} /> &plusmn; spatial std band</label>
+          </div>
+          <Plot height={320} exportName="region_mean_series" data={s.rows.flatMap((r, ci) => {
+            const lines: Plotly.Data[] = [{ type: "scatter", mode: "lines+markers", x: r.t, y: r.mean, name: r.id, legendgroup: r.id,
+                                            marker: { size: 4 }, line: { color: PALETTE[ci % PALETTE.length] } }];
+            if (band) lines.push({ type: "scatter", mode: "lines", x: [...r.t, ...[...r.t].reverse()], legendgroup: r.id, showlegend: false,
+              y: [...r.mean.map((m, i) => (m === null || r.std[i] === null ? null : m + r.std[i]!)),
+                  ...r.mean.map((m, i) => (m === null || r.std[i] === null ? null : m - r.std[i]!)).reverse()],
+              fill: "toself", line: { width: 0 }, fillcolor: PALETTE[ci % PALETTE.length] + "33", hoverinfo: "skip" });
+            return lines;
+          })} layout={{
+            xaxis: { title: { text: "time [s]" } }, yaxis: { title: { text: `region mean ${s.label} [${s.rows[0]?.unit ?? ""}]` } },
+            legend: { orientation: "h", y: 1.02, yanchor: "bottom" }, margin: { t: 30, r: 20, b: 50, l: 80 },
+            shapes: [
+              ...(intervals.trim() ? ivs.map((iv) => ({ type: "rect" as const, xref: "x" as const, yref: "paper" as const,
+                x0: Number.isFinite(iv[0]) ? iv[0] : tMin, x1: Number.isFinite(iv[1]) ? iv[1] : tMax, y0: 0, y1: 1,
+                fillcolor: "rgba(120,160,220,0.15)", line: { width: 0 } })) : []),
+              { type: "line", x0: t, x1: t, yref: "paper", y0: 0, y1: 1, line: { dash: "dot", color: "grey" } }],
+          }} />
+          <div className="row small">
+            <b className="grow">Mean over the interval{ivs.length > 1 ? "s" : ""}</b>
+            <button onClick={copyIv}>{copied === null ? "Copy table" : copied ? "Copied" : "Copy failed"}</button>
+            <button onClick={() => download("region_interval_means.csv", toCsv(ivHeader, ivTable))}>Export CSV</button>
+            <button onClick={() => download("region_mean_series.csv", toCsv(["case", "time [s]", `region mean ${s.label}`, "spatial std"],
+              s.rows.flatMap((r) => r.t.map((tt, i) => [r.id, tt, r.mean[i], r.std[i]]))))}>Time course CSV</button>
+          </div>
+          <div className="tablewrap">
+            <table className="grid">
+              <thead><tr>{ivHeader.map((h) => <th key={h}>{h}</th>)}</tr></thead>
+              <tbody>{ivTable.map((r, i) => (
+                <tr key={i}>{r.map((v, j) => j < 3 ? <td key={j} className={j ? "small" : "mono"}>{v}</td>
+                  : <td key={j} className="num">{fmt(v as number | null)}</td>)}</tr>))}</tbody>
+            </table>
+          </div>
+        </>
+      )}
     </div>
   );
 }
+const PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"];
 
 // Point probe results for the current frame, plus the optional time series at the point.
 function PointCard({ p, t, rows, series, fieldLabel, onCloseSeries }: {

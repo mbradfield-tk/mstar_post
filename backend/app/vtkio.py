@@ -7,6 +7,7 @@ full VTK read (cached).
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import threading
 from collections import OrderedDict
@@ -109,9 +110,60 @@ def _header_vtk(path: str) -> dict:
     return h
 
 
-def header(path: Path) -> dict:
+def _single_header(path: Path) -> dict:
     st = path.stat()
     return _header(str(path), st.st_mtime_ns, st.st_size)
+
+
+_BLOCK_DIR = re.compile(r"^block(\d+)$", re.I)
+
+
+def block_files(path: Path) -> list[Path]:
+    """Same-named files of all blockN folders next to path's (multi-GPU solves write one
+    block per GPU), block number order; [] for single-block output."""
+    m = _BLOCK_DIR.match(path.parent.name)
+    if not m:
+        return []
+    try:
+        dirs = [(int(mm.group(1)), e.path) for e in os.scandir(path.parent.parent)
+                if e.is_dir() and (mm := _BLOCK_DIR.match(e.name))]
+    except OSError:
+        return []
+    if len(dirs) < 2:
+        return []
+    files = [Path(d) / path.name for _, d in sorted(dirs)]
+    files = [f for f in files if f.is_file()]
+    return files if len(files) > 1 else []
+
+
+@lru_cache(maxsize=1024)
+def _merged_header(blocks: tuple[tuple[str, int, int], ...]) -> dict:
+    """Header of the union of image-data blocks: global extent from 0, origin of the lowest
+    corner; h['blocks'] = [(path, (z, y, x) offset in samples)]."""
+    hs = [_header(*b) for b in blocks]
+    h0 = hs[0]
+    sp = h0["spacing"]
+    lo = [min(h["origin"][a] + h["extent"][2 * a] * sp[a] for h in hs) for a in range(3)]
+    offs, hi = [], [0, 0, 0]
+    for h in hs:
+        o = [int(round((h["origin"][a] + h["extent"][2 * a] * sp[a] - lo[a]) / sp[a])) for a in range(3)]
+        for a in range(3):
+            hi[a] = max(hi[a], o[a] + h["extent"][2 * a + 1] - h["extent"][2 * a])
+        offs.append((o[2], o[1], o[0]))
+    return {**h0, "extent": [0, hi[0], 0, hi[1], 0, hi[2]], "origin": lo,
+            "blocks": [(b[0], off) for b, off in zip(blocks, offs)]}
+
+
+def header(path: Path) -> dict:
+    h = _single_header(path)
+    blocks = block_files(path) if "extent" in h else []
+    if not blocks:
+        return h
+    key = []
+    for b in blocks:
+        st = b.stat()
+        key.append((str(b), st.st_mtime_ns, st.st_size))
+    return _merged_header(tuple(key))
 
 
 def grid_dims(h: dict, assoc: str) -> tuple[int, int, int]:
@@ -164,9 +216,93 @@ def _read_full(path: str, name: str, assoc: str) -> np.ndarray:
     return arr
 
 
-def volume_array(path: Path, name: str) -> np.ndarray:
-    """Array as (nz, ny, nx[, ncomp]) - memory-mapped when possible."""
+class Tiled:
+    """Read-only (nz, ny, nx[, c]) view over several blocks; indexing reads only the
+    overlapping parts of each block, uncovered samples are NaN (0 for integers)."""
+
+    def __init__(self, parts: list[tuple[tuple[int, int, int], np.ndarray]], dims: tuple[int, int, int]):
+        self.parts = parts
+        a0 = parts[0][1]
+        self.dtype = a0.dtype
+        self.shape = tuple(dims) + a0.shape[3:]
+        self.ndim = len(self.shape)
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __array__(self, dtype=None, copy=None):
+        out = self[:, :, :]
+        return out if dtype is None else out.astype(dtype)
+
+    def _empty(self, shape) -> np.ndarray:
+        fill = np.nan if np.issubdtype(self.dtype, np.floating) else 0
+        return np.full(shape, fill, self.dtype)
+
+    def __getitem__(self, key):
+        key = key if isinstance(key, tuple) else (key,)
+        if any(k is Ellipsis for k in key):
+            i = key.index(Ellipsis)
+            key = key[:i] + (slice(None),) * (3 - (len(key) - 1)) + key[i + 1:]
+        key = key + (slice(None),) * (3 - len(key))
+        idx3, tail = key[:3], key[3:]
+        if all(isinstance(k, (int, np.integer)) for k in idx3):
+            g = [int(k) + (self.shape[d] if k < 0 else 0) for d, k in enumerate(idx3)]
+            for off, arr in self.parts:
+                loc = [g[d] - off[d] for d in range(3)]
+                if all(0 <= loc[d] < arr.shape[d] for d in range(3)):
+                    return arr[tuple(loc) + tail]
+            return self._empty(self.shape[3:])[tail] if tail else self._empty(())[()]
+        if any(isinstance(k, (np.ndarray, list)) for k in idx3):
+            gi = np.broadcast_arrays(*[np.asarray(k) for k in idx3])
+            out = self._empty(gi[0].shape + self.shape[3:])
+            for off, arr in self.parts:
+                m = np.ones(gi[0].shape, bool)
+                for d in range(3):
+                    m &= (gi[d] >= off[d]) & (gi[d] < off[d] + arr.shape[d])
+                if m.any():
+                    out[m] = arr[gi[0][m] - off[0], gi[1][m] - off[1], gi[2][m] - off[2]]
+            return out[(Ellipsis,) + tail] if tail else out
+        sel, squeeze = [], []
+        for d, k in enumerate(idx3):
+            if isinstance(k, (int, np.integer)):
+                k = int(k) + (self.shape[d] if k < 0 else 0)
+                sel.append(np.array([k]))
+                squeeze.append(d)
+            else:
+                sel.append(np.arange(self.shape[d])[k])
+        out = self._empty(tuple(len(s) for s in sel) + self.shape[3:])
+        for off, arr in self.parts:
+            osl, lsl = [], []
+            for d in range(3):
+                m = (sel[d] >= off[d]) & (sel[d] < off[d] + arr.shape[d])
+                pos = np.flatnonzero(m)
+                if not pos.size:
+                    break
+                loc = sel[d][m] - off[d]
+                step = int(loc[1] - loc[0]) if loc.size > 1 else 1
+                stop = int(loc[-1]) + (1 if step > 0 else -1)
+                osl.append(slice(int(pos[0]), int(pos[-1]) + 1))
+                lsl.append(slice(int(loc[0]), stop if stop >= 0 else None, step))
+            else:
+                out[tuple(osl)] = arr[tuple(lsl)]
+        if squeeze:
+            out = out.reshape(tuple(n for d, n in enumerate(out.shape) if d not in squeeze))
+        return out[(slice(None),) * (3 - len(squeeze)) + tail] if tail else out
+
+
+def volume_array(path: Path, name: str):
+    """Array as (nz, ny, nx[, ncomp]) - memory-mapped when possible; several blocks
+    (multi-GPU output) as a Tiled view."""
     h = header(path)
+    if h.get("blocks"):
+        a = find_array(h, name)
+        dims = grid_dims(h, a["assoc"])
+        return Tiled([(off, _single_array(Path(p), name)) for p, off in h["blocks"]], (dims[2], dims[1], dims[0]))
+    return _single_array(path, name)
+
+
+def _single_array(path: Path, name: str) -> np.ndarray:
+    h = _single_header(path)
     a = find_array(h, name)
     nx, ny, nz = grid_dims(h, a["assoc"])
     shape = (nz, ny, nx) + ((a["ncomp"],) if a["ncomp"] > 1 else ())
@@ -434,6 +570,39 @@ def line_profile(path: Path, name: str, comp: str, p0: list[float], p1: list[flo
             "unit": a["unit"]}
 
 
+def _in_polygon(u: np.ndarray, v: np.ndarray, poly: list[list[float]]) -> np.ndarray:
+    """Ray-casting point-in-polygon test of the points (u, v) against poly [[u, v], ...]."""
+    inside = np.zeros(u.shape, bool)
+    for i in range(len(poly)):
+        (u1, v1), (u2, v2) = poly[i], poly[i - 1]
+        if v1 == v2:
+            continue
+        cross = (v1 > v) != (v2 > v)
+        inside ^= cross & (u < (u2 - u1) * (v - v1) / (v2 - v1) + u1)
+    return inside
+
+
+def region_series(paths: list[Path], name: str, comp: str, axis: int | None, pos: float | None,
+                  poly: list[list[float]], mask: bool = True, smooth: bool = False) -> list[dict]:
+    """Statistics of the plane cells whose centres lie inside poly ([[u, v], ...] in the plane's
+    in-plane axes) for each file: {time, mean, std, min, max, n (fluid cells), n_region}."""
+    out, inside = [], None
+    for p in paths:
+        pl = extract_plane(p, name, comp, axis, pos, mask, smooth)
+        d = pl["data"]
+        if inside is None or inside.shape != d.shape:
+            uu, vv = np.meshgrid(pl["u0"] + np.arange(d.shape[1]) * pl["du"], pl["v0"] + np.arange(d.shape[0]) * pl["dv"])
+            inside = _in_polygon(uu, vv, poly)
+        vals = d[inside]
+        vals = vals[np.isfinite(vals)].astype(np.float64)
+        out.append({"time": pl["time"], "n": int(vals.size), "n_region": int(inside.sum()),
+                    "mean": float(vals.mean()) if vals.size else None,
+                    "std": float(vals.std(ddof=1)) if vals.size > 1 else None,
+                    "min": float(vals.min()) if vals.size else None,
+                    "max": float(vals.max()) if vals.size else None, "unit": pl["unit"]})
+    return out
+
+
 def point_value(path: Path, name: str, comp: str, p: list[float], mask: bool = True) -> dict:
     """Value of the cell (or sample) nearest to world point p: {value, cell, center, inside,
     solid (fractions sum < 0.5; None when the case has no two-fluid fractions), unit, time}.
@@ -604,7 +773,7 @@ def isosurface_stl(path: Path, name: str, comp: str, level: float,
     """Isosurface of a .vti array at level (flying edges), cached as STL or indexed mesh."""
     write, ext = _WRITERS[fmt]
     st = path.stat()
-    out = _cache_path("iso", str(path), st.st_mtime_ns, name, comp, level, stride, max_tris, ext=ext)
+    out = _cache_path("iso", str(path), st.st_mtime_ns, name, comp, level, stride, max_tris, "blocks", ext=ext)
     if out.is_file():
         return out
     import vtk
@@ -639,7 +808,7 @@ def streamlines(path: Path, name: str, axis: int | None, pos: float | None,
     """
     st = path.stat()
     out = _cache_path("stream", str(path), st.st_mtime_ns, name, axis, pos, n_seeds,
-                      max_steps, stride, ext=".bin")
+                      max_steps, stride, "blocks", ext=".bin")
     if out.is_file():
         return out
     import vtk

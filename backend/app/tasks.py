@@ -168,6 +168,8 @@ def _dispersion_build(project: dict, cases: list[dict], prm: dict, run: Path) ->
                        ("partition", "--partition"), ("dc0", "--dc0"),
                        ("zone_scales", "--zone-scales"), ("vertical_axis", "--vertical-axis")):
         _opt(argv, flag, prm.get(name))
+    if not prm.get("reuse", True):
+        argv.append("--no-reuse")
     cmds = [{"argv": argv}]
     if prm.get("canon_body", True):
         cmds.append({"argv": rename_body_argv(run, project.get("ref_case"))})
@@ -178,7 +180,9 @@ DISPERSION = Task(
     id="dispersion", label="Liquid-liquid dispersion", launcher="stats_summary",
     description="Add-on for immiscible two-fluid runs: interfacial area a(t) and its "
                 "kinetics (a0, a_ss, E, t90/t95, tau), drop statistics from the VOF "
-                "surface (n_drops, d32, F_disp, coverage), the Hinze resolution check "
+                "surface (n_drops, d32, F_disp, coverage), the Hinze resolution check, "
+                "a grid-resolution and accuracy assessment (correlation d32, cells per drop, "
+                "area bounds and best estimate, settling, dispersion state; dispersion_assessment.csv) "
                 "and, optionally, phase uniformity (zonal CoV, segregation index, "
                 "continuity) and a two-film mass-transfer estimate from global averages "
                 "(k_c, k_d, K_oc a, extraction time; give the diffusivities and m). "
@@ -189,9 +193,9 @@ DISPERSION = Task(
         *_STEADY_PARAMS,
         P("disp_time", "Dispersion start time [s]", help="blank = a(t) plateau",
           group="Dispersion"),
-        P("sigma", "Interfacial tension [N/m]", help="for the Hinze check",
+        P("sigma", "Interfacial tension [N/m]", help="blank = input.xml surface tension",
           group="Dispersion"),
-        P("rho_continuous", "Continuous-phase density [kg/m3]", group="Dispersion"),
+        P("rho_continuous", "Continuous-phase density [kg/m3]", help="blank = input.xml", group="Dispersion"),
         P("dispersed_fraction", "Dispersed fraction [-]", help="blank = minority fraction from Fluid.txt",
           group="Dispersion"),
         P("vessel_diameter", "Vessel diameter [m]", help="checks a0 against the flat interface",
@@ -214,6 +218,9 @@ DISPERSION = Task(
           options=[{"value": a, "label": a} for a in "xyz"]),
         P("canon_body", "Impeller body name = Agitator", "bool", True, group="Outputs",
           help="normalise 'Moving Body' / 'agitator' to 'Agitator' in the outputs"),
+        P("reuse", "Reuse earlier results when VTK files are gone", "bool", True, group="Outputs",
+          help="VOF-drop and uniformity metrics of cases whose .vtp/.vti output was deleted are taken "
+               "from the newest earlier dispersion run of this project; the rest is recomputed"),
     ],
     build=_dispersion_build,
     presets=[
