@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import ColorLegend, { drawLegend, savePng, type LegendInfo } from "./ColorLegend";
 import { cmapLut, colorize, hexRgb, luminance, shadeLic, upsample } from "./cmap";
-import type { Plane } from "./plane";
-import type { Overlay } from "./SliceCanvas";
+import { isAbort, LoadCache, type Plane } from "./plane";
+import { sameProps, type Overlay } from "./SliceCanvas";
 
 export type MeshLayer = {
   key: string;      // stable id (url changes reload the geometry)
@@ -27,6 +27,7 @@ export type LineLayer = {
 };
 
 const NO_PLANES: Plane[] = [];
+const NO_LINES: LineLayer[] = [];
 const PALETTE = ["#8aa2c8", "#c8a97f", "#93c47f", "#c47f9f", "#7fc4bb", "#a37fc4", "#c4c07f"];
 export const layerColor = (i: number) => PALETTE[i % PALETTE.length];
 
@@ -46,25 +47,17 @@ export class CameraSync {
   }
 }
 
-// Decoded meshes (binary STL or the app's indexed "MPM1" format) kept within a byte budget.
+// Decoded meshes (binary STL or the app's indexed "MPM1" format) kept within a byte budget, least
+// recently used first. `shown` counts the panes drawing a geometry: such a geometry is never dropped,
+// and its GPU buffers are freed as soon as no pane draws it (three uploads it again when it is shown
+// again; the arrays stay in the cache), so GPU memory follows what is on screen.
 const MESH_CACHE_BYTES = 700 * 1024 * 1024;
-const meshCache = new Map<string, Promise<THREE.BufferGeometry>>();
-const meshBytes = new Map<string, number>();
-export function clearViewerCaches(): void {
-  meshCache.clear();
-  meshBytes.clear();
-  lineCache.clear();
-}
-function evictMeshes() {
-  let total = 0;
-  for (const n of meshBytes.values()) total += n;
-  for (const k of meshBytes.keys()) {
-    if (total <= MESH_CACHE_BYTES) break;
-    total -= meshBytes.get(k)!;
-    meshBytes.delete(k);
-    meshCache.delete(k);
-  }
-}
+const shown = new WeakMap<THREE.BufferGeometry, number>();
+const holdGeo = (g: THREE.BufferGeometry) => { shown.set(g, (shown.get(g) ?? 0) + 1); };
+const releaseGeo = (g: THREE.BufferGeometry) => {
+  const n = (shown.get(g) ?? 1) - 1;
+  if (n > 0) shown.set(g, n); else { shown.delete(g); g.dispose(); }
+};
 function parseMesh(buf: ArrayBuffer): THREE.BufferGeometry {
   const magic = new Uint8Array(buf, 0, 4);
   if (String.fromCharCode(...magic) === "MPM1") {
@@ -76,61 +69,58 @@ function parseMesh(buf: ArrayBuffer): THREE.BufferGeometry {
   }
   return new STLLoader().parse(buf);
 }
-// smooth: vertex normals over the shared vertices; flat shading is a material property
-// (derivatives in the shader), so one decoded geometry serves both.
-function loadMesh(url: string): Promise<THREE.BufferGeometry> {
-  let p = meshCache.get(url);
-  if (p) {
-    meshCache.delete(url); meshCache.set(url, p);  // LRU touch
-    return p;
-  }
-  p = fetch(url).then(async (r) => {
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail ?? `${r.status}`);
-    const g = parseMesh(await r.arrayBuffer());
-    g.computeVertexNormals();
-    let bytes = 0;
-    for (const a of Object.values(g.attributes)) bytes += (a as THREE.BufferAttribute).array.byteLength;
-    if (g.index) bytes += g.index.array.byteLength;
-    meshBytes.set(url, bytes);
-    evictMeshes();
-    return g;
-  });
-  p.catch(() => { meshCache.delete(url); meshBytes.delete(url); });
-  meshCache.set(url, p);
-  return p;
+// "no-cache": the files are served with validators only, so the browser must ask whether its copy
+// is still the file on disk (a re-run solve writes the same names)
+async function fetchBuf(url: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+  const r = await fetch(url, { signal, cache: "no-cache" });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail ?? `${r.status}`);
+  return r.arrayBuffer();
 }
-/** Fetch and decode a mesh ahead of time (e.g. the next time step). */
-export const prefetchMesh = (url: string) => loadMesh(url).catch(() => undefined);
+// Vertex normals are not computed here: only smooth layers need them (flat shading derives the
+// normals in the shader) and only for the frames that are shown (see the layers effect).
+const meshes = new LoadCache<THREE.BufferGeometry>(MESH_CACHE_BYTES,
+  async (url, signal) => parseMesh(await fetchBuf(url, signal)),
+  (g) => 2 * g.attributes.position.array.byteLength + (g.index ? g.index.array.byteLength : 0),  // + normals
+  (g) => shown.has(g), (g) => g.dispose());
+export function clearViewerCaches(): void {
+  meshes.clear();
+  lineCache.clear();
+}
+/** Fetch and decode a mesh ahead of time (e.g. the next time step); settles when it is there or failed. */
+export const prefetchMesh = (url: string): Promise<void> => meshes.get(url).then(() => undefined, () => undefined);
 
 type Lines = { pts: Float32Array; speed: Float32Array; offsets: Uint32Array };
 const lineCache = new Map<string, Promise<Lines>>();
 function loadLines(url: string): Promise<Lines> {
   let p = lineCache.get(url);
-  if (!p) {
-    p = fetch(url).then(async (r) => {
-      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail ?? `${r.status}`);
-      const buf = await r.arrayBuffer();
+  if (p) lineCache.delete(url);
+  else {
+    p = fetchBuf(url).then((buf) => {
       const [n, m] = new Uint32Array(buf, 0, 2);
       return { pts: new Float32Array(buf, 8, n * 3), speed: new Float32Array(buf, 8 + n * 12, n),
                offsets: new Uint32Array(buf, 8 + n * 16, m + 1) };
     });
     p.catch(() => lineCache.delete(url));
-    lineCache.set(url, p);
-    if (lineCache.size > 16) lineCache.delete(lineCache.keys().next().value!);
   }
+  lineCache.set(url, p);
+  if (lineCache.size > 16) lineCache.delete(lineCache.keys().next().value!);
   return p;
 }
 
-// Textured quad of a plane in world coordinates; px is RGBA at scale s x the plane grid (rows = v up).
-function planeMesh(plane: Plane, px: Uint8ClampedArray<ArrayBuffer>, s = 1, smooth = false): THREE.Mesh {
+// Textured quad of a plane in world coordinates: one unit square and one material per quad, placed
+// and textured per plane; px is RGBA at scale s x the plane grid (rows = v up).
+const newQuad = (geo: THREE.BufferGeometry) => new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }));
+function setQuad(m: THREE.Mesh, plane: Plane, px: Uint8ClampedArray<ArrayBuffer>, s = 1, smooth = false): void {
+  const mat = m.material as THREE.MeshBasicMaterial;
+  mat.map?.dispose();
   const tex = new THREE.DataTexture(px, plane.w * s, plane.h * s, THREE.RGBAFormat);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.magFilter = smooth ? THREE.LinearFilter : THREE.NearestFilter;
   tex.needsUpdate = true;
+  mat.map = tex;
   const W = plane.w * plane.du, H = plane.h * plane.dv;
-  const m = new THREE.Mesh(new THREE.PlaneGeometry(W, H),
-                           new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide }));
-  // PlaneGeometry spans local x (u) and y (v); orient into world axes
+  m.scale.set(W, H, 1);
+  // the unit square spans local x (u) and y (v); orient into world axes
   const u = new THREE.Vector3().setComponent(plane.uAxis, 1);
   const v = new THREE.Vector3().setComponent(plane.vAxis, 1);
   m.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(u, v, u.clone().cross(v)));
@@ -139,13 +129,10 @@ function planeMesh(plane: Plane, px: Uint8ClampedArray<ArrayBuffer>, s = 1, smoo
   c[plane.uAxis] = plane.u0 - plane.du / 2 + W / 2;
   c[plane.vAxis] = plane.v0 - plane.dv / 2 + H / 2;
   m.position.set(c[0], c[1], c[2]);
-  return m;
 }
-
-function disposeMesh(m: THREE.Mesh) {
+function dropQuad(m: THREE.Mesh): void {
   (m.material as THREE.MeshBasicMaterial).map?.dispose();
   (m.material as THREE.Material).dispose();
-  m.geometry.dispose();
 }
 
 // XYZ orientation gizmo: unit arrows with labels, drawn in a corner with the main camera's rotation.
@@ -169,37 +156,71 @@ function makeAxes() {
     scene.add(sp);
   });
   const cam = new THREE.OrthographicCamera(-1.7, 1.7, 1.7, -1.7, 0.1, 10);
-  return { scene, cam };
+  const dispose = () => scene.traverse((o) => {
+    const x = o as THREE.Mesh;
+    x.geometry?.dispose();
+    const m = x.material as (THREE.Material & { map?: THREE.Texture | null }) | undefined;
+    m?.map?.dispose();
+    m?.dispose();
+  });
+  return { scene, cam, dispose };
 }
 
-async function linesObject(l: Lines, layer: LineLayer): Promise<THREE.LineSegments> {
+// Line segments of the streamlines (uncolored: see colorLines).
+function linesObject(l: Lines): THREE.LineSegments {
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.BufferAttribute(l.pts, 3));
-  const idx: number[] = [];
-  for (let k = 0; k + 1 < l.offsets.length; k++)
-    for (let i = l.offsets[k]; i + 1 < l.offsets[k + 1]; i++) idx.push(i, i + 1);
-  g.setIndex(idx);
-  let mat: THREE.LineBasicMaterial;
+  let n = 0;
+  for (let k = 0; k + 1 < l.offsets.length; k++) n += Math.max(0, l.offsets[k + 1] - l.offsets[k] - 1);
+  const idx = new Uint32Array(2 * n);
+  for (let k = 0, j = 0; k + 1 < l.offsets.length; k++)
+    for (let i = l.offsets[k]; i + 1 < l.offsets[k + 1]; i++) { idx[j++] = i; idx[j++] = i + 1; }
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  return new THREE.LineSegments(g, new THREE.LineBasicMaterial());
+}
+// One color, or by speed with the layer's colormap and range; only the color attribute and the
+// material change, so a new range or color does not rebuild the lines.
+async function colorLines(o: THREE.LineSegments, l: Lines, layer: LineLayer): Promise<void> {
+  const mat = o.material as THREE.LineBasicMaterial;
   if (layer.color) {
-    mat = new THREE.LineBasicMaterial({ color: layer.color });
-  } else {
-    const lut = await cmapLut(layer.cmap);
-    const rgba = colorize(l.speed, l.speed.length, 1, lut, layer.range[0], layer.range[1], layer.log, false);
-    const col = new Float32Array(l.speed.length * 3);
-    for (let i = 0; i < l.speed.length; i++) {
-      col[3 * i] = rgba[4 * i] / 255; col[3 * i + 1] = rgba[4 * i + 1] / 255; col[3 * i + 2] = rgba[4 * i + 2] / 255;
-    }
-    g.setAttribute("color", new THREE.BufferAttribute(col, 3));
-    mat = new THREE.LineBasicMaterial({ vertexColors: true });
+    mat.color.set(layer.color);
+    if (mat.vertexColors) { mat.vertexColors = false; mat.needsUpdate = true; }
+    return;
   }
-  return new THREE.LineSegments(g, mat);
+  const lut = await cmapLut(layer.cmap);
+  const rgba = colorize(l.speed, l.speed.length, 1, lut, layer.range[0], layer.range[1], layer.log, false);
+  let a = o.geometry.getAttribute("color") as THREE.BufferAttribute | undefined;
+  if (!a) o.geometry.setAttribute("color", a = new THREE.BufferAttribute(new Float32Array(l.speed.length * 3), 3));
+  const col = a.array as Float32Array;
+  for (let i = 0; i < l.speed.length; i++) {
+    col[3 * i] = rgba[4 * i] / 255; col[3 * i + 1] = rgba[4 * i + 1] / 255; col[3 * i + 2] = rgba[4 * i + 2] / 255;
+  }
+  a.needsUpdate = true;
+  mat.color.set("#ffffff");
+  if (!mat.vertexColors) { mat.vertexColors = true; mat.needsUpdate = true; }
+}
+
+type Slot = { mesh: THREE.Mesh; url: string; reload: number };  // url / reload = the geometry it shows
+type LineSlot = { obj: THREE.LineSegments; url: string; reload: number; data: Lines; sig: string };
+
+// color, opacity and shading of a layer on its mesh (the material is kept for the life of the layer,
+// so a new time step does not compile a shader)
+function styleMesh(m: THREE.Mesh, l: MeshLayer): void {
+  const mat = m.material as THREE.MeshStandardMaterial;
+  mat.color.set(l.color);
+  mat.opacity = l.opacity;
+  // opaque materials are compiled with OPAQUE (alpha forced to 1): recompile when it flips
+  if (mat.transparent !== (l.opacity < 1)) { mat.transparent = l.opacity < 1; mat.needsUpdate = true; }
+  mat.depthWrite = l.opacity >= 1;
+  if (mat.flatShading === !!l.smooth) { mat.flatShading = !l.smooth; mat.needsUpdate = true; }
+  if (l.smooth && !m.geometry.attributes.normal) m.geometry.computeVertexNormals();
 }
 
 // Interactive 3D scene in metres: STL/surface layers, streamlines and one
-// textured plane (optionally LIC-shaded), with an in-view legend.
-export default function Viewer3D({ layers, plane, cmap, range, log, height = 560, sync, lines = [],
-                                   background = "#f4f6f9", legend, overlay, exportName = "view3d",
-                                   extraPlanes = NO_PLANES, smooth = false, onLoading }: {
+// textured plane (optionally LIC-shaded), with an in-view legend. Drawn on demand.
+function Viewer3D({ layers, plane, cmap, range, log, height = 560, sync, lines = NO_LINES,
+                    background = "#f4f6f9", legend, overlay, exportName = "view3d",
+                    extraPlanes = NO_PLANES, smooth = false, onLoading, loadKey, reload = 0 }: {
   layers: MeshLayer[];
   plane: Plane | null;
   cmap: string;
@@ -214,22 +235,28 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
   exportName?: string;
   extraPlanes?: Plane[];
   smooth?: boolean;  // bilinear plane texture (2x upsampled, masked cells crisp) instead of flat cells
-  onLoading?: (n: number) => void;  // number of meshes / streamlines still loading (playback waits for 0)
+  onLoading?: (n: number, key?: string) => void;  // meshes / streamlines still loading (playback waits for 0)
+  loadKey?: string;  // passed back to onLoading (so one stable callback serves every pane)
+  reload?: number;   // a new value loads every mesh and streamline again (Refresh: files may have changed)
 }) {
   const host = useRef<HTMLDivElement>(null);
   const three = useRef<{
     scene: THREE.Scene; camera: THREE.PerspectiveCamera; renderer: THREE.WebGLRenderer;
-    controls: OrbitControls; meshes: Map<string, THREE.Mesh>; plane: THREE.Mesh | null;
-    lines: Map<string, THREE.LineSegments>; extra: THREE.Mesh[]; draw: () => void;
+    controls: OrbitControls; meshes: Map<string, Slot>; plane: THREE.Mesh; quad: THREE.BufferGeometry;
+    lines: Map<string, LineSlot>; extra: THREE.Mesh[]; draw: () => void;
+    invalidate: () => void;  // ask for one frame (the scene, the camera or the size changed)
     userMoved: boolean;   // the user (or a linked camera) has positioned the camera: stop auto-fitting
     seen: Set<string>;    // layer keys / plane kinds already fitted once
   } | null>(null);
   const [loading, setLoading] = useState(0);
   const onLoadingRef = useRef(onLoading);
   onLoadingRef.current = onLoading;
-  useEffect(() => { onLoadingRef.current?.(loading); }, [loading]);
-  useEffect(() => () => onLoadingRef.current?.(0), []);
-  const [error, setError] = useState<string | null>(null);
+  const loadKeyRef = useRef(loadKey);
+  loadKeyRef.current = loadKey;
+  useEffect(() => { onLoadingRef.current?.(loading, loadKeyRef.current); }, [loading]);
+  useEffect(() => () => onLoadingRef.current?.(0, loadKeyRef.current), []);
+  const [meshErr, setMeshErr] = useState<string | null>(null);
+  const [lineErr, setLineErr] = useState<string | null>(null);
   const me = useRef({});
   const applying = useRef(false);
   const syncRef = useRef(sync);
@@ -237,8 +264,9 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
 
   useEffect(() => {
     const el = host.current!;
-    const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
-    renderer.setPixelRatio(window.devicePixelRatio);
+    // no preserveDrawingBuffer: snapshot() draws and copies in one task
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
     renderer.setClearColor(0xf4f6f9);
     el.appendChild(renderer.domElement);
     const scene = new THREE.Scene();
@@ -252,27 +280,10 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.zoomToCursor = true;
-    const onDbl = (e: MouseEvent) => {
-      const t = three.current;
-      if (!t) return;
-      const r = renderer.domElement.getBoundingClientRect();
-      const ray = new THREE.Raycaster();
-      ray.setFromCamera(new THREE.Vector2((e.clientX - r.left) / r.width * 2 - 1,
-                                          -(e.clientY - r.top) / r.height * 2 + 1), camera);
-      const objs: THREE.Object3D[] = [...t.meshes.values(), ...(t.plane ? [t.plane] : []), ...t.extra];
-      const hit = ray.intersectObjects(objs, false)[0];
-      if (hit) controls.target.copy(hit.point);
-    };
-    renderer.domElement.addEventListener("dblclick", onDbl);
-    const onChange = () => {
-      if (applying.current || !syncRef.current) return;
-      syncRef.current.publish({ pos: camera.position.toArray(), target: controls.target.toArray(),
-                                up: camera.up.toArray() }, me.current);
-    };
-    controls.addEventListener("change", onChange);
-    const onStart = () => { if (three.current) three.current.userMoved = true; };
-    controls.addEventListener("start", onStart);
-    renderer.domElement.addEventListener("wheel", onStart, { passive: true });
+    const quad = new THREE.PlaneGeometry(1, 1);
+    const planeQuad = newQuad(quad);
+    planeQuad.visible = false;
+    scene.add(planeQuad);
     const axes = makeAxes();
     renderer.autoClear = false;
     const draw = () => {
@@ -290,24 +301,60 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
       renderer.setScissorTest(false);
       renderer.setViewport(0, 0, w, h);
     };
-    three.current = { scene, camera, renderer, controls, meshes: new Map(), plane: null,
-                      lines: new Map(), extra: [], draw, userMoved: false, seen: new Set() };
+    // Drawn on demand: invalidate() asks for one frame; frames only follow each other while the
+    // damping of the controls still moves the camera.
+    let raf = 0, dirty = true;
+    const frame = () => {
+      raf = 0;
+      if (!el.clientWidth) return;  // hidden tab: the resize when it is shown again asks for a frame
+      const moving = controls.update();
+      if (dirty || moving) { dirty = false; draw(); }
+      if (moving && !raf) raf = requestAnimationFrame(frame);
+    };
+    const invalidate = () => { dirty = true; if (!raf) raf = requestAnimationFrame(frame); };
+    const t = three.current = { scene, camera, renderer, controls, meshes: new Map<string, Slot>(), plane: planeQuad, quad,
+                                lines: new Map<string, LineSlot>(), extra: [] as THREE.Mesh[], draw, invalidate,
+                                userMoved: false as boolean, seen: new Set<string>() };
+    const onDbl = (e: MouseEvent) => {
+      const r = renderer.domElement.getBoundingClientRect();
+      const ray = new THREE.Raycaster();
+      ray.setFromCamera(new THREE.Vector2((e.clientX - r.left) / r.width * 2 - 1,
+                                          -(e.clientY - r.top) / r.height * 2 + 1), camera);
+      const objs: THREE.Object3D[] = [...[...t.meshes.values()].map((s) => s.mesh), ...(t.plane.visible ? [t.plane] : []), ...t.extra];
+      const hit = ray.intersectObjects(objs, false)[0];
+      if (hit) { controls.target.copy(hit.point); invalidate(); }
+    };
+    renderer.domElement.addEventListener("dblclick", onDbl);
+    // every camera move (drag, wheel, buttons, a linked camera): keep the clip planes around the
+    // distance to the target, so zooming in does not cut the geometry open, and draw
+    const onChange = () => {
+      const d = camera.position.distanceTo(controls.target);
+      if (d > 0 && (camera.near > d / 20 || camera.near < d / 400 || camera.far < d * 4)) {
+        camera.near = d / 20;
+        camera.far = Math.max(camera.far, d * 10);
+        camera.updateProjectionMatrix();
+      }
+      invalidate();
+      if (applying.current || !syncRef.current) return;
+      syncRef.current.publish({ pos: camera.position.toArray(), target: controls.target.toArray(),
+                                up: camera.up.toArray() }, me.current);
+    };
+    controls.addEventListener("change", onChange);
+    const onStart = () => { t.userMoved = true; };
+    controls.addEventListener("start", onStart);
+    renderer.domElement.addEventListener("wheel", onStart, { passive: true });
     const resize = () => {
       const w = el.clientWidth, h = el.clientHeight;
       if (!w || !h) return;  // hidden tab
       renderer.setSize(w, h);
       camera.aspect = w / Math.max(h, 1);
       camera.updateProjectionMatrix();
+      invalidate();
     };
     resize();
     const ro = new ResizeObserver(resize);
     ro.observe(el);
-    let raf = 0;
-    const loop = () => {
-      if (el.clientWidth) { controls.update(); draw(); }
-      raf = requestAnimationFrame(loop);
-    };
-    loop();
+    invalidate();
     return () => {
       cancelAnimationFrame(raf);
       ro.disconnect();
@@ -315,8 +362,16 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
       controls.removeEventListener("start", onStart);
       renderer.domElement.removeEventListener("wheel", onStart);
       renderer.domElement.removeEventListener("dblclick", onDbl);
+      // free what this pane holds: shared geometries (their GPU copies go when no pane shows them),
+      // materials, plane textures, lines, the gizmo, and the WebGL context itself
+      t.meshes.forEach((s) => { releaseGeo(s.mesh.geometry); (s.mesh.material as THREE.Material).dispose(); });
+      t.lines.forEach((s) => { s.obj.geometry.dispose(); (s.obj.material as THREE.Material).dispose(); });
+      [t.plane, ...t.extra].forEach(dropQuad);
+      quad.dispose();
+      axes.dispose();
       controls.dispose();
       renderer.dispose();
+      renderer.forceContextLoss();
       el.removeChild(renderer.domElement);
       three.current = null;
     };
@@ -334,12 +389,18 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
       t.controls.update();
       applying.current = false;
       t.userMoved = true;
+      t.invalidate();
     };
     if (sync.last) apply(sync.last);
     return sync.subscribe((s, from) => { if (from !== me.current) apply(s); });
   }, [sync]);
 
-  useEffect(() => { three.current?.renderer.setClearColor(background); }, [background]);
+  useEffect(() => {
+    const t = three.current;
+    if (!t) return;
+    t.renderer.setClearColor(background);
+    t.invalidate();
+  }, [background]);
 
   const [mode, setMode] = useState<"rotate" | "pan" | "box">("rotate");
   const [rect, setRect] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
@@ -352,103 +413,113 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
       : { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
   }, [mode]);
 
-  // streamline layers (rebuilt when url or coloring changes)
+  // streamline layers: one object per layer key; the lines of a new url replace it when they have
+  // arrived, a new color or range only recolors it
+  const wantLines = useRef(new Map<string, LineLayer>());
   useEffect(() => {
     const t = three.current;
     if (!t) return;
-    const sig = (l: LineLayer) => JSON.stringify([l.key, l.url, l.color, l.cmap, l.range, l.log]);
-    const want = new Map(lines.map((l) => [sig(l), l]));
-    for (const [k, o] of t.lines) {
-      if (!want.has(k)) {
-        t.scene.remove(o);
-        o.geometry.dispose();
-        (o.material as THREE.Material).dispose();
-        t.lines.delete(k);
-      }
+    setLineErr(null);
+    wantLines.current = new Map(lines.map((l) => [l.key, l]));
+    const sigOf = (l: LineLayer) => JSON.stringify(l.color ? [l.color] : [l.cmap, l.range, l.log]);
+    const drop = (s: LineSlot) => { t.scene.remove(s.obj); s.obj.geometry.dispose(); (s.obj.material as THREE.Material).dispose(); };
+    for (const [k, s] of t.lines) {
+      if (!wantLines.current.has(k)) { drop(s); t.lines.delete(k); t.invalidate(); }
     }
-    let live = true;
-    for (const [k, l] of want) {
-      if (t.lines.has(k)) continue;
-      setLoading((n) => n + 1);
-      loadLines(l.url).then((d) => linesObject(d, l)).then((o) => {
-        const tt = three.current;
-        if (!live || !tt || tt.lines.has(k)) { o.geometry.dispose(); return; }
-        tt.scene.add(o);
-        tt.lines.set(k, o);
-      }).catch((e) => setError(`streamlines: ${e.message ?? e}`))
-        .finally(() => setLoading((n) => n - 1));
-    }
-    return () => { live = false; };
-  }, [lines]);
-
-  // mesh layers: a layer's previous mesh (e.g. the last time step) stays on screen until
-  // its replacement is decoded, so playback does not blink
-  useEffect(() => {
-    const t = three.current;
-    if (!t) return;
-    const visible = layers.filter((l) => l.visible);
-    const wantKeys = new Set(visible.map((l) => l.key));
-    const wantIds = new Set(visible.map((l) => l.key + l.url));
-    for (const [k, m] of t.meshes) {
-      if (!wantKeys.has(m.userData.layerKey)) {
-        t.scene.remove(m);
-        (m.material as THREE.Material).dispose();
-        t.meshes.delete(k);
-      }
-    }
-    for (const l of visible) {
-      const k = l.key + l.url;
-      const existing = t.meshes.get(k);
-      if (existing) {
-        const mat = existing.material as THREE.MeshStandardMaterial;
-        mat.color.set(l.color);
-        mat.opacity = l.opacity;
-        mat.transparent = l.opacity < 1;
-        mat.depthWrite = l.opacity >= 1;
-        if (mat.flatShading === !!l.smooth) { mat.flatShading = !l.smooth; mat.needsUpdate = true; }
+    for (const l of lines) {
+      const s = t.lines.get(l.key);
+      if (s && s.url === l.url && s.reload === reload) {
+        if (s.sig !== sigOf(l)) { s.sig = sigOf(l); colorLines(s.obj, s.data, l).then(() => three.current?.invalidate()); }
         continue;
       }
       setLoading((n) => n + 1);
-      loadMesh(l.url).then((g) => {
-        const tt = three.current;
-        if (!tt || tt.meshes.has(k)) return;
-        const mat = new THREE.MeshStandardMaterial({
-          color: l.color, opacity: l.opacity, transparent: l.opacity < 1, flatShading: !l.smooth,
-          depthWrite: l.opacity >= 1, side: THREE.DoubleSide, metalness: 0.1, roughness: 0.7,
-        });
-        const m = new THREE.Mesh(g, mat);
-        m.userData.layerKey = l.key;
-        tt.scene.add(m);
-        tt.meshes.set(k, m);
-        // the replaced version of this layer (previous time step) goes now
-        for (const [kk, mm] of tt.meshes) {
-          if (kk !== k && mm.userData.layerKey === l.key && !wantIds.has(kk)) {
-            tt.scene.remove(mm);
-            (mm.material as THREE.Material).dispose();
-            tt.meshes.delete(kk);
-          }
-        }
-        if (!tt.userMoved && !tt.seen.has(l.key)) { tt.seen.add(l.key); fit(ISO); }
-      }).catch((e) => setError(`${l.key}: ${e.message ?? e}`))
+      loadLines(l.url).then(async (d) => {
+        const here = () => three.current === t && wantLines.current.get(l.key)?.url === l.url;
+        const has = () => { const x = t.lines.get(l.key); return !!x && x.url === l.url && x.reload === reload; };
+        if (!here() || has()) return;
+        const obj = linesObject(d), cur = wantLines.current.get(l.key)!;
+        await colorLines(obj, d, cur);
+        if (!here() || has()) { obj.geometry.dispose(); (obj.material as THREE.Material).dispose(); return; }
+        const old = t.lines.get(l.key);
+        if (old) drop(old);
+        t.scene.add(obj);
+        const slot: LineSlot = { obj, url: l.url, reload, data: d, sig: sigOf(cur) };
+        t.lines.set(l.key, slot);
+        const now = wantLines.current.get(l.key)!;  // the coloring may have changed while it loaded
+        if (sigOf(now) !== slot.sig) { slot.sig = sigOf(now); colorLines(obj, d, now).then(() => t.invalidate()); }
+        t.invalidate();
+      }).catch((e) => setLineErr(`streamlines: ${e.message ?? e}`))
         .finally(() => setLoading((n) => n - 1));
     }
-  }, [layers]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [lines, reload]);
 
-  // textured plane
+  // mesh layers: one mesh and material per layer key. The geometry of a new url (time step) is
+  // swapped in when it has been decoded, so the previous one stays on screen meanwhile; a geometry
+  // that is no longer wanted when it arrives (newer time step, layer switched off) is not used,
+  // and its download is given up unless a prefetch asked for it too
+  const wanted = useRef(new Map<string, MeshLayer>());
   useEffect(() => {
     const t = three.current;
     if (!t) return;
-    if (t.plane) {
-      t.scene.remove(t.plane);
-      disposeMesh(t.plane);
-      t.plane = null;
+    setMeshErr(null);
+    const visible = layers.filter((l) => l.visible);
+    wanted.current = new Map(visible.map((l) => [l.key, l]));
+    for (const [k, s] of t.meshes) {
+      if (wanted.current.has(k)) continue;
+      t.scene.remove(s.mesh);
+      releaseGeo(s.mesh.geometry);
+      (s.mesh.material as THREE.Material).dispose();
+      t.meshes.delete(k);
+      t.invalidate();
     }
-    if (!plane) return;
+    const ac = new AbortController();
+    for (const l of visible) {
+      const s = t.meshes.get(l.key);
+      if (s) {
+        styleMesh(s.mesh, l);
+        t.invalidate();
+        if (s.url === l.url && s.reload === reload) continue;
+      }
+      setLoading((n) => n + 1);
+      meshes.get(l.url, ac.signal).then((g) => {
+        const cur = wanted.current.get(l.key);
+        if (three.current !== t || !cur || cur.url !== l.url) return;
+        const slot = t.meshes.get(l.key);
+        if (slot && slot.url === l.url && slot.reload === reload) return;
+        holdGeo(g);
+        if (slot) {
+          releaseGeo(slot.mesh.geometry);
+          slot.mesh.geometry = g;
+          slot.url = l.url;
+          slot.reload = reload;
+          styleMesh(slot.mesh, cur);
+        } else {
+          const mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ side: THREE.DoubleSide, metalness: 0.1, roughness: 0.7 }));
+          styleMesh(mesh, cur);
+          t.scene.add(mesh);
+          t.meshes.set(l.key, { mesh, url: l.url, reload });
+        }
+        if (!t.userMoved && !t.seen.has(l.key)) { t.seen.add(l.key); fit(ISO); }
+        t.invalidate();
+      }).catch((e) => { if (!isAbort(e)) setMeshErr(`${l.key}: ${e.message ?? e}`); })
+        .finally(() => setLoading((n) => n - 1));
+    }
+    return () => ac.abort();
+  }, [layers, reload]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // textured plane: one quad and material, a new texture per plane / coloring
+  useEffect(() => {
+    const t = three.current;
+    if (!t) return;
+    if (!plane) {
+      if (t.plane.visible) { t.plane.visible = false; t.invalidate(); }
+      return;
+    }
     let live = true;
     const lic = overlay?.lic && overlay.lic.length === plane.w * plane.h * overlay.licScale ** 2
       ? overlay.lic : null;
     cmapLut(cmap).then((lut) => {
-      if (!live || !three.current) return;
+      if (!live || three.current !== t) return;
       const s = lic ? overlay!.licScale : smooth ? 2 : 1;
       let px: Uint8ClampedArray<ArrayBuffer>;
       if (smooth) {
@@ -458,36 +529,37 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
         const base = colorize(plane.data, plane.w, plane.h, lut, range[0], range[1], log, false, hexRgb(background));
         px = lic ? shadeLic(base, plane.w, plane.h, lic, s, overlay!.licMode, false) : base;
       }
-      const m = planeMesh(plane, px, s, smooth);
-      three.current.scene.add(m);
-      three.current.plane = m;
-      if (!three.current.userMoved && !three.current.seen.has("plane")) { three.current.seen.add("plane"); fit(ISO); }
+      setQuad(t.plane, plane, px, s, smooth);
+      t.plane.visible = true;
+      if (!t.userMoved && !t.seen.has("plane")) { t.seen.add("plane"); fit(ISO); }
+      t.invalidate();
     });
     return () => { live = false; };
-  }, [plane, cmap, range, log, overlay?.lic, overlay?.licMode, background, smooth]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [plane, cmap, range[0], range[1], log, overlay?.lic, overlay?.licMode, overlay?.licScale, background, smooth]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // additional planes (e.g. the three center planes), colored like the main plane
+  // additional planes (e.g. the three center planes), colored like the main plane; quads are reused
   useEffect(() => {
     const t = three.current;
     if (!t) return;
-    t.extra.forEach((m) => { t.scene.remove(m); disposeMesh(m); });
-    t.extra = [];
-    if (!extraPlanes.length) return;
+    const trim = (n: number) => {
+      while (t.extra.length > n) { const m = t.extra.pop()!; t.scene.remove(m); dropQuad(m); t.invalidate(); }
+    };
+    if (!extraPlanes.length) { trim(0); return; }
     let live = true;
     cmapLut(cmap).then((lut) => {
-      const tt = three.current;
-      if (!live || !tt) return;
-      for (const p of extraPlanes) {
+      if (!live || three.current !== t) return;
+      extraPlanes.forEach((p, i) => {
+        if (!t.extra[i]) { t.extra[i] = newQuad(t.quad); t.scene.add(t.extra[i]); }
         const s = smooth ? 2 : 1;
         const d = smooth ? upsample(p.data, p.w, p.h, s) : p.data;
-        const m = planeMesh(p, colorize(d, p.w * s, p.h * s, lut, range[0], range[1], log, false, hexRgb(background)), s, smooth);
-        tt.scene.add(m);
-        tt.extra.push(m);
-      }
-      if (!tt.userMoved && !tt.seen.has("extra")) { tt.seen.add("extra"); fit(ISO); }
+        setQuad(t.extra[i], p, colorize(d, p.w * s, p.h * s, lut, range[0], range[1], log, false, hexRgb(background)), s, smooth);
+      });
+      trim(extraPlanes.length);
+      if (!t.userMoved && !t.seen.has("extra")) { t.seen.add("extra"); fit(ISO); }
+      t.invalidate();
     });
     return () => { live = false; };
-  }, [extraPlanes, cmap, range, log, background, smooth]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [extraPlanes, cmap, range[0], range[1], log, background, smooth]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const ISO: [number, number, number] = [1 / Math.sqrt(3), 1 / Math.sqrt(3), 1 / Math.sqrt(3)];
 
@@ -498,8 +570,8 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
     const t = three.current;
     if (!t) return;
     const box = new THREE.Box3();
-    t.meshes.forEach((m) => box.expandByObject(m));
-    if (t.plane) box.expandByObject(t.plane);
+    t.meshes.forEach((s) => box.expandByObject(s.mesh));
+    if (t.plane.visible) box.expandByObject(t.plane);
     t.extra.forEach((m) => box.expandByObject(m));
     if (box.isEmpty()) return;
     const c = box.getCenter(new THREE.Vector3());
@@ -525,15 +597,18 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
     t.camera.near = Math.max(1e-5, (dist - r) / 10);
     t.camera.far = (dist + r) * 10;
     t.camera.updateProjectionMatrix();
+    t.invalidate();
   }
 
-  function view(dir: [number, number, number], up: [number, number, number] = [0, 1, 0]) {
+  // camera.up stays +y, the orbit axis of the controls (they fix it when they are created), so
+  // rotating after any of these views behaves; a view along y is tilted by 0.06 degrees instead
+  function view(dir: [number, number, number]) {
     const t = three.current;
     if (!t) return;
     t.userMoved = true;
     const d = t.camera.position.distanceTo(t.controls.target);
-    t.camera.up.set(...up);
-    t.camera.position.copy(t.controls.target).add(new THREE.Vector3(...dir).multiplyScalar(d));
+    t.camera.position.copy(t.controls.target).add(new THREE.Vector3(...dir).normalize().multiplyScalar(d));
+    t.invalidate();
   }
 
   function zoom(f: number) {
@@ -541,16 +616,7 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
     if (!t) return;
     const off = t.camera.position.clone().sub(t.controls.target).multiplyScalar(f);
     t.camera.position.copy(t.controls.target).add(off);
-    keepNear();
-  }
-
-  function keepNear() {
-    const t = three.current!;
-    const d = t.camera.position.distanceTo(t.controls.target);
-    if (t.camera.near > d / 20) {
-      t.camera.near = d / 20;
-      t.camera.updateProjectionMatrix();
-    }
+    t.invalidate();
   }
 
   // zoom so the dragged rectangle (CSS px in the canvas) fills the view
@@ -570,21 +636,26 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
     const off = t.camera.position.clone().sub(t.controls.target).multiplyScalar(f);
     t.controls.target.copy(hit);
     t.camera.position.copy(hit).add(off);
-    keepNear();
+    t.invalidate();
   }
 
-  // look straight at the slice plane (u to the right, v up) with the target on it
+  // look straight at the slice plane (u to the right, v up) with the target on it. A y-normal
+  // plane (v = z) is seen from below with a tilt of 0.06 degrees towards z: with up = +y that
+  // puts z up on screen (see view)
   function facePlane() {
     const t = three.current;
     if (!t || !plane) return;
+    t.userMoved = true;
     const d = t.camera.position.distanceTo(t.controls.target);
     const n = new THREE.Vector3().setComponent(plane.axis, 1);
     const u = new THREE.Vector3().setComponent(plane.uAxis, 1);
     const v = new THREE.Vector3().setComponent(plane.vAxis, 1);
     const s = -n.clone().cross(v).dot(u);
     t.controls.target.setComponent(plane.axis, plane.pos);
-    t.camera.up.copy(v);
-    t.camera.position.copy(t.controls.target).add(n.multiplyScalar(s * d));
+    const dir = n.multiplyScalar(s);
+    if (plane.axis === 1) dir.addScaledVector(v, -s * 1e-3).normalize();
+    t.camera.position.copy(t.controls.target).add(dir.multiplyScalar(d));
+    t.invalidate();
   }
 
   const showLegend = !!legend && (!!plane || extraPlanes.length > 0 || lines.some((l) => !l.color));
@@ -632,12 +703,12 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
         <button onClick={facePlane} disabled={!plane} title="look straight at the slice plane">Plane</button>
         <button onClick={() => view([0, 0, 1])}>Front</button>
         <button onClick={() => view([1, 0, 0])}>Side</button>
-        <button onClick={() => view([0, 1, 0], [0, 0, -1])}>Top</button>
+        <button onClick={() => view([0, 1, 1e-3])}>Top</button>
         <button onClick={() => view(ISO)}
                 title="isometric: equal angles to x, y and z, y up">Iso</button>
         <button onClick={snapshot} title="PNG with legend">PNG</button>
         {loading > 0 && <span className="muted">loading {loading}...</span>}
-        {error && <span className="error">{error}</span>}
+        {(meshErr || lineErr) && <span className="error">{[meshErr, lineErr].filter(Boolean).join("; ")}</span>}
       </div>
       <div className="viewer3d-wrap" title={`${tips[mode]}; wheel: zoom; double-click: set rotation center`}>
         <div ref={host} className="viewer3d-canvas" style={{ height }} />
@@ -669,3 +740,6 @@ export default function Viewer3D({ layers, plane, cmap, range, log, height = 560
     </div>
   );
 }
+
+// re-rendered only when a prop really changes (ranges, legends and overlays are compared by value)
+export default memo(Viewer3D, sameProps);

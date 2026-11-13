@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import csv
+import functools
 import json
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -36,11 +38,12 @@ def all_cases(details: bool = True, me: Identity | None = Depends(current_user))
     user = me.user if me else None
     for f in sorted(config.PROJECTS_DIR.glob("*/project.json")):
         try:
-            p = json.loads(f.read_text())
+            with _editing(f.parent.name):
+                p = json.loads(f.read_text())
+                if caseid.ensure_uids(p, user, taken):
+                    save(p)
         except (OSError, ValueError):
             continue
-        if caseid.ensure_uids(p, user, taken):
-            save(p)
         for c in p["cases"]:
             r = rows.setdefault(c["uid"], {
                 "uid": c["uid"], "path": c["path"], "stats_dir": c["stats_dir"],
@@ -73,9 +76,29 @@ def load(pid: str) -> dict:
 def save(p: dict) -> None:
     d = config.PROJECTS_DIR / p["id"]
     d.mkdir(parents=True, exist_ok=True)
-    tmp = d / "project.json.tmp"
+    tmp = d / f"project.json.{os.getpid()}.{threading.get_ident()}.tmp"
     tmp.write_text(json.dumps(p, indent=2))
     tmp.replace(d / "project.json")
+
+
+_locks: dict[str, threading.RLock] = {}
+_locks_guard = threading.Lock()
+
+
+def _editing(pid: str) -> threading.RLock:
+    """Lock of one project's project.json. Every load-change-save runs under it, so two
+    requests arriving together (two cases ticked quickly) cannot drop each other's change."""
+    with _locks_guard:
+        return _locks.setdefault(pid, threading.RLock())
+
+
+def _locked(fn):
+    """Run an endpoint that changes project.json under that project's lock."""
+    @functools.wraps(fn)
+    def run(pid: str, *args, **kw):
+        with _editing(pid):
+            return fn(pid, *args, **kw)
+    return run
 
 
 def _discover(root: Path, old: dict | None = None) -> tuple[bool, list[dict]]:
@@ -153,9 +176,10 @@ def create_project(body: NewProject, me: Identity = Depends(require_user)) -> di
 @router.get("/{pid}")
 def get_project(pid: str, details: bool = True, refresh: bool = False,
                 me: Identity | None = Depends(current_user)) -> dict:
-    p = load(pid)
-    if caseid.ensure_uids(p, me.user if me else None):  # projects created before case ids existed
-        save(p)
+    with _editing(pid):
+        p = load(pid)
+        if caseid.ensure_uids(p, me.user if me else None):  # projects created before case ids existed
+            save(p)
     if refresh:
         for c in p["cases"]:
             cases.forget(Path(c["path"]), Path(c["stats_dir"]))
@@ -193,6 +217,7 @@ def _safe_info(c: dict) -> dict | None:
 
 
 @router.patch("/{pid}")
+@_locked
 def patch_project(pid: str, body: ProjectPatch, me: Identity = Depends(require_user)) -> dict:
     p = load(pid)
     if body.name is not None:
@@ -231,6 +256,7 @@ class Relocate(BaseModel):
 
 
 @router.post("/{pid}/relocate")
+@_locked
 def relocate(pid: str, body: Relocate, me: Identity = Depends(require_user)) -> dict:
     """Point a project at moved/renamed data: a new root moves every case that was
     under the old root along with it; cases maps case ids to new case folders. Case
@@ -264,6 +290,7 @@ def relocate(pid: str, body: Relocate, me: Identity = Depends(require_user)) -> 
 
 
 @router.post("/{pid}/rediscover")
+@_locked
 def rediscover(pid: str, me: Identity = Depends(require_user)) -> dict:
     p = load(pid)
     p["single"], p["cases"] = _discover(safe_path(p["root"]), p)
@@ -428,6 +455,9 @@ def run_variables(pid: str) -> list[dict]:
                     e["kind"] = "table"
                 out.append({"run": r.name, "path": rel, "case": cid, **e})
     return out
+
+
+@router.delete("/{pid}/runs/{name}")
 def delete_run(pid: str, name: str, me: Identity = Depends(require_user)) -> dict:
     r = safe_child(_dir(pid) / "runs", name)
     p = load(pid)
@@ -524,6 +554,37 @@ def run_series(pid: str, name: str, file: str, columns: list[str] = Query(...),
     return out
 
 
+@router.get("/{pid}/runs/{name}/series_stats")
+def run_series_stats(pid: str, name: str, file: str, columns: list[str] = Query(...),
+                     cases: list[str] | None = Query(None), t_from: float | None = None,
+                     t_to: float | None = None) -> dict:
+    """{case: {column: n, mean, std, min, max for t_from <= t <= t_to, last}} from every
+    row of <run>/<case>/<file> (the /series points are decimated)."""
+    if Path(file).name != file or not file.endswith(".csv"):
+        raise HTTPException(422, "file must be a CSV name")
+    p = load(pid)
+    run = safe_child(_dir(pid) / "runs", name)
+    out = {}
+    for cid, d in _case_dirs(p, run).items():
+        if cases and cid not in cases or not (d / file).is_file():
+            continue
+        f = safe_child(run, (d / file).relative_to(run).as_posix())
+        with open(f, newline="") as fh:
+            reader = csv.reader(fh)
+            hdr = next(reader, [])
+            rows = [r for r in reader if r]
+        if not hdr or not _is_time(hdr[0]):
+            raise HTTPException(422, f"{file} has no time_s column")
+
+        def col(j: int) -> np.ndarray:
+            vals = (_num(r[j]) if j < len(r) else None for r in rows)
+            return np.array([v if isinstance(v, float) else np.nan for v in vals], float)
+        t = col(0)
+        out[cid] = {c: cases_mod.window_stats(t, col(hdr.index(c)), t_from, t_to)
+                    for c in columns if c in hdr}
+    return out
+
+
 # ------------------------------------------------------------------ files
 
 @router.post("/{pid}/rename-body")
@@ -571,11 +632,13 @@ def get_csv(pid: str, path: str, max_rows: int = 50000) -> dict:
             columns = next(reader)
         except StopIteration:
             return {"columns": [], "rows": [], "truncated": False}
+        # ids stay text: a case folder named 0100 or 1e3 must not come back as a number
+        ids = {i for i, c in enumerate(columns) if c.strip().lower() == "case"}
         rows = []
         for i, r in enumerate(reader):
             if i >= max_rows:
                 return {"columns": columns, "rows": rows, "truncated": True}
-            rows.append([_num(v) for v in r])
+            rows.append([v if j in ids else _num(v) for j, v in enumerate(r)])
     return {"columns": columns, "rows": rows, "truncated": False}
 
 

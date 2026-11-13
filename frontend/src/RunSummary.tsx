@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { caseName, download, fmt, toCsv, type Project, type Run, type TaskDef } from "./api";
-import { COND, condOf, fmtPct, loadRunResults, meansFilesOf, pct, pickMetrics, type RunResults } from "./results";
+import { COND, condOf, fmtPct, loadRunResults, meansFilesOf, pct, PCT_HELP, pickMetrics, runStamp, type RunResults } from "./results";
 
 const dur = (a: number | null, b: number | null) => {
   if (!a || !b) return "";
@@ -27,7 +27,8 @@ export default function RunSummary({ project, run, task, onOpenFile }: {
     let live = true;
     loadRunResults(project, run).then((r) => live && setRes(r)).catch((e) => live && setError(e.message));
     return () => { live = false; };
-  }, [run.path, run.csvs.join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
+  // runStamp: a run made again keeps its folder and file names but is loaded again
+  }, [runStamp(run), run.csvs.join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const metrics = res ? pickMetrics(res.columns) : [];
   const rows = res?.rows ?? new Map<string, Record<string, string | number | null>>();
@@ -37,12 +38,12 @@ export default function RunSummary({ project, run, task, onOpenFile }: {
   const cond = (c: string, key: string) => condOf(project, c, key);
   const condCols = COND.filter((k) => ordered.some((c) => cond(c, k.key) !== null));
 
-  // non-default settings
+  // non-default settings (list parameters are stored as arrays, their defaults as text: compare both as text)
+  const flat = (x: unknown) => (Array.isArray(x) ? x.join(" ") : x) ?? null;
   const settings = (task?.params ?? []).flatMap((p) => {
     const v = prm[p.name];
     const d = p.default;
-    const same = JSON.stringify(v ?? null) === JSON.stringify(d ?? null)
-      || (Array.isArray(d) && Array.isArray(v) && d.join(" ") === v.join(" "));
+    const same = JSON.stringify(flat(v)) === JSON.stringify(flat(d));
     if (same || v === null || v === undefined || v === "") return [];
     const txt = p.type === "bool" ? (v ? "on" : "off") : Array.isArray(v) ? v.join(" ") : String(v);
     return [{ label: p.label, value: txt }];
@@ -106,7 +107,7 @@ export default function RunSummary({ project, run, task, onOpenFile }: {
       <div className="card">
         <div className="row">
           <h3 className="grow">Key results <span className="muted small">({valueNote})</span></h3>
-          {refRow && multi && <label className="small"><input type="checkbox" checked={showPct} onChange={(e) => setShowPct(e.target.checked)} /> % vs ref</label>}
+          {refRow && multi && <label className="small" title={PCT_HELP}><input type="checkbox" checked={showPct} onChange={(e) => setShowPct(e.target.checked)} /> % vs ref</label>}
           {ordered.length > 0 && <button onClick={exportCsv}>Export CSV</button>}
         </div>
         {error && <div className="error">{error}</div>}

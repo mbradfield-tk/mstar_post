@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { caseName, download, fmt, toCsv, type Project, type Run, type TaskDef } from "./api";
-import { COND, condOf, fmtPct, loadRunResults, pct, pickMetrics, type Cell, type Column, type RunResults } from "./results";
+import { COND, condOf, fmtPct, loadRunResults, newestFirst, pct, PCT_HELP, pickMetrics, runStamp, selectedCaseIds,
+         type Cell, type Column, type RunResults } from "./results";
 
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleDateString() : "");
 const STORE = "mstar_post.taskcmp";
@@ -9,7 +10,7 @@ const STORE = "mstar_post.taskcmp";
 // all finished runs of that task: per case the newest run that contains it wins, so the
 // table shows the project's current state regardless of how many runs were needed.
 export default function TaskComparison({ project, task, runs, onOpenRun }: {
-  project: Project; task: TaskDef | undefined; runs: Run[];  // runs of this task, newest first
+  project: Project; task: TaskDef | undefined; runs: Run[];  // runs of this task, in any order
   onOpenRun: (name: string) => void;
 }) {
   const taskId = task?.id ?? runs[0]?.task ?? "";
@@ -26,59 +27,66 @@ export default function TaskComparison({ project, task, runs, onOpenRun }: {
     else localStorage.removeItem(`${STORE}.${project.id}.${taskId}`);
   }, [picked, project.id, taskId]);
 
-  const done = runs.filter((r) => r.status === "done" || r.status === "unknown");
+  // finished runs, newest results first; loaded results are kept per run stamp, so a run made
+  // again (same folder name, new times) is read again
+  const done = newestFirst(runs.filter((r) => r.status === "done" || r.status === "unknown"));
+  const stamps = done.map(runStamp).join("|");
   useEffect(() => {
     let live = true;
     setError(null);
-    done.filter((r) => !loaded[r.name]).forEach((r) =>
-      loadRunResults(project, r).then((res) => live && setLoaded((m) => ({ ...m, [r.name]: res })))
+    done.filter((r) => !loaded[runStamp(r)]).forEach((r) =>
+      loadRunResults(project, r).then((res) => live && setLoaded((m) => ({ ...m, [runStamp(r)]: res })))
         .catch((e) => live && setError(e.message)));
     return () => { live = false; };
-  }, [done.map((r) => r.name).join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
-  const pending = done.filter((r) => !loaded[r.name]).length;
+  }, [stamps]); // eslint-disable-line react-hooks/exhaustive-deps
+  const pending = done.filter((r) => !loaded[runStamp(r)]).length;
 
-  // merge: newest run first; a case keeps the first (newest) run that has it
+  // merge: newest run first; a case keeps the first (newest) run that has it (origin = its name)
   const merged = useMemo(() => {
     const columns: Column[] = [];
+    const seen = new Set<string>(), numeric = new Set<string>();
     const rows = new Map<string, Record<string, Cell>>();
-    const origin = new Map<string, Run>();
+    const origin = new Map<string, string>();
     for (const r of done) {
-      const res = loaded[r.name];
+      const res = loaded[runStamp(r)];
       if (!res) continue;
-      res.columns.forEach((c) => !columns.some((x) => x.col === c.col) && columns.push(c));
+      res.columns.forEach((c) => { if (!seen.has(c.col)) { seen.add(c.col); columns.push(c); } });
       for (const [cid, row] of res.rows) {
-        if (!rows.has(cid)) { rows.set(cid, row); origin.set(cid, r); }
+        if (!rows.has(cid)) { rows.set(cid, row); origin.set(cid, r.name); }
       }
     }
-    return { columns, rows, origin };
-  }, [loaded, done.map((r) => r.name).join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
+    for (const row of rows.values()) for (const k in row) if (typeof row[k] === "number") numeric.add(k);
+    return { columns, rows, origin, byCol: new Map(columns.map((c) => [c.col, c])), numericCols: columns.filter((c) => numeric.has(c.col)) };
+  }, [loaded, stamps]); // eslint-disable-line react-hooks/exhaustive-deps
+  const runOf = (c: string) => done.find((r) => r.name === merged.origin.get(c));
 
-  const selected = new Set(project.cases.filter((c) => c.included).map((c) => c.id));
+  const selected = selectedCaseIds(project);  // the selected cases, or all when none is selected
   const order = new Map(project.cases.map((c, i) => [c.id, i]));
   const cases = [...merged.rows.keys()].filter((c) => !onlySelected || selected.has(c) || !order.has(c))
     .sort((a, b) => (order.get(a) ?? 1e9) - (order.get(b) ?? 1e9) || a.localeCompare(b));
-  const notRun = project.cases.filter((c) => c.included && !merged.rows.has(c.id));
+  const notRun = project.cases.filter((c) => selected.has(c.id) && !merged.rows.has(c.id));
   const nHidden = merged.rows.size - cases.length;
 
   const defaults = pickMetrics(merged.columns);
   const metrics = picked
-    ? picked.map((col) => merged.columns.find((c) => c.col === col)).filter((c): c is Column => !!c)
+    ? picked.map((col) => merged.byCol.get(col)).filter((c): c is Column => !!c)
         .map((c) => ({ ...c, label: c.col.replace(/\s*\[[^\]]*\]\s*$/, ""), unit: c.col.match(/\[([^\]]*)\]\s*$/)?.[1] ?? "" }))
     : defaults;
+  const shownCols = new Set(metrics.map((m) => m.col));
   const ref = project.ref_case && merged.rows.has(project.ref_case) ? project.ref_case : null;
   const refRow = ref ? merged.rows.get(ref) : undefined;
   const cond = (c: string, key: string) => condOf(project, c, key);
   const condCols = COND.filter((k) => cases.some((c) => cond(c, k.key) !== null));
-  const numericCols = merged.columns.filter((c) => [...merged.rows.values()].some((r) => typeof r[c.col] === "number"));
+  const numericCols = merged.numericCols;
   const colChoices = merged.columns.filter((c) => c.col.toLowerCase().includes(colFilter.toLowerCase()));
 
   const exportCsv = () => download(`${project.id}_${taskId}_comparison.csv`, toCsv(
     ["case", "run", ...COND.map((k) => k.key), ...metrics.map((m) => m.col), ...(refRow ? metrics.map((m) => `${m.col} % vs ref`) : [])],
-    cases.map((c) => [c, merged.origin.get(c)?.name ?? "", ...COND.map((k) => cond(c, k.key) ?? ""),
+    cases.map((c) => [c, merged.origin.get(c) ?? "", ...COND.map((k) => cond(c, k.key) ?? ""),
       ...metrics.map((m) => merged.rows.get(c)?.[m.col] ?? ""),
       ...(refRow ? metrics.map((m) => { const p = pct(merged.rows.get(c)?.[m.col] ?? null, refRow[m.col] ?? null); return p === null ? "" : p; }) : [])])));
 
-  const valueNotes = [...new Set(Object.values(loaded).map((r) => r.valueNote).filter((v) => v !== "none"))];
+  const valueNotes = [...new Set(done.map((r) => loaded[runStamp(r)]?.valueNote).filter((v): v is string => !!v && v !== "none"))];
   return (
     <div className="overview">
       <div className="card">
@@ -99,7 +107,7 @@ export default function TaskComparison({ project, task, runs, onOpenRun }: {
         <div className="row">
           <h3 className="grow">Cases compared <span className="muted small">({cases.length}{nHidden > 0 ? ` shown, ${nHidden} not selected` : ""})</span></h3>
           <label className="small"><input type="checkbox" checked={onlySelected} onChange={(e) => setOnlySelected(e.target.checked)} /> selected cases only</label>
-          {refRow && <label className="small"><input type="checkbox" checked={showPct} onChange={(e) => setShowPct(e.target.checked)} /> % vs ref</label>}
+          {refRow && <label className="small" title={PCT_HELP}><input type="checkbox" checked={showPct} onChange={(e) => setShowPct(e.target.checked)} /> % vs ref</label>}
           <details className="colpick">
             <summary className="small">Columns ({metrics.length}{picked ? "" : ", default"})</summary>
             <div className="row small">
@@ -110,7 +118,7 @@ export default function TaskComparison({ project, task, runs, onOpenRun }: {
             </div>
             <div className="checklist">
               {colChoices.map((c) => {
-                const on = metrics.some((m) => m.col === c.col);
+                const on = shownCols.has(c.col);
                 return <label key={c.col} className="small" title={`from ${c.source}`}><input type="checkbox" checked={on}
                   onChange={(e) => setPicked((e.target.checked ? [...metrics.map((m) => m.col), c.col] : metrics.map((m) => m.col).filter((x) => x !== c.col)))} />{c.col}</label>;
               })}
@@ -132,8 +140,8 @@ export default function TaskComparison({ project, task, runs, onOpenRun }: {
               <tbody>
                 {cases.map((c) => {
                   const row = merged.rows.get(c)!;
-                  const r = merged.origin.get(c);
-                  const stale = r && r !== done[0];
+                  const r = runOf(c);
+                  const stale = !!r && r.name !== done[0]?.name;  // by name: the run objects are new after every reload
                   return (
                     <tr key={c} className={`${c === ref ? "refrow" : ""}${order.has(c) ? "" : " excluded"}`}>
                       <td className="mono" title={`${c}\nfrom run ${r?.label ?? r?.name ?? "?"} (${when(r?.created_at ?? null)})${order.has(c) ? "" : "\nno longer in the project"}`}>
@@ -154,7 +162,7 @@ export default function TaskComparison({ project, task, runs, onOpenRun }: {
             </table>
           </div>
         )}
-        {cases.some((c) => merged.origin.get(c) !== done[0]) && done.length > 1 &&
+        {cases.some((c) => merged.origin.get(c) !== done[0]?.name) && done.length > 1 &&
           <div className="small muted">* value from an older run (the case was not part of the newest run).</div>}
         {notRun.length > 0 && (
           <div className="small muted" style={{ marginTop: 6 }}>

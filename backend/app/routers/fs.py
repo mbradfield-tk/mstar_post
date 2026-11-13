@@ -221,10 +221,11 @@ def _download(path: list[str], name: str | None, me: Identity):
 
 
 @router.post("/upload")
-async def upload(parent: str = Form(...), overwrite: bool = Form(False), files: list[UploadFile] = File(...),
-                 me: Identity = Depends(require_user)) -> dict:
+def upload(parent: str = Form(...), overwrite: bool = Form(False), files: list[UploadFile] = File(...),
+           me: Identity = Depends(require_user)) -> dict:
     """Store uploaded files in `parent` (inside the writable roots) as the logged-in user;
-    existing names are skipped unless overwrite. Per-file results in saved / skipped."""
+    existing names are skipped unless overwrite. Per-file results in saved / skipped.
+    A plain (threadpool) endpoint: copying gigabytes must not hold up the event loop."""
     if len(files) > 200:
         raise HTTPException(422, "at most 200 files per upload")
     saved, skipped = [], []
@@ -236,6 +237,6 @@ async def upload(parent: str = Form(...), overwrite: bool = Form(False), files: 
         except HTTPException as e:
             skipped.append({"name": fname, "reason": str(e.detail)})
         finally:
-            await f.close()
+            f.file.close()
     _du_cache.clear()
     return {"parent": parent, "saved": saved, "skipped": skipped}

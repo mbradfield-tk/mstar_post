@@ -857,3 +857,315 @@ def test_multi_block_volume(tmp_path):
     assert np.array_equal(arr[[0, 3], [1, 2], [0, 5]][:, 0], full[[0, 3], [1, 2], [0, 5]])
     p = vtkio.extract_plane(f, "Velocity Vector (m/s)", "0", 2, 0.015, mask=False)
     assert p["data"].shape == (5, 6) and np.array_equal(p["data"], full[1])
+
+
+def test_delete_run(client):
+    p = client.post("/api/projects", json={"name": "dr", "root": str(client.root)}).json()
+    run = config.PROJECTS_DIR / p["id"] / "runs" / "20260101-000000_stats_summary"
+    run.mkdir(parents=True)
+    (run / "batch_summary.csv").write_text("case,file,variable,mean\n")
+    url = f"/api/projects/{p['id']}/runs/{run.name}"
+    logout(client)
+    assert client.delete(url).status_code == 401
+    login(client, "bob")  # not the project owner
+    assert client.delete(url).status_code == 403
+    logout(client)
+    login(client, "tester")
+    assert client.delete(url).json() == {"deleted": run.name}
+    assert not run.exists() and client.get(f"/api/projects/{p['id']}/runs").json() == []
+
+
+def test_per_case_job_status(client):
+    """A per-case job is done while any case succeeded, whichever case failed."""
+    script = client.root / "tool.py"
+    script.write_text("import sys\nsys.exit(3 if sys.argv[1] in sys.argv[2:] else 0)\n")
+    p = client.post("/api/projects", json={"name": "st", "root": str(client.root)}).json()
+
+    def run(failing: str) -> dict:
+        j = client.post(f"/api/projects/{p['id']}/run", json={
+            "task": "custom_script", "params": {"script": str(script), "args": "{case_id} " + failing}}).json()
+        return wait(client, j["id"])
+    for failing in ("R1/caseB", "R2/caseA"):  # a middle case, the last case
+        j = run(failing)
+        assert (j["status"], j["error"], j["returncode"]) == ("done", "1 of 3 step(s) failed", 3)
+    j = run("R1/caseA R1/caseB R2/caseA")
+    assert (j["status"], j["error"]) == ("failed", "3 of 3 step(s) failed")
+
+
+def test_job_interrupted_by_shutdown(tmp_path, monkeypatch):
+    """A job still running when the backend stops must not be recorded as done."""
+    import asyncio
+    monkeypatch.setattr(config, "PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "jobs.db")
+    monkeypatch.setattr(config, "HELPER_MODE", "direct")
+
+    async def main() -> str:
+        m = jobs.JobManager()
+        await m.startup()
+        j = await m.submit("p", "custom_script", "sleeper", [{"argv": ["sleep", "30"]}],
+                           tmp_path / "projects" / "p" / "runs" / "r1", {})
+        await asyncio.sleep(0.5)
+        assert jobs.get_job(j["id"])["status"] == "running"
+        await m.shutdown()
+        return j["id"]
+    j = jobs.get_job(asyncio.run(main()))
+    assert (j["status"], j["returncode"]) == ("failed", None) and "restart" in j["error"]
+
+
+def test_surface_cache_single_builder(tmp_path, monkeypatch):
+    """Two requests for the same uncached surface: one conversion, no error, no leftovers."""
+    import threading
+    from app import vtkio
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "cache")
+    src = tmp_path / "s.vtp"
+    pv.Sphere().save(src)
+    calls = []
+    simplify = vtkio._simplify
+
+    def slow(poly, max_tris):
+        calls.append(1)
+        time.sleep(0.3)
+        return simplify(poly, max_tris)
+    monkeypatch.setattr(vtkio, "_simplify", slow)
+    out, errs = [], []
+
+    def go():
+        try:
+            out.append(vtkio.surface_stl(src, 1000, "mesh"))
+        except Exception as e:  # noqa: BLE001
+            errs.append(e)
+    threads = [threading.Thread(target=go) for _ in range(3)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert not errs and len(calls) == 1 and len(set(out)) == 1
+    assert out[0].read_bytes()[:4] == b"MPM1"
+    assert [f.name for f in (tmp_path / "cache" / "surf").iterdir()] == [out[0].name]
+
+
+def test_binary_responses_not_gzipped(client):
+    case = str(client.root / "R1" / "caseA")
+    r = client.get("/api/case/surface", headers={"Accept-Encoding": "gzip"}, params={
+        "path": case, "file": "out/Output/VolumeVOFSurface/block0/VOFSurface.1.00000e+00.vtp", "fmt": "mesh"})
+    assert r.status_code == 200 and len(r.content) > 4096 and "content-encoding" not in r.headers
+    r = client.get("/api/tasks", headers={"Accept-Encoding": "gzip"})
+    assert len(r.content) > 4096 and r.headers["content-encoding"] == "gzip"
+    r = client.get("/api/no/such/endpoint")  # not the page of the UI
+    assert r.status_code == 404 and "json" in r.headers["content-type"]
+
+
+def test_series_stats_use_every_row(client):
+    """Window statistics come from the full series: the plotted points are bucket extremes."""
+    from app import cases
+    case = client.root / "R1" / "caseA"
+    rng = np.random.default_rng(0)
+    t = np.arange(20000) * 0.01
+    v = 1.0 + 0.2 * rng.standard_normal(t.size)
+    v[5] = np.nan
+    with open(case / "out" / "Stats" / "Noise.txt", "w") as fh:
+        fh.write("Time [s]\tSignal [m/s]\tOther [-]\n")
+        fh.writelines(f"{a:.6f}\t{b:.9g}\t1\n" for a, b in zip(t, v))
+    q = {"path": str(case), "file": "Noise.txt", "columns": ["Signal [m/s]"]}
+    full = v[(t >= 100) & (t <= 150)]
+    s = client.get("/api/case/series_stats", params={**q, "t_from": 100, "t_to": 150}).json()["stats"]["Signal [m/s]"]
+    assert s["n"] == full.size and s["last"] == pytest.approx(v[-1])
+    assert (s["mean"], s["std"], s["min"], s["max"]) == pytest.approx((full.mean(), full.std(ddof=1), full.min(), full.max()))
+    plotted = client.get("/api/case/series", params=q).json()
+    pt, pv = np.array(plotted["t"]), np.array(plotted["columns"]["Signal [m/s]"], float)
+    assert len(pt) < t.size and np.nanstd(pv[(pt >= 100) & (pt <= 150)], ddof=1) > 1.2 * s["std"]  # why
+    s = client.get("/api/case/series_stats", params=q).json()["stats"]["Signal [m/s]"]
+    assert s["n"] == t.size - 1  # the NaN row is not counted
+    empty = client.get("/api/case/series_stats", params={**q, "t_from": 1e6}).json()["stats"]["Signal [m/s]"]
+    assert empty == {"n": 0, "mean": None, "std": None, "min": None, "max": None, "last": pytest.approx(v[-1])}
+    assert client.get("/api/case/series_stats", params={**q, "columns": ["nope"]}).status_code == 404
+    assert cases.window_stats(np.array([0.0, 1.0]), np.array([2.0, np.nan]))["std"] is None  # n = 1
+
+    # per-case CSVs of a run
+    p = client.post("/api/projects", json={"name": "ss", "root": str(client.root)}).json()
+    run = config.PROJECTS_DIR / p["id"] / "runs" / "r1"
+    for cid, scale in (("R1/caseA", 1.0), ("R2/caseA", 2.0)):
+        (run / cid).mkdir(parents=True)
+        (run / cid / "ua.csv").write_text("time [s],UA [W/K],note\n" + "".join(f"{i},{scale * i},x\n" for i in range(5)))
+    r = client.get(f"/api/projects/{p['id']}/runs/r1/series_stats",
+                   params={"file": "ua.csv", "columns": ["UA [W/K]", "missing"], "t_from": 1, "t_to": 3}).json()
+    assert r["R2/caseA"] == {"UA [W/K]": {"n": 3, "mean": 4.0, "std": 2.0, "min": 2.0, "max": 6.0, "last": 8.0}}
+    assert list(client.get(f"/api/projects/{p['id']}/runs/r1/series_stats",
+                           params={"file": "ua.csv", "columns": ["UA [W/K]"], "cases": ["R1/caseA"]}).json()) == ["R1/caseA"]
+
+
+def test_job_delete_does_not_block_the_event_loop(tmp_path, monkeypatch):
+    """Removing a run folder happens in a thread; the job cannot be re-run meanwhile."""
+    import asyncio
+    monkeypatch.setattr(config, "PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "jobs.db")
+    monkeypatch.setattr(config, "HELPER_MODE", "direct")
+    clear = jobs._clear_run_dir
+
+    def slow(j, recreate):
+        time.sleep(0.5)
+        return clear(j, recreate)
+
+    async def main() -> float:
+        m = jobs.JobManager()
+        await m.startup()
+        j = await m.submit("p", "custom_script", "quick", [{"argv": ["true"]}],
+                           tmp_path / "projects" / "p" / "runs" / "r1", {})
+        while jobs.get_job(j["id"])["status"] in ("queued", "running"):
+            await asyncio.sleep(0.05)
+        monkeypatch.setattr(jobs, "_clear_run_dir", slow)
+        ticks = []
+
+        async def tick():
+            while True:
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.02)
+        ticker = asyncio.create_task(tick())
+        deleting = asyncio.create_task(m.delete(j["id"]))
+        await asyncio.sleep(0.1)
+        with pytest.raises(RuntimeError):
+            await m.rerun(j["id"])
+        await deleting
+        ticker.cancel()
+        assert jobs.get_job(j["id"]) is None and not (tmp_path / "projects" / "p" / "runs" / "r1").exists()
+        await m.shutdown()
+        return float(np.diff(ticks).max())
+    assert asyncio.run(main()) < 0.25
+
+
+def test_volume_passes_in_slabs(tmp_path, monkeypatch):
+    """Whole-volume mean and fluid bounds are read slab by slab in threads: same numbers
+    whatever the slab size, also across the blocks of a multi-GPU output."""
+    from app import vtkio
+    v = tmp_path / "Volume"
+    for block, x0 in (("block0", -0.03), ("block1", 0.0)):
+        write_vti(v / block / "Volume.1.00000e+00.vti", (3, 5, 4), (x0, 0, 0), True, 1.0)
+    f = v / "block0" / "Volume.1.00000e+00.vti"
+
+    def both():
+        vtkio._volume_mean.cache_clear()
+        vtkio._fluid_bounds.cache_clear()
+        return vtkio.volume_mean(f, "Velocity Vector (m/s)", "mag", True), vtkio.fluid_bounds(f)
+    whole = both()
+    slabs = vtkio._slabs
+    monkeypatch.setattr(vtkio, "_slabs", lambda arr: slabs(arr, cells=20))  # one z layer per slab
+    assert len(vtkio._slabs(vtkio.volume_array(f, "Velocity Vector (m/s)"))) == 4
+    mean, bounds = both()
+    assert mean == pytest.approx(whole[0]) and bounds == whole[1]
+    # write_vti: fluid 1 fraction is 0 in the first 5 cells of each block, 1 elsewhere
+    vel = np.concatenate([np.arange(60).reshape(4, 5, 3)] * 2, axis=2).astype(float)
+    w = np.ones((4, 5, 6))
+    w[0, 0, :3] = w[0, 0, 3:] = 0
+    w[0, 1, :2] = w[0, 1, 3:5] = 0
+    assert mean["mean"] == pytest.approx((vel * w).sum() / w.sum()) and mean["n_cells"] == int(w.sum())
+    assert bounds["source"] == "volume fractions" and bounds["lo"] == pytest.approx([-0.025, 0.005, 0.005])
+
+
+def test_cache_is_pruned_least_recently_used_first(tmp_path, monkeypatch):
+    from app import vtkio
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(config, "CACHE_MAX_BYTES", 2500)
+    now = time.time()
+    for kind, name, age in (("surf", "old.mesh", 300), ("iso", "mid.stl", 200), ("stream", "new.bin", 100)):
+        (tmp_path / kind).mkdir(exist_ok=True)
+        (tmp_path / kind / name).write_bytes(b"x" * 1000)
+        os.utime(tmp_path / kind / name, (now - age, now - age))
+    assert vtkio._cached(tmp_path / "surf" / "old.mesh")  # used just now: the oldest file is now "mid"
+    vtkio._prune(every=0)
+    assert sorted(p.name for p in tmp_path.rglob("*") if p.is_file()) == ["new.bin", "old.mesh"]
+
+
+def test_csv_ids_log_offsets_and_page_caching(client):
+    p = client.post("/api/projects", json={"name": "misc", "root": str(client.root)}).json()
+    run = config.PROJECTS_DIR / p["id"] / "runs" / "r1"
+    run.mkdir(parents=True)
+    (run / "x_means.csv").write_text("case,Power [W]\n0100,1e3\n1e3,2\n")
+    t = client.get(f"/api/projects/{p['id']}/csv", params={"path": "runs/r1/x_means.csv"}).json()
+    assert t["rows"] == [["0100", 1000.0], ["1e3", 2.0]]  # case ids stay text
+
+    # job log read in small chunks: no byte lost or repeated, no character cut in two
+    script = client.root / "say.py"
+    script.write_text("print('ε = 1 m²/s³ → ok\\n' * 40, end='')\n")
+    j = client.post(f"/api/projects/{p['id']}/run", json={
+        "task": "custom_script", "cases": ["R2/caseA"], "params": {"script": str(script), "args": ""}}).json()
+    j = wait(client, j["id"])
+    whole = client.get(f"/api/jobs/{j['id']}/log").json()
+    assert "ε = 1 m²/s³ → ok" in whole["text"] and whole["offset"] == whole["size"]
+    text, offset = "", 0
+    while offset < whole["size"]:
+        r = client.get(f"/api/jobs/{j['id']}/log", params={"offset": offset, "limit": 13}).json()
+        assert r["offset"] > offset
+        text, offset = text + r["text"], r["offset"]
+    assert text == whole["text"] and "\ufffd" not in text
+
+    from app import main
+    if main.DIST.is_dir():  # the built UI: the page is revalidated, hashed assets are kept
+        assert client.get("/").headers["cache-control"] == "no-cache"
+        asset = next((main.DIST / "assets").glob("*.css")).name
+        assert "immutable" in client.get(f"/assets/{asset}").headers["cache-control"]
+
+
+def test_concurrent_project_edits_are_not_lost(client, monkeypatch):
+    import threading
+    from app.routers import projects as pr
+    p = client.post("/api/projects", json={"name": "lock", "root": str(client.root)}).json()
+    save = pr.save
+
+    def slow_save(proj):  # widens the window between load and save
+        time.sleep(0.02)
+        save(proj)
+    monkeypatch.setattr(pr, "save", slow_save)
+    edits = [pr.ProjectPatch(included={"R1/caseA": False}), pr.ProjectPatch(included={"R1/caseB": False}),
+             pr.ProjectPatch(included={"R2/caseA": False}), pr.ProjectPatch(notes="kept")]
+    start = threading.Barrier(len(edits))
+
+    def go(body):
+        start.wait()
+        pr.patch_project(p["id"], body, None)
+    threads = [threading.Thread(target=go, args=(b,)) for b in edits]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    after = pr.load(p["id"])
+    assert after["notes"] == "kept" and not any(c["included"] for c in after["cases"])
+    assert not list((config.PROJECTS_DIR / p["id"]).glob("*.tmp"))
+
+
+def test_restart_signals_only_its_own_job_process(tmp_path, monkeypatch):
+    """A job marked running at start-up is failed; its stored PID is signalled only when
+    that process really is the job (a PID reused after a reboot must be left alone)."""
+    import asyncio
+    import subprocess
+    monkeypatch.setattr(config, "PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "jobs.db")
+    monkeypatch.setattr(config, "HELPER_MODE", "direct")
+    jobs.init_db()
+    procs = {}
+    for name, cwd in (("mine", tmp_path / "projects" / "p" / "runs" / "mine"), ("other", tmp_path)):
+        run = tmp_path / "projects" / "p" / "runs" / name
+        run.mkdir(parents=True)
+        procs[name] = subprocess.Popen(["sleep", "30"], cwd=cwd, start_new_session=True)
+        with jobs._conn() as c:
+            c.execute(f"INSERT INTO jobs ({', '.join(jobs._COLS)}) VALUES ({', '.join('?' * len(jobs._COLS))})",
+                      (name, "p", "custom_script", name, "running", "[]", str(run), time.time(), time.time(),
+                       None, None, procs[name].pid, 0, "{}", None, "tester"))
+    try:
+        async def main():
+            m = jobs.JobManager()
+            await m.startup()
+            await m.shutdown()
+        asyncio.run(main())
+        assert procs["mine"].wait(timeout=5) == -15       # SIGTERM
+        assert procs["other"].poll() is None              # untouched
+        assert {jobs.get_job(n)["status"] for n in procs} == {"failed"}
+    finally:
+        for pr_ in procs.values():
+            pr_.kill()
+
+
+def test_marker_write_is_not_retried_on_every_load(client, monkeypatch):
+    from app import caseid
+    calls = []
+    monkeypatch.setattr(caseid, "write_marker", lambda folder, uid, user: calls.append(folder) or False)
+    p = client.post("/api/projects", json={"name": "ro", "root": str(client.root)}).json()
+    assert len(calls) == 3 and not any(c["id_written"] for c in p["cases"])
+    for _ in range(3):
+        client.get(f"/api/projects/{p['id']}")
+    assert len(calls) == 3

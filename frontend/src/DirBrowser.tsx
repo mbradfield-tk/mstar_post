@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
 
 // Folder browser over the server's allowed roots; folders that are M-Star
@@ -13,32 +13,40 @@ export default function DirBrowser({ onSelect, initial }: {
   const [error, setError] = useState<string | null>(null);
   const [typed, setTyped] = useState(initial ?? "");
   const [loading, setLoading] = useState(false);
+  // the roots as a promise: the listing of the initial folder may fail before they have arrived
+  const rootsP = useRef<Promise<string[]> | null>(null);
+  const seq = useRef(0);
+  // the root a path lies in ("/data2/x" is not inside "/data")
+  const rootOf = (p: string, rs = roots) => rs.find((r) => p === r || p.startsWith(`${r}/`));
 
   useEffect(() => {
-    api.roots().then((r) => {
-      const ok = r.filter((x) => x.exists).map((x) => x.path);
+    rootsP.current = api.roots().then((r) => r.filter((x) => x.exists).map((x) => x.path));
+    rootsP.current.then((ok) => {
       setRoots(ok);
       // fall back to the first root when the initial folder is outside the roots
-      if (!path || !ok.some((x) => path === x || path.startsWith(`${x}/`))) setPath(ok[0] ?? "");
+      if (!path || !rootOf(path, ok)) setPath(ok[0] ?? "");
     }).catch((e) => setError(String(e)));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!path) return;
+    const my = ++seq.current;  // only the reply of the newest request is shown
     setError(null);
     setLoading(true);
-    api.listDir(path).then((l) => { setListing(l); setTyped(l.path); })
-      .catch((e) => {
+    api.listDir(path).then((l) => { if (my === seq.current) { setListing(l); setTyped(l.path); } })
+      .catch(async (e) => {
         // a missing initial folder falls back to its root instead of showing an error
-        const root = roots.find((r) => path !== r && path.startsWith(`${r}/`));
-        if (path === initial && root) setPath(root); else setError(e.message);
-      }).finally(() => setLoading(false));
+        const ok = path === initial ? await (rootsP.current ?? Promise.resolve([])).catch(() => [] as string[]) : [];
+        if (my !== seq.current) return;
+        const root = rootOf(path, ok);
+        if (root && root !== path) setPath(root); else setError(e.message);
+      }).finally(() => { if (my === seq.current) setLoading(false); });
   }, [path]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="dirbrowser">
       <div className="row">
-        <select value={roots.find((r) => path.startsWith(r)) ?? ""}
+        <select value={rootOf(path) ?? ""}
                 onChange={(e) => setPath(e.target.value)}>
           {roots.map((r) => <option key={r} value={r}>{r}</option>)}
         </select>

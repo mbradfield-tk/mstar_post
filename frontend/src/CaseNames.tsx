@@ -26,7 +26,10 @@ export default function CaseNames({ project, onChange }: {
 }) {
   const [draft, setDraft] = useState<Record<string, string>>(project.aliases ?? {});
   const [error, setError] = useState<string | null>(null);
-  useEffect(() => setDraft(project.aliases ?? {}), [project.id, project.aliases]);
+  // the draft follows the saved names only when those change (or the project does): other project
+  // updates (case selection, a refresh) hand over a new but equal object and must not discard typing
+  const savedKey = JSON.stringify(project.aliases ?? {});
+  useEffect(() => setDraft(project.aliases ?? {}), [project.id, savedKey]); // eslint-disable-line react-hooks/exhaustive-deps
   const ids = project.cases.map((c) => c.id);
   const n = Object.keys(project.aliases ?? {}).length;
   const dirty = JSON.stringify(draft) !== JSON.stringify(project.aliases ?? {});

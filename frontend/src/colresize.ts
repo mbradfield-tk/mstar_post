@@ -69,10 +69,44 @@ function restore(t: HTMLTableElement) {
   t.classList.add("colfixed");
 }
 
+// Only tables whose header changed or that were just added are looked at (collected per mutation,
+// applied once per frame): the observer sees every DOM change of the app, including hidden tabs,
+// logs and plots, and must stay cheap there.
+const dirty = new Set<HTMLTableElement>();
 let scheduled = false;
 function scan() {
   scheduled = false;
-  document.querySelectorAll<HTMLTableElement>("table.grid").forEach(restore);
+  dirty.forEach((t) => { if (t.isConnected) restore(t); });
+  dirty.clear();
+}
+function mark(t: HTMLTableElement | null) {
+  if (!t) return;
+  dirty.add(t);
+  if (!scheduled) { scheduled = true; requestAnimationFrame(scan); }
+}
+// the table.grid whose header row contains (or is) the node, if any
+function headerTable(n: Node | null): HTMLTableElement | null {
+  const el = n instanceof Element ? n : n?.parentElement;
+  const t = el?.closest<HTMLTableElement>("table.grid");
+  if (!t || !el) return null;
+  if (el === t || el.tagName === "THEAD" || (el.tagName === "TBODY" && !t.tHead)) return t;
+  const tr = el.closest("tr");
+  return tr && tr === headerRow(t) ? t : null;
+}
+function onMutations(records: MutationRecord[]) {
+  // a burst (a big view mounting or updating at once): looking at every record would cost more than one pass over the tables
+  if (records.length > 200) {
+    document.querySelectorAll<HTMLTableElement>("table.grid").forEach(mark);
+    return;
+  }
+  for (const r of records) {
+    mark(headerTable(r.target));
+    r.addedNodes.forEach((n) => {
+      if (!(n instanceof Element)) return;
+      if (n.matches("table.grid")) mark(n as HTMLTableElement);
+      else if (n.firstElementChild) n.querySelectorAll<HTMLTableElement>("table.grid").forEach(mark);
+    });
+  }
 }
 
 export function installColumnResize() {
@@ -114,7 +148,6 @@ export function installColumnResize() {
     e.stopPropagation();
     reset(th.closest("table") as HTMLTableElement);
   }, true);
-  new MutationObserver(() => {
-    if (!scheduled) { scheduled = true; requestAnimationFrame(scan); }
-  }).observe(document.body, { childList: true, subtree: true, characterData: true });
+  new MutationObserver(onMutations).observe(document.body, { childList: true, subtree: true, characterData: true });
+  document.querySelectorAll<HTMLTableElement>("table.grid").forEach(mark);
 }

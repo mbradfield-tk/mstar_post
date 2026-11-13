@@ -1,11 +1,30 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { fmt } from "./api";
 import ColorLegend, { drawLegend, savePng, type LegendInfo } from "./ColorLegend";
-import { cmapLut, colorize, hexRgb, luminance, shadeLic, upsample } from "./cmap";
+import { cmapLut, colorize, hexRgb, luminance, shadeLic, smoothed, upsample } from "./cmap";
 import type { Plane } from "./plane";
 
 const AX = "xyz";
-const MAX_SMOOTH_PX = 4e6;  // cap on upsampled pixels per plane
+const MAX_SMOOTH_PX = 4e6;   // cap on upsampled pixels per plane
+const MAX_OVERLAY_PX = 6e6;  // cap on the overlay canvas (it is drawn sharper when zoomed)
+
+// Props compared for React.memo: identical, or equal by value for the small objects the parent
+// builds on every render (one level deep, arrays element by element).
+const BY_VALUE = new Set(["range", "marker", "legend", "overlay"]);
+const same1 = (a: unknown, b: unknown): boolean => Object.is(a, b)
+  || (Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => Object.is(x, b[i])));
+export function sameProps<P extends object>(prev: P, next: P): boolean {
+  const a = prev as Record<string, unknown>, b = next as Record<string, unknown>;
+  for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    const x = a[k], y = b[k];
+    if (Object.is(x, y)) continue;
+    if (!BY_VALUE.has(k) || !x || !y || typeof x !== "object" || typeof y !== "object") return false;
+    if (Array.isArray(x) || Array.isArray(y)) { if (!same1(x, y)) return false; continue; }
+    const xo = x as Record<string, unknown>, yo = y as Record<string, unknown>, ks = Object.keys(xo);
+    if (ks.length !== Object.keys(yo).length || !ks.every((q) => same1(xo[q], yo[q]))) return false;
+  }
+  return true;
+}
 
 export type Overlay = {
   lines?: Float32Array[] | null;   // streamlines in grid coordinates (see flow.ts)
@@ -24,9 +43,9 @@ export type Region = { pts: number[][]; closed: boolean; shape?: RegionShape; in
 // given height; legend inside the box, optional LIC shading and streamlines,
 // wheel zoom at the cursor and drag to pan, hover readout, click tools (two-click
 // line, polygon region, probe point; world coordinates) and PNG export of the full plane.
-export default function SliceCanvas({ plane, cmap, range, log, title, onLine, tool = "none", height = 480,
-                                      legend, overlay, exportName = "slice", background = "#f8fafc", smooth = false,
-                                      region, regionShape = "polygon", onRegionPoint, onRegionClose, onRegionDrag, onPoint, marker }: {
+function SliceCanvas({ plane, cmap, range, log, title, onLine, tool = "none", height = 480,
+                       legend, overlay, exportName = "slice", background = "#f8fafc", smooth = false,
+                       region, regionShape = "polygon", onRegionPoint, onRegionClose, onRegionDrag, onPoint, marker }: {
   plane: Plane | null;
   cmap: string;
   range: [number, number];
@@ -62,6 +81,8 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, to
   const shapeStart = useRef<number[] | null>(null);
 
   useEffect(() => { setPick(null); if (!lineMode) setLine(null); }, [lineMode]);
+  // a probe line belongs to the plane it was picked on
+  useEffect(() => { setPick(null); setLine(null); }, [plane?.axis, plane?.index]);
   useEffect(() => { setZv({ s: 1, tx: 0, ty: 0 }); }, [plane?.w, plane?.h]);
 
   // zoom by f about point (cx, cy) in the unzoomed image's pixel frame
@@ -125,20 +146,26 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, to
       cv.getContext("2d")!.putImageData(new ImageData(img, cv.width, cv.height), 0, 0);
     });
     return () => { live = false; };
-  }, [plane, cmap, range, log, lic, overlay?.licMode, background, smooth, smoothScale]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [plane, cmap, range[0], range[1], log, lic, overlay?.licMode, background, smooth, smoothScale]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const anyOverlay = !!overlay?.lines?.length || !!line || !!region?.pts.length || !!marker;
   useEffect(() => {
     const cv = over.current;
     if (!plane || !cv) return;
-    // redraw sharper when zoomed (canvas pixels scale with the zoom, capped)
-    const dpr = (window.devicePixelRatio || 1) * Math.min(4, Math.max(1, Math.round(zv.s)));
+    if (!anyOverlay) {  // nothing to draw: no backing store
+      if (cv.width > 1) { cv.width = 1; cv.height = 1; }
+      return;
+    }
+    // redraw sharper when zoomed (canvas pixels scale with the zoom), within the pixel budget
+    const dpr = Math.min((window.devicePixelRatio || 1) * Math.min(4, Math.max(1, Math.round(zv.s))),
+                         Math.sqrt(MAX_OVERLAY_PX / (cw * ch)));
     cv.width = Math.round(cw * dpr);
     cv.height = Math.round(ch * dpr);
     const ctx = cv.getContext("2d")!;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cw, ch);
     drawOverlay(ctx, plane, cw, ch, overlay, line, 1 / zv.s, region, marker);
-  }, [plane, cw, ch, overlay?.lines, overlay?.lineColor, line, zv.s, region, marker]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [plane, cw, ch, overlay?.lines, overlay?.lineColor, line, zv.s, region, marker?.join(), anyOverlay]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!plane) return <div className="slice empty muted" style={{ height }}>{title ?? "no data"}</div>;
 
@@ -231,7 +258,8 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, to
                   onMouseMove={(e) => {
                     const { c, rr, p } = world(e);
                     if (c < 0 || rr < 0 || c >= plane.w || rr >= plane.h) return;
-                    const v = plane.data[rr * plane.w + c];
+                    // smooth shading: the value that is drawn (in-plane tent over the cell and its neighbours)
+                    const v = (smooth ? smoothed(plane.data, plane.w, plane.h) : plane.data)[rr * plane.w + c];
                     setHover(`${AX[plane.uAxis]}=${fmt(p[plane.uAxis])} ${AX[plane.vAxis]}=${fmt(p[plane.vAxis])} m : ${Number.isFinite(v) ? fmt(v) : "solid"} ${plane.unit}${smooth && Number.isFinite(v) ? " (smoothed)" : ""}`);
                   }}
                   onClick={(e) => {
@@ -252,6 +280,9 @@ export default function SliceCanvas({ plane, cmap, range, log, title, onLine, to
     </div>
   );
 }
+
+// re-rendered only when a prop really changes (range, marker, legend and overlay compared by value)
+export default memo(SliceCanvas, sameProps);
 
 // streamlines (with arrowheads), the probe line, the region polygon and the probe point on a W x H display canvas
 function drawOverlay(ctx: CanvasRenderingContext2D, plane: Plane, W: number, H: number,

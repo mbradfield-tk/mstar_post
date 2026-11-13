@@ -10,8 +10,10 @@ import hashlib
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
@@ -388,8 +390,20 @@ def _moving_cached(path_s: str, mtime_ns: int, assoc: str) -> bool:
     if va is None:
         return False
     arr = volume_array(path, va["name"])
+    if np.any(np.asarray(arr[arr.shape[0] // 2]) != 0):  # one layer through the middle settles it almost always
+        return True
     step = max(1, int(2e7 // max(1, arr.shape[1] * arr.shape[2] * va["ncomp"])))
     return any(np.any(np.asarray(arr[z:z + step]) != 0) for z in range(0, arr.shape[0], step))
+
+
+_slab_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="slab")
+
+
+def _slabs(arr, cells: float = 4e6) -> list[tuple[int, int]]:
+    """z ranges of about `cells` cells each: whole-volume passes read them in parallel
+    (numpy releases the GIL), a few hundred MB in memory at a time."""
+    step = max(1, int(cells // max(1, arr.shape[1] * arr.shape[2])))
+    return [(z, min(arr.shape[0], z + step)) for z in range(0, arr.shape[0], step)]
 
 
 def _weight(path: Path, h: dict, assoc: str, take) -> tuple[np.ndarray | None, str]:
@@ -439,16 +453,22 @@ def _volume_mean(path_s: str, mtime_ns: int, name: str, comp: str, mask: bool) -
     h = header(path)
     a = find_array(h, name)
     arr = volume_array(path, name)
-    total, wsum, count, source = 0.0, 0.0, 0, "none"
-    step = max(1, int(2e7 // max(1, arr.shape[1] * arr.shape[2])))  # ~20 M cells per slab
-    for z in range(0, arr.shape[0], step):
-        v = reduce_comp(np.asarray(arr[z:z + step]), comp, a["ncomp"]).astype(np.float64)
-        w, source = _weight(path, h, a["assoc"], lambda x: x[z:z + step]) if mask else (None, "none")
-        w = np.ones_like(v) if w is None else w.astype(np.float64)
+    # the kind of mask is the same for every slab; asking once also settles the at-rest check
+    source = _weight(path, h, a["assoc"], lambda x: x[:1])[1] if mask else "none"
+
+    def part(zs: tuple[int, int]) -> tuple[float, float, int]:
+        z0, z1 = zs
+        v = reduce_comp(np.asarray(arr[z0:z1]), comp, a["ncomp"])
+        w = _weight(path, h, a["assoc"], lambda x: x[z0:z1])[0] if source != "none" else None
+        if w is None:
+            w = np.ones(v.shape, np.float32)
         ok = np.isfinite(v) & (w > 0)
-        total += float((v[ok] * w[ok]).sum())
-        wsum += float(w[ok].sum())
-        count += int(ok.sum())
+        w = np.where(ok, w, np.float32(0))
+        v = np.where(ok, v, np.float32(0))
+        return (float(np.dot(v.ravel().astype(np.float64), w.ravel().astype(np.float64))),
+                float(w.sum(dtype=np.float64)), int(ok.sum()))
+    parts = list(_slab_pool.map(part, _slabs(arr)))
+    total, wsum, count = (sum(p[i] for p in parts) for i in range(3))
     cell = float(np.prod(h["spacing"]))
     return {"mean": total / wsum if wsum else None, "n_cells": count, "unit": a["unit"],
             "time": h["time"], "masked": source != "none", "mask": source, "fluid_volume": wsum * cell}
@@ -531,15 +551,27 @@ def _fluid_bounds(path_s: str, mtime_ns: int) -> dict:
     so, sp = np.array(sample_origin(h, assoc)), np.array(h["spacing"])
     fr = _fraction_names(h, assoc)
     lo_i, hi_i, source = np.zeros(3, int), np.array(dims) - 1, "grid"
-    w, how = _weight(path, h, assoc, lambda a: a) if len(fr) >= 2 or _velocity_array(h, assoc) else (None, "none")
-    if w is None and len(fr) == 1:
-        w, how = np.asarray(volume_array(path, fr[0]), np.float32), "volume fractions"
-    if w is not None:
+    by_weight = len(fr) >= 2 or _velocity_array(h, assoc) is not None
+    how = _weight(path, h, assoc, lambda a: a[:1])[1] if by_weight else "none"
+    if how == "none" and len(fr) == 1:
+        how = "volume fractions"
+
+    def part(zs: tuple[int, int]):
+        """Fluid flags of one slab projected on z, y and x (the whole array is never in memory)."""
+        z0, z1 = zs
+        w = _weight(path, h, assoc, lambda a: a[z0:z1])[0] if by_weight else None
+        if w is None:
+            w = np.asarray(volume_array(path, fr[0])[z0:z1], np.float32)
         fluid = w >= 0.5  # (z, y, x)
-        if fluid.any():
+        return fluid.any(axis=(1, 2)), fluid.any(axis=(0, 2)), fluid.any(axis=(0, 1))
+    if how != "none":
+        parts = list(_slab_pool.map(part, _slabs(volume_array(path, (fr or [_velocity_array(h, assoc)["name"]])[0]))))
+        along = (np.logical_or.reduce([p[2] for p in parts]), np.logical_or.reduce([p[1] for p in parts]),
+                 np.concatenate([p[0] for p in parts]))  # x, y, z
+        if along[0].any():
             source = how
-            for ax, other in ((0, (0, 1)), (1, (0, 2)), (2, (1, 2))):
-                idx = np.flatnonzero(fluid.any(axis=other))
+            for ax in range(3):
+                idx = np.flatnonzero(along[ax])
                 lo_i[ax], hi_i[ax] = idx[0], idx[-1]
     lo, hi = so + lo_i * sp, so + hi_i * sp
     return {"lo": lo.tolist(), "hi": hi.tolist(), "center": ((lo + hi) / 2).tolist(),
@@ -639,6 +671,83 @@ def _cache_path(kind: str, *key, ext: str = ".stl") -> Path:
     return d / f"{digest}{ext}"
 
 
+_build_locks: dict[str, threading.Lock] = {}
+_build_guard = threading.Lock()
+
+
+@contextmanager
+def _building(out: Path):
+    """One builder per cache file: a second request for the same output (the Viewer asks
+    for a surface while it is being warmed) waits here and then finds the file."""
+    key = str(out)
+    with _build_guard:
+        lock = _build_locks.setdefault(key, threading.Lock())
+    try:
+        with lock:
+            yield
+    finally:
+        with _build_guard:
+            if not lock.locked():
+                _build_locks.pop(key, None)
+
+
+def _publish(out: Path, chunks: list[bytes]) -> None:
+    """Write a cache file atomically through a temporary name of its own."""
+    tmp = out.with_name(f"{out.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with open(tmp, "wb") as fh:
+            for c in chunks:
+                fh.write(c)
+        tmp.replace(out)
+    finally:
+        tmp.unlink(missing_ok=True)
+    _prune()
+
+
+def _cached(out: Path) -> bool:
+    """True when the cache file exists; its access time is set to now for the pruning
+    order (the modification time stays: it is the file's ETag)."""
+    try:
+        os.utime(out, (time.time(), out.stat().st_mtime))
+    except OSError:
+        return out.is_file()
+    return True
+
+
+_pruned_at = 0.0
+
+
+def _prune(every: float = 600.0) -> None:
+    """Keep the mesh caches under config.CACHE_MAX_BYTES by deleting the least recently
+    used files; looked at after a file was written, at most once per `every` seconds."""
+    global _pruned_at
+    now = time.monotonic()
+    if _pruned_at and now - _pruned_at < every:
+        return
+    _pruned_at = now
+    files = []
+    for kind in ("surf", "iso", "stream"):
+        try:
+            entries = list(os.scandir(config.CACHE_DIR / kind))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                st = e.stat()
+            except OSError:
+                continue
+            files.append((max(st.st_atime, st.st_mtime), st.st_size, e.path))
+    total = sum(f[1] for f in files)
+    for _, size, path in sorted(files):
+        if total <= config.CACHE_MAX_BYTES:
+            break
+        try:
+            os.unlink(path)
+            total -= size
+        except OSError:
+            pass
+
+
 def _triangles(poly):
     """(points float32 (n, 3), faces uint32 (m, 3)) of poly, degenerate triangles dropped."""
     import vtk
@@ -662,13 +771,8 @@ def _write_mesh(poly, out: Path) -> None:
     """Indexed binary mesh, ~3x smaller than STL: b'MPM1', uint32 n_points, uint32
     n_triangles, float32 xyz[n_points], uint32 index[n_triangles * 3] (little-endian)."""
     pts, f = _triangles(poly)
-    tmp = out.with_suffix(".tmp")
-    with open(tmp, "wb") as fh:
-        fh.write(b"MPM1")
-        fh.write(np.array([len(pts), len(f)], "<u4").tobytes())
-        fh.write(np.ascontiguousarray(pts, "<f4").tobytes())
-        fh.write(np.ascontiguousarray(f, "<u4").tobytes())
-    tmp.replace(out)
+    _publish(out, [b"MPM1", np.array([len(pts), len(f)], "<u4").tobytes(),
+                   np.ascontiguousarray(pts, "<f4").tobytes(), np.ascontiguousarray(f, "<u4").tobytes()])
 
 
 def _write_stl(poly, out: Path) -> None:
@@ -682,12 +786,7 @@ def _write_stl(poly, out: Path) -> None:
         nrm = np.zeros((0, 3), np.float32)
     rec = np.zeros(len(v), dtype=[("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")])
     rec["n"], rec["v"] = nrm, v
-    tmp = out.with_suffix(".tmp")
-    with open(tmp, "wb") as fh:
-        fh.write(b"mstar_post".ljust(80, b" "))
-        fh.write(np.uint32(len(v)).tobytes())
-        fh.write(rec.tobytes())
-    tmp.replace(out)
+    _publish(out, [b"mstar_post".ljust(80, b" "), np.uint32(len(v)).tobytes(), rec.tobytes()])
 
 
 _WRITERS = {"stl": (_write_stl, ".stl"), "mesh": (_write_mesh, ".mesh")}
@@ -723,13 +822,15 @@ def surface_stl(path: Path, max_tris: int = 400_000, fmt: str = "stl") -> Path:
     write, ext = _WRITERS[fmt]
     st = path.stat()
     out = _cache_path("surf", str(path), st.st_mtime_ns, max_tris, ext=ext)
-    if out.is_file():
+    if _cached(out):
         return out
-    import pyvista as pv
-    mesh = pv.read(str(path))
-    if not isinstance(mesh, pv.PolyData):
-        mesh = mesh.extract_surface()
-    write(_simplify(mesh, max_tris), out)
+    with _building(out):
+        if not out.is_file():
+            import pyvista as pv
+            mesh = pv.read(str(path))
+            if not isinstance(mesh, pv.PolyData):
+                mesh = mesh.extract_surface()
+            write(_simplify(mesh, max_tris), out)
     return out
 
 
@@ -774,8 +875,15 @@ def isosurface_stl(path: Path, name: str, comp: str, level: float,
     write, ext = _WRITERS[fmt]
     st = path.stat()
     out = _cache_path("iso", str(path), st.st_mtime_ns, name, comp, level, stride, max_tris, "blocks", ext=ext)
-    if out.is_file():
-        return out
+    if not _cached(out):
+        with _building(out):
+            if not out.is_file():
+                _isosurface(path, name, comp, level, stride, max_tris, write, out)
+    return out
+
+
+def _isosurface(path: Path, name: str, comp: str, level: float, stride: int, max_tris: int,
+                write, out: Path) -> None:
     import vtk
     from vtk.util import numpy_support
     h = header(path)
@@ -795,7 +903,6 @@ def isosurface_stl(path: Path, name: str, comp: str, level: float,
     fe.ComputeNormalsOff()
     fe.Update()
     write(_simplify(fe.GetOutput(), max_tris), out)
-    return out
 
 
 def streamlines(path: Path, name: str, axis: int | None, pos: float | None,
@@ -809,8 +916,15 @@ def streamlines(path: Path, name: str, axis: int | None, pos: float | None,
     st = path.stat()
     out = _cache_path("stream", str(path), st.st_mtime_ns, name, axis, pos, n_seeds,
                       max_steps, stride, "blocks", ext=".bin")
-    if out.is_file():
-        return out
+    if not _cached(out):
+        with _building(out):
+            if not out.is_file():
+                _streamlines(path, name, axis, pos, n_seeds, max_steps, stride, out)
+    return out
+
+
+def _streamlines(path: Path, name: str, axis: int | None, pos: float | None,
+                 n_seeds: int, max_steps: int, stride: int, out: Path) -> None:
     import vtk
     from vtk.util import numpy_support
     h = header(path)
@@ -872,11 +986,6 @@ def streamlines(path: Path, name: str, axis: int | None, pos: float | None,
             pts = allp[conn].astype(np.float32)
             vv = numpy_support.vtk_to_numpy(o.GetPointData().GetArray("v"))[conn]
             speed = np.linalg.norm(vv, axis=1).astype(np.float32)
-    tmp = out.with_suffix(".tmp")
-    with open(tmp, "wb") as fh:
-        fh.write(np.array([len(pts), len(offsets) - 1], "<u4").tobytes())
-        fh.write(np.ascontiguousarray(pts, "<f4").tobytes())
-        fh.write(np.ascontiguousarray(speed, "<f4").tobytes())
-        fh.write(np.ascontiguousarray(offsets, "<u4").tobytes())
-    tmp.replace(out)
-    return out
+    _publish(out, [np.array([len(pts), len(offsets) - 1], "<u4").tobytes(),
+                   np.ascontiguousarray(pts, "<f4").tobytes(), np.ascontiguousarray(speed, "<f4").tobytes(),
+                   np.ascontiguousarray(offsets, "<u4").tobytes()])

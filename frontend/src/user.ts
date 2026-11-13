@@ -10,35 +10,75 @@ export const USER_CHANGED = "mstar_post:user-changed";
 const GUEST: WhoAmI = { user: null, method: "none", admin: false, password_login: false, server_account: "" };
 let current: WhoAmI | null = null;
 let pending: Promise<WhoAmI> | null = null;
+// a 401 from the API means the session expired or a guest tried to edit: let the header offer a login
+export const LOGIN_NEEDED = "mstar_post:login-needed";
+// the account of the last answered whoami, kept across page loads (undefined = never answered in this browser)
+const LAST_USER = "mstar_post.lastuser";
+let verified: string | null | undefined;
+let unverified = false;  // the server did not answer the last whoami
+let seq = 0, retryTimer = 0;
+let prompt: { reason: string; until: number } | null = null;
 
 // Everything the app remembers in this browser is per user, except the theme.
 export function wipeLocalState(): void {
   for (const k of Object.keys(localStorage)) {
-    if (k.startsWith("mstar_post.") && k !== "mstar_post.theme") localStorage.removeItem(k);
+    if (k.startsWith("mstar_post.") && k !== "mstar_post.theme" && k !== LAST_USER) localStorage.removeItem(k);
   }
 }
 
-export function refreshUser(): Promise<WhoAmI> {
-  pending = api.whoami().catch(() => GUEST).then((w) => {
-    const before = current;
-    current = w;
+const lastUser = (): string | null | undefined => {
+  try {
+    const v = localStorage.getItem(LAST_USER);
+    return v === null ? undefined : v || null;
+  } catch { return undefined; }
+};
+
+// expired = asked because the API answered 401: a login that is gone re-opens the login dialog
+export function refreshUser(expired = false): Promise<WhoAmI> {
+  const my = ++seq;
+  const p: Promise<WhoAmI> = api.whoami().then((w): WhoAmI | null => w, () => null).then((w) => {
+    if (my !== seq) return pending ?? current ?? GUEST;  // a newer request decides
     pending = null;
+    if (!w) {
+      // no answer (server restarting, network down): keep the identity, this is not a logout
+      unverified = true;
+      current = current ?? GUEST;
+      window.dispatchEvent(new Event(EVENT));
+      clearTimeout(retryTimer);
+      retryTimer = window.setTimeout(() => { if (unverified && !pending) void refreshUser(); }, 5000);
+      return current;
+    }
+    unverified = false;
+    // an unchanged answer keeps the same object, so the components using useUser do not re-render
+    if (!current || JSON.stringify(current) !== JSON.stringify(w)) current = w;
     window.dispatchEvent(new Event(EVENT));
-    if (before !== null && before.user !== w.user) {
+    // on the first answer of a page load the account of the previous page load counts as "before"
+    const before = verified !== undefined ? verified : lastUser();
+    verified = w.user;
+    try { localStorage.setItem(LAST_USER, w.user ?? ""); } catch { /* storage blocked */ }
+    if (before !== undefined && before !== w.user) {
       wipeLocalState();
-      window.dispatchEvent(new CustomEvent(USER_CHANGED, { detail: { from: before.user, to: w.user } }));
+      if (expired && before && !w.user) prompt = { reason: `The login of ${before} expired: log in again to continue.`, until: Date.now() + 5000 };
+      window.dispatchEvent(new CustomEvent(USER_CHANGED, { detail: { from: before, to: w.user } }));
     }
     return w;
   });
-  return pending;
+  pending = p;
+  return p;
 }
+
+// why the session that starts after an account change should open the login dialog (null = it should not)
+export const loginPrompt = (): string | null => (prompt && Date.now() < prompt.until ? prompt.reason : null);
+
+// the identity may have changed behind our back (expired session): ask again instead of trusting the store
+window.addEventListener(LOGIN_NEEDED, () => { void refreshUser(true); });
 
 export function useUser(): WhoAmI & { loading: boolean; canManage: (...owners: (string | null | undefined)[]) => boolean } {
   const [w, setW] = useState<WhoAmI | null>(current);
   useEffect(() => {
     const on = () => setW(current);
     window.addEventListener(EVENT, on);
-    if (!current && !pending) refreshUser();
+    if ((!current || unverified) && !pending) void refreshUser();
     return () => window.removeEventListener(EVENT, on);
   }, []);
   const me = w ?? GUEST;
@@ -61,6 +101,3 @@ export async function logout(): Promise<void> {
   // same account afterwards (SSH tunnel): refreshUser did not fire the change, so reset anyway
   if (before === after) window.dispatchEvent(new CustomEvent(USER_CHANGED, { detail: { from: before, to: after } }));
 }
-
-// a 401 from the API means the session expired or a guest tried to edit: let the header offer a login
-export const LOGIN_NEEDED = "mstar_post:login-needed";

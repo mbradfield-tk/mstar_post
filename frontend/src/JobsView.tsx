@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { api, type Job } from "./api";
 import { useDialog } from "./Dialog";
+import { dropJob, putJob, useJobs } from "./jobsStore";
 import { useUser } from "./user";
+import { usePageVisible } from "./visible";
 
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : "");
 const dur = (j: Job) => {
@@ -9,53 +11,41 @@ const dur = (j: Job) => {
   const s = Math.round((j.finished_at ?? Date.now() / 1000) - j.started_at);
   return s < 120 ? `${s} s` : `${Math.floor(s / 60)} min ${s % 60} s`;
 };
+const NEAR_BOTTOM = 40;  // px: the log follows new output only while it is scrolled (almost) to the end
 
-// Live job list (WebSocket updates) and a tailing log view.
-export default function JobsView({ project, selected, onSelect, onOpenResults, owner }: {
+// Live job list (shared jobs store: WebSocket updates, reconnects by itself) and a tailing log view.
+export default memo(function JobsView({ project, selected, onSelect, onOpenResults, owner, active = true }: {
   project: string;
   selected: string | null;
   onSelect: (id: string) => void;
   onOpenResults: () => void;
   owner?: string | null;  // project owner: may manage every job of the project
+  active?: boolean;       // the tab is on screen: the duration tick and the log tail pause otherwise
 }) {
   const me = useUser();
-  const [jobs, setJobs] = useState<Job[]>([]);
+  const { jobs, loaded, connected, error: listError } = useJobs(project);
   const [log, setLog] = useState("");
   const [error, setError] = useState<string | null>(null);
   const offset = useRef(0);
   const pre = useRef<HTMLPreElement>(null);
+  const follow = useRef(true);
   const job = jobs.find((j) => j.id === selected);
   const ui = useDialog();
+  const shown = usePageVisible() && active;
   // re-render every second while a job runs so its duration ticks
   const [, setTick] = useState(0);
   const anyActive = jobs.some((j) => j.status === "running" || j.status === "queued");
   useEffect(() => {
-    if (!anyActive) return;
+    if (!anyActive || !shown) return;
     const id = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(id);
-  }, [anyActive]);
-
-  useEffect(() => {
-    api.jobs(project).then(setJobs);
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/api/jobs/ws`);
-    ws.onmessage = (e) => {
-      const m = JSON.parse(e.data);
-      if (m.type === "job_deleted") { setJobs((js) => js.filter((j) => j.id !== m.id)); return; }
-      if (m.type !== "job" || m.job.project !== project) return;
-      setJobs((js) => {
-        const i = js.findIndex((j) => j.id === m.job.id);
-        return i < 0 ? [m.job, ...js] : js.map((j) => (j.id === m.job.id ? m.job : j));
-      });
-    };
-    const ping = setInterval(() => ws.readyState === 1 && ws.send("ping"), 30000);
-    return () => { clearInterval(ping); ws.close(); };
-  }, [project]);
+  }, [anyActive, shown]);
 
   useEffect(() => {
     setLog("");
     setError(null);
     offset.current = 0;
+    follow.current = true;
   }, [selected]);
 
   const rerun = async (j: Job) => {
@@ -65,15 +55,15 @@ export default function JobsView({ project, selected, onSelect, onOpenResults, o
       const nj = await api.rerunJob(j.id);
       setLog("");
       offset.current = 0;
-      setJobs((js) => [nj, ...js.filter((x) => x.id !== j.id)]);
+      follow.current = true;
+      putJob(nj);
     } catch (e) { setError((e as Error).message); }
   };
   const rename = async (j: Job) => {
     const label = (await ui.prompt({ title: "Rename job", input: j.label, ok: "Rename" }))?.trim();
     if (!label || label === j.label) return;
     try {
-      const nj = await api.renameJob(j.id, label);
-      setJobs((js) => js.map((x) => (x.id === j.id ? nj : x)));
+      putJob(await api.renameJob(j.id, label));
     } catch (e) { setError((e as Error).message); }
   };
   const remove = async (j: Job) => {
@@ -82,42 +72,61 @@ export default function JobsView({ project, selected, onSelect, onOpenResults, o
         <div className="mono small muted">{j.run_dir}</div></> })) return;
     try {
       await api.deleteJob(j.id);
-      setJobs((js) => js.filter((x) => x.id !== j.id));
+      dropJob(project, j.id);
     } catch (e) { setError((e as Error).message); }
   };
 
-  const active = job?.status === "running" || job?.status === "queued";
+  const running = job?.status === "running" || job?.status === "queued";
+  // Tail of the selected job's log: one request at a time, the next one a second after the reply
+  // (never overlapping, so a slow reply cannot append the same text twice). `offset` is the next byte to ask for.
   useEffect(() => {
-    if (!selected) return;
-    let live = true;
+    if (!selected || !shown) return;
+    let live = true, timer = 0;
     const poll = async () => {
       try {
         const r = await api.jobLog(selected, offset.current);
         if (!live) return;
+        if (r.size < offset.current) {  // the log started again (job re-run elsewhere): read it from the start
+          offset.current = 0;
+          setLog("");
+          void poll();
+          return;
+        }
         if (r.text) {
+          const el = pre.current;
+          follow.current = !el || el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM;
           offset.current = r.offset;
           setLog((l) => (l + r.text).slice(-400000));
-          requestAnimationFrame(() => pre.current && (pre.current.scrollTop = pre.current.scrollHeight));
+          // a long log arrives in pieces: fetch the rest right away, also for a finished job
+          if (r.offset < r.size) { timer = window.setTimeout(poll, 0); return; }
         }
       } catch { /* job gone */ }
+      if (live && running) timer = window.setTimeout(poll, 1000);
     };
-    poll();
-    const id = active ? setInterval(poll, 1000) : undefined;
-    return () => { live = false; if (id) clearInterval(id); };
-  }, [selected, active]);
+    void poll();
+    return () => { live = false; clearTimeout(timer); };
+  }, [selected, running, shown]);
+  // keep the end of the log in view, but leave it alone once the user scrolled up to read
+  useEffect(() => {
+    const el = pre.current;
+    if (el && follow.current) el.scrollTop = el.scrollHeight;
+  }, [log, shown]);
 
   return (
     <div className="split">
       {ui.dialog}
       <div className="side">
         <h3>Jobs</h3>
+        {loaded && !connected && <div className="small muted" title="the live connection to the server was lost; it is retried automatically and the list is read again when it is back">
+          reconnecting to the server...</div>}
+        {listError && <div className="error small">{listError}</div>}
         {jobs.map((j) => (
           <div key={j.id} className={`taskcard${j.id === selected ? " active" : ""}`} onClick={() => onSelect(j.id)}>
             <span className={`status ${j.status}`}>{j.status}</span> <b>{j.label}</b>
             <div className="small muted">{when(j.created_at)} {dur(j) && `| ${dur(j)}`}{j.user && ` | ${j.user}`}</div>
           </div>
         ))}
-        {!jobs.length && <div className="muted">No jobs yet: start one on the Run tab.</div>}
+        {!jobs.length && <div className="muted">{loaded ? "No jobs yet: start one on the Run tab." : listError ? "" : "Loading..."}</div>}
       </div>
       <div className="main panel">
         {job ? (
@@ -128,11 +137,11 @@ export default function JobsView({ project, selected, onSelect, onOpenResults, o
                 const mine = me.canManage(job.user, owner);
                 const why = !me.user ? "log in to manage jobs" : `only ${job.user ?? "the owner"}, the project owner or an admin`;
                 return <>
-                  {active && <button disabled={!mine} title={mine ? undefined : why} onClick={() => api.cancelJob(job.id).catch((e) => setError(e.message))}>Cancel</button>}
+                  {running && <button disabled={!mine} title={mine ? undefined : why} onClick={() => api.cancelJob(job.id).catch((e) => setError(e.message))}>Cancel</button>}
                   {job.status === "done" && <button className="primary" onClick={onOpenResults}>Open results</button>}
                   {me.user && <button onClick={() => rename(job)}>Rename</button>}
-                  {!active && <button disabled={!mine} title={mine ? "delete the results and run again with the same settings" : why} onClick={() => rerun(job)}>Re-run</button>}
-                  {!active && <button className="danger" disabled={!mine} title={mine ? "delete the job and all its results" : why} onClick={() => remove(job)}>Delete</button>}
+                  {!running && <button disabled={!mine} title={mine ? "delete the results and run again with the same settings" : why} onClick={() => rerun(job)}>Re-run</button>}
+                  {!running && <button className="danger" disabled={!mine} title={mine ? "delete the job and all its results" : why} onClick={() => remove(job)}>Delete</button>}
                 </>;
               })()}
             </div>
@@ -147,10 +156,10 @@ export default function JobsView({ project, selected, onSelect, onOpenResults, o
               <summary className="small">Commands</summary>
               <pre className="log small">{job.commands.map((c) => c.argv.join(" ")).join("\n")}</pre>
             </details>
-            <pre ref={pre} className="log">{log || (active ? "Waiting for output..." : "(no output)")}</pre>
+            <pre ref={pre} className="log">{log || (running ? "Waiting for output..." : "(no output)")}</pre>
           </>
         ) : <div className="muted">{jobs.length ? "Select a job to see its log." : "Jobs started on the Run tab appear here with their live log."}</div>}
       </div>
     </div>
   );
-}
+});

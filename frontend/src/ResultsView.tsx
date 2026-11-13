@@ -10,7 +10,8 @@ import StatsSeries from "./StatsSeries";
 import TaskComparison from "./TaskComparison";
 import AllResults from "./AllResults";
 import CaseSelect from "./CaseSelect";
-import { fileForCases, runHasCases, selectedCaseIds } from "./results";
+import { clearResultsCache, fileForCases, runHasCases, runStamp, selectedCaseIds } from "./results";
+import { clearZonerCache } from "./zoner";
 
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : "");
 // stats_plots/<stem>.html name of a Stats file, as written by mstar_stats_summary.make_plots
@@ -48,6 +49,8 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
   const [file, setFile] = useState<string | null>(null);
   const [table, setTable] = useState<CsvTable | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // failed actions (delete, rename, run list): shown above every section until the next action
+  const [actionError, setActionError] = useState<string | null>(null);
   const [seriesSel, setSeriesSel] = useState<{ caseId: string; file: string; src: string } | null>(null);
   // sidebar: runs listed by date, or grouped by job type with a project-wide comparison per type
   const [groupBy, setGroupBy] = useState<"date" | "task">(() => (localStorage.getItem(`mstar_post.results.group.${project.id}`) as "task" | null) ?? "task");
@@ -71,10 +74,13 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
   useEffect(() => { api.tasks().then(setTasks).catch(() => undefined); }, []);
 
   const reload = () => api.runs(project.id).then((rs) => {
-    setRuns(rs);
+    setRuns((old) => (JSON.stringify(old) === JSON.stringify(rs) ? old : rs));
     const first = rs.find((r) => runHasCases(r, selectedCaseIds(project)));
     if (!runName && first) onRunChange(first.name);
-  }).catch((e) => setError(e.message));
+  }).catch((e) => setActionError(`run list: ${e.message}`));
+  // Refresh also drops the loaded results (rev remounts the views that hold them), so files changed on disk are read again
+  const [rev, setRev] = useState(0);
+  const refresh = () => { clearResultsCache(); clearZonerCache(); setActionError(null); setRev((n) => n + 1); reload(); };
   useEffect(() => { if (active) reload(); }, [project.id, active]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -93,19 +99,27 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
       ? [`${seriesSel.caseId}/${plotStem(seriesSel.file)}.html`, `${plotStem(seriesSel.file)}.html`] : [];
   const seriesHtml = seriesCandidates.find((h) => run?.htmls.includes(h)) ?? null;
 
+  // the table of the chosen file; an answer that arrives after another file was chosen is dropped,
+  // and a run made again (same path, new stamp) is read again
+  const runKey = run ? runStamp(run) : "";
   useEffect(() => {
     setTable(null);
     setError(null);
     if (!run || !file?.endsWith(".csv")) return;
-    api.csv(project.id, `${run.path}/${file}`).then(setTable).catch((e) => setError(e.message));
-  }, [run?.path, file]); // eslint-disable-line react-hooks/exhaustive-deps
+    let live = true;
+    api.csv(project.id, `${run.path}/${file}`).then((t) => live && setTable(t)).catch((e) => live && setError(e.message));
+    return () => { live = false; };
+  }, [runKey, file]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const del = async () => {
     if (!run || !await ui.confirm({ title: "Delete run?", ok: "Delete", danger: true,
       body: <p>Delete run <b>{run.label ?? run.name}</b> and all its outputs? This cannot be undone.</p> })) return;
-    await api.deleteRun(project.id, run.name);
-    onRunChange(null);
-    reload();
+    setActionError(null);
+    try {
+      await api.deleteRun(project.id, run.name);
+      onRunChange(null);
+      reload();
+    } catch (e) { setActionError(`Delete run: ${(e as Error).message}`); }
   };
   const [renaming, setRenaming] = useState(false);
   const [renameNote, setRenameNote] = useState<string | null>(null);
@@ -117,14 +131,17 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
         Case folders are not touched. Runs made from now on are normalised automatically.</p> })) return;
     setRenaming(true);
     setRenameNote(null);
+    setActionError(null);
     try {
       const r = await api.renameBody(project.id, all ? undefined : run?.name);
       const bad = r.runs.filter((x) => x.error || x.skipped);
       setRenameNote(`${r.changed} file${r.changed === 1 ? "" : "s"} updated in ${r.runs.length} run${r.runs.length === 1 ? "" : "s"}`
         + (bad.length ? `; ${bad.map((x) => `${x.run}: ${x.skipped ?? "failed"}`).join(", ")}` : ""));
       setFile(null);
+      clearResultsCache();  // headers and file names of finished runs changed in place
+      setRev((n) => n + 1);
       reload();
-    } catch (e) { setError((e as Error).message); }
+    } catch (e) { setActionError(`Rename: ${(e as Error).message}`); }
     setRenaming(false);
   };
 
@@ -141,7 +158,7 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
     <div className="split">
       {ui.dialog}
       <div className="side">
-        <div className="row"><h3 className="grow">Runs</h3><button onClick={reload}>Refresh</button>
+        <div className="row"><h3 className="grow">Runs</h3><button onClick={refresh} title="read the run list and the results again">Refresh</button>
           <button onClick={() => { setCompareTask(null); onReset(); }} title="newest run, default file, no table filters">Reset</button></div>
         <CaseSelect project={project} onChange={onProjectChange} />
         {runs.length > shownRuns.length && <div className="small muted">{runs.length - shownRuns.length} run{runs.length - shownRuns.length === 1 ? "" : "s"} hidden: none of their cases is selected</div>}
@@ -193,6 +210,7 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
         )}
       </div>
       <div className="main panel">
+        {actionError && <div className="error" onClick={() => setActionError(null)} title="click to dismiss">{actionError}</div>}
         {compareTask !== null ? (
           <>
             <div className="row">
@@ -206,15 +224,15 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
               <span className="small muted">{CMP_SECTIONS.find(([k]) => k === cmpSection)?.[2]}</span>
             </div>
             {cmpSection === "key" && (
-              <TaskComparison key={compareTask} project={project} task={tasks.find((t) => t.id === compareTask)}
+              <TaskComparison key={`${compareTask}|${rev}`} project={project} task={tasks.find((t) => t.id === compareTask)}
                               runs={byTask.get(compareTask) ?? []} onOpenRun={openRun} />)}
             {cmpSection === "all" && (
               <div className="card">
-                <AllResults key={compareTask} project={project} runs={byTask.get(compareTask) ?? []} storeKey={`task.${compareTask}`} />
+                <AllResults key={`${compareTask}|${rev}`} project={project} runs={byTask.get(compareTask) ?? []} storeKey={`task.${compareTask}`} />
               </div>)}
             {cmpSection === "series" && (
               <div className="card">
-                <StatsSeries key={compareTask} project={project} multi storeKey={`task.${compareTask}`}
+                <StatsSeries key={compareTask} project={project} multi storeKey={`task.${compareTask}`} active={active}
                              runs={(byTask.get(compareTask) ?? []).filter((r) => r.status === "done" || r.status === "unknown")} />
               </div>)}
           </>
@@ -243,7 +261,7 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
 
             {section === "overview" && (
               <>
-                <RunSummary project={project} run={run} task={tasks.find((t) => t.id === run.task)} onOpenFile={openFile} />
+                <RunSummary key={rev} project={project} run={run} task={tasks.find((t) => t.id === run.task)} onOpenFile={openFile} />
                 {runCases.length > 0 && (
                   <details className="card">
                     <summary><b>Simulation time</b> <span className="small muted">{simTimeSummary(runCases)}</span></summary>
@@ -259,13 +277,13 @@ export default function ResultsView({ project, runName, onRunChange, onProjectCh
 
             {section === "all" && (
               <div className="card">
-                <AllResults key={run.name} project={project} runs={[run]} storeKey={`run.${run.task ?? "x"}`} />
+                <AllResults key={`${run.name}|${rev}`} project={project} runs={[run]} storeKey={`run.${run.task ?? "x"}`} />
               </div>
             )}
 
             {section === "series" && (
               <div className="card">
-                <StatsSeries project={project} onSelect={(caseId, f, src) => setSeriesSel({ caseId, file: f, src })} />
+                <StatsSeries project={project} active={active} onSelect={(caseId, f, src) => setSeriesSel({ caseId, file: f, src })} />
                 {seriesSel && seriesHtml && (
                   <div className="small muted">
                     Legacy HTML plot of all variables of {seriesSel.file} for this case in this run: <a onClick={() => openFile(seriesHtml)}>{seriesHtml}</a>

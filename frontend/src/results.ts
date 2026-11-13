@@ -1,4 +1,4 @@
-import { api, type Project, type Run } from "./api";
+import { api, type Project, type Run, type RunSeriesFile } from "./api";
 
 // Shared logic for the Results overviews: which columns of a run's outputs are the
 // "key results" and how to load one row per case from a run (means tables of the
@@ -57,13 +57,31 @@ export type RunResults = {
   rows: Map<string, Record<string, Cell>>; // case id -> values
   std?: Map<string, Record<string, number>>; // case id -> std of the steady-state mean, where known
   valueNote: string;
+  partial?: boolean;                       // a file could not be read: shown, but not kept in the cache
 };
 
 export const unitOf = (col: string) => col.match(/\[([^\]]*)\]\s*$/)?.[1] ?? "";
 export const shortName = (col: string) => col.replace(/\s*\[[^\]]*\]\s*$/, "");
-export const pct = (v: Cell, r: Cell) =>
-  typeof v === "number" && typeof r === "number" && r !== 0 ? ((v - r) / Math.abs(r)) * 100 : null;
+// The one "% vs ref" of the app: (value - ref) / ref x 100 = (value / ref - 1) x 100. It does not depend
+// on the sign convention of the variable (a torque of -2 against a reference of -1 is +100 %, as
+// 2 against 1); null without two numbers or for a reference of 0.
+export const pct = (v: unknown, r: unknown) =>
+  typeof v === "number" && typeof r === "number" && r !== 0 && Number.isFinite(v) && Number.isFinite(r) ? ((v - r) / r) * 100 : null;
+export const PCT_HELP = "% vs ref = (value - ref) / ref x 100 = (value / ref - 1) x 100. With a negative reference "
+  + "a value of larger magnitude reads positive (-2 vs -1 = +100 %); blank when the reference is 0 or not a number.";
 export const fmtPct = (p: number) => `${p > 0 ? "+" : ""}${p.toFixed(Math.abs(p) < 10 ? 1 : 0)}%`;
+
+// Newest results first: a re-run keeps its folder name but gets new times, so runs are ordered by
+// finished_at ?? created_at (runs without a job record: the time stamp of the folder name).
+const nameTime = (name: string) => {
+  const m = name.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/);
+  return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime() / 1000 : 0;
+};
+export const runTime = (r: Run) => r.finished_at ?? r.created_at ?? nameTime(r.name);
+export const newestFirst = (runs: Run[]) => [...runs].sort((a, b) => runTime(b) - runTime(a) || b.name.localeCompare(a.name));
+// identity of the outputs of a run: changes when the run is made again
+export const runStamp = (r: Run) => `${r.name}@${r.finished_at ?? ""}@${r.created_at ?? ""}@${r.csvs.length}`;
+const finished = (r: Run) => r.status !== "queued" && r.status !== "running";
 
 export const condOf = (project: Project, c: string, key: string): number | string | null => {
   const v = project.cases.find((x) => x.id === c)?.info?.settings?.[key];
@@ -85,9 +103,15 @@ export const meansFilesOf = (run: Run) => run.csvs.filter((f) => !f.includes("/"
 // per-case scalar results of per-case tasks: <case id>/<tool>_summary.csv with a single "case" row
 export const caseSummaryFilesOf = (run: Run) => run.csvs.filter((f) => f.includes("/") && /_summary\.csv$/.test(f));
 
-// case id of a per-case output path (<case id>/[<sub dir>/]<file>); case ids contain "/", so match by prefix
+// The case a per-case output path (<case id>[/<sub dir>][/<file>]) belongs to. Case ids contain "/"
+// and may be nested (a and a/b), so the longest id that is a prefix wins.
+export const caseOfDir = (p: Project, f: string): string | undefined => {
+  let best: string | undefined;
+  for (const c of p.cases) if ((f === c.id || f.startsWith(`${c.id}/`)) && c.id.length > (best?.length ?? -1)) best = c.id;
+  return best;
+};
 const caseOfPath = (project: Project, f: string) =>
-  project.cases.find((c) => f.startsWith(`${c.id}/`))?.id ?? (project.single ? project.cases[0]?.id : undefined) ?? f.slice(0, f.lastIndexOf("/"));
+  caseOfDir(project, f) ?? (project.single ? project.cases[0]?.id : undefined) ?? f.slice(0, f.lastIndexOf("/"));
 
 // the cases the user works on: the selected ones, or all when none is selected
 export const selectedCaseIds = (p: Project) => {
@@ -102,24 +126,51 @@ export const runHasCases = (r: Run, ids: Set<string>) => {
   return !rc || rc.some((id) => ids.has(id));
 };
 // the case a run file belongs to (longest matching id prefix), null for run-level files
-export const fileCase = (p: Project, f: string): string | null => p.single ? null
-  : p.cases.filter((c) => f.startsWith(`${c.id}/`)).sort((a, b) => b.id.length - a.id.length)[0]?.id ?? null;
+export const fileCase = (p: Project, f: string): string | null => p.single || !f.includes("/") ? null : caseOfDir(p, f) ?? null;
 export const fileForCases = (p: Project, f: string, ids: Set<string>) => {
   const c = fileCase(p, f);
   return !c || ids.has(c);
 };
 
+// One load per run and state of its outputs, shared by the run overview, the job-type comparisons
+// and the plots (runStamp: a run made again is loaded again). Unfinished runs are not cached.
+const resultsCache = new Map<string, Promise<RunResults>>();
+const runFilesCache = new Map<string, Promise<RunSeriesFile[]>>();
+function cached<T>(cache: Map<string, Promise<T>>, key: string, run: Run, load: () => Promise<T>): Promise<T> {
+  if (!finished(run)) return load();
+  let p = cache.get(key);
+  if (!p) {
+    if (cache.size > 400) cache.clear();
+    p = load();
+    cache.set(key, p);
+    // failed and incomplete loads (a summary file that could not be read) are asked again next time
+    const drop = () => { if (cache.get(key) === p) cache.delete(key); };
+    p.then((v) => { if ((v as { partial?: boolean } | null)?.partial) drop(); }, drop);
+  }
+  return p;
+}
+// after the result files of finished runs were changed in place (body rename) or on Refresh
+export const clearResultsCache = () => { resultsCache.clear(); runFilesCache.clear(); };
+// the per-case time-series CSVs of a run with their columns and cases
+export const runSeriesFiles = (pid: string, run: Run) =>
+  cached(runFilesCache, `${pid}|${runStamp(run)}`, run, () => api.runTimeseries(pid, run.name));
+
 // One row per case of a run: merged root *_means.csv (first file wins per column), or
 // the final value of every key column of the per-case time series.
-export async function loadRunResults(project: Project, run: Run, full = false): Promise<RunResults> {
+export const loadRunResults = (project: Project, run: Run, full = false): Promise<RunResults> =>
+  cached(resultsCache, `${full ? "full" : "key"}|${project.id}|${project.cases.length}|${runStamp(run)}`, run, () => readRunResults(project, run, full));
+
+async function readRunResults(project: Project, run: Run, full: boolean): Promise<RunResults> {
   const means = meansFilesOf(run);
   const columns: Column[] = [];
+  const seen = new Set<string>();
+  const add = (c: string, source: string, group: string) => { if (!seen.has(c)) { seen.add(c); columns.push({ col: c, source, group }); } };
   const rows = new Map<string, Record<string, Cell>>();
   if (means.length) {
     const tables = await Promise.all(means.map((f) => api.csv(project.id, `${run.path}/${f}`).then((t) => [f, t] as const)));
     for (const [f, t] of tables) {
       if (t.columns[0] !== "case") continue;
-      t.columns.slice(1).forEach((c) => !columns.some((x) => x.col === c) && columns.push({ col: c, source: f, group: "Summary means" }));
+      t.columns.slice(1).forEach((c) => add(c, f, "Summary means"));
       for (const r of t.rows) {
         const row = rows.get(String(r[0])) ?? {};
         t.columns.forEach((c, i) => { if (i && row[c] === undefined) row[c] = r[i]; });
@@ -128,34 +179,40 @@ export async function loadRunResults(project: Project, run: Run, full = false): 
     }
     return { columns, rows, valueNote: "steady-state means" };
   }
-  // per-case tasks: their scalar summaries first (ua_summary.csv), then the final time-series values
+  // per-case tasks: their scalar summaries first (ua_summary.csv), then the final time-series values;
+  // all files are requested together
   const summaries = caseSummaryFilesOf(run);
-  for (const f of summaries) {
+  let partial = false;
+  const [sums, files] = await Promise.all([
+    Promise.all(summaries.map((f) => api.csv(project.id, `${run.path}/${f}`).catch(() => { partial = true; return null; }))),
+    runSeriesFiles(project.id, run)]);
+  summaries.forEach((f, k) => {
+    const t = sums[k];
+    if (!t || !t.rows.length) return;
     const cid = caseOfPath(project, f);
-    const t = await api.csv(project.id, `${run.path}/${f}`).catch(() => null);
-    if (!t || !t.rows.length) continue;
     const name = f.slice(f.lastIndexOf("/") + 1);
-    t.columns.forEach((c) => c !== "case" && !columns.some((x) => x.col === c) && columns.push({ col: c, source: name, group: `Script summary: ${name}` }));
+    t.columns.forEach((c) => c !== "case" && add(c, name, `Script summary: ${name}`));
     const row = rows.get(cid) ?? {};
     t.columns.forEach((c, i) => { if (c !== "case" && row[c] === undefined) row[c] = t.rows[0][i]; });
     rows.set(cid, row);
-  }
-  const files = await api.runTimeseries(project.id, run.name);
-  for (const f of files) {
-    const want = full ? f.columns : pickMetrics(f.columns.map((c) => ({ col: c, source: f.file }))).map((m) => m.col);
-    if (!want.length) continue;
-    const s = await api.runSeries(project.id, run.name, f.file, want);
+  });
+  const wants = files.map((f) => (full ? f.columns : pickMetrics(f.columns.map((c) => ({ col: c, source: f.file }))).map((m) => m.col)));
+  const series = await Promise.all(files.map((f, k) => (wants[k].length ? api.runSeries(project.id, run.name, f.file, wants[k]) : null)));
+  files.forEach((f, k) => {
+    const s = series[k];
+    if (!s) return;
     for (const [cid, d] of Object.entries(s)) {
       const row = rows.get(cid) ?? {};
-      for (const c of want) {
+      for (const c of wants[k]) {
         const v = (d.columns[c] ?? []).filter((x): x is number => x !== null);
-        if (v.length) row[c] = v[v.length - 1];
+        if (v.length && row[c] === undefined) row[c] = v[v.length - 1];
       }
       rows.set(cid, row);
     }
-    want.forEach((c) => columns.push({ col: c, source: f.file, group: `Script output: ${f.file}` }));
-  }
-  return { columns, rows, valueNote: summaries.length ? "script results (final values for time series)" : files.length ? "final values" : "none" };
+    wants[k].forEach((c) => add(c, f.file, `Script output: ${f.file}`));
+  });
+  return { columns, rows, partial: partial || undefined,
+    valueNote: summaries.length ? "script results (final values for time series)" : files.length ? "final values" : "none" };
 }
 
 // the stats summary's long tables: one row per case x Stats file x variable with mean/std
@@ -166,18 +223,24 @@ const longTablesOf = (run: Run) => run.csvs.filter((f) => /^(batch_summary|stats
 // Everything a run knows per case: the summary means plus every M-Star Stats variable of
 // the long table (steady-state mean, with std) grouped by Stats file, and the derived rows.
 // Column names follow the means table: Fluid.txt variables bare, other files "<stem>: <variable>".
-export async function loadAllResults(project: Project, run: Run): Promise<RunResults> {
-  const base = await loadRunResults(project, run, true);
+export const loadAllResults = (project: Project, run: Run): Promise<RunResults> =>
+  cached(resultsCache, `all|${project.id}|${project.cases.length}|${runStamp(run)}`, run, () => readAllResults(project, run));
+
+async function readAllResults(project: Project, run: Run): Promise<RunResults> {
   const longs = longTablesOf(run);
-  if (!longs.length) return base;
+  const [full, tables] = await Promise.all([loadRunResults(project, run, true),
+    Promise.all(longs.map((long) => api.csv(project.id, `${run.path}/${long}`)))]);
+  if (!longs.length) return full;
+  // the cached summary result is shared: extend copies
+  const base: RunResults = { ...full, columns: [...full.columns], rows: new Map([...full.rows].map(([k, v]) => [k, { ...v }])) };
   const single = project.single ? project.cases[0]?.id : null;
   const std = new Map<string, Record<string, number>>();
   const seen = new Set(base.columns.map((c) => c.col));
-  for (const long of longs) {
-    const t = await api.csv(project.id, `${run.path}/${long}`);
+  longs.forEach((long, k) => {
+    const t = tables[k];
     const ix = (n: string) => t.columns.indexOf(n);
     const iCase = ix("case"), iFile = ix("file"), iVar = ix("variable"), iMean = ix("mean"), iStd = ix("std");
-    if (iFile < 0 || iVar < 0 || iMean < 0) continue;
+    if (iFile < 0 || iVar < 0 || iMean < 0) return;
     for (const r of t.rows) {
       const cid = iCase >= 0 ? String(r[iCase]) : single ?? "";
       const file = String(r[iFile] ?? ""), v = String(r[iVar] ?? "");
@@ -196,6 +259,6 @@ export async function loadAllResults(project: Project, run: Run): Promise<RunRes
         std.set(cid, s);
       }
     }
-  }
+  });
   return { ...base, std, valueNote: "steady-state means" };
 }

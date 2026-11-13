@@ -1,50 +1,41 @@
-import { useEffect, useRef, useState } from "react";
-import { api, type Job, type Project, type ProjectMeta, type ProjectSummary } from "./api";
+import { lazy, memo, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { api, clearApiCaches, type Job, type Project, type ProjectMeta, type ProjectSummary } from "./api";
 import { THEME_KEY, ThemeContext, type Theme } from "./theme";
-import { logout, USER_CHANGED, useUser } from "./user";
+import { loginPrompt, logout, USER_CHANGED, useUser } from "./user";
 import LoginDialog from "./Login";
-import { clearPlaneCache } from "./plane";
-import { clearLicCache } from "./lic";
-import { clearViewerCaches } from "./Viewer3D";
 import CasesView from "./CasesView";
 import Dashboard from "./Dashboard";
 import DirBrowser from "./DirBrowser";
 import { useDialog } from "./Dialog";
+import ErrorBoundary from "./ErrorBoundary";
 import FilesView from "./FilesView";
 import GpuView from "./GpuView";
 import Relocate from "./Relocate";
 import JobsView from "./JobsView";
-import PlotsView from "./PlotsView";
+import { activeJobCount, useJobs } from "./jobsStore";
 import { META_FIELDS, metaValues } from "./ProjectMeta";
-import ResultsView from "./ResultsView";
 import RunView from "./RunView";
-import TheoryView from "./TheoryView";
-import ViewerView from "./ViewerView";
+import { useEvent } from "./visible";
 
 const TABS = ["Cases", "Run", "Jobs", "Results", "Plots", "Viewer", "Files", "GPUs", "Theory"] as const;
 const GLOBAL_TABS: readonly string[] = ["Files", "GPUs", "Theory"];  // usable without a project
 type Tab = (typeof TABS)[number];
 
-// number of queued/running jobs of a project, kept live over the jobs WebSocket
-function useActiveJobs(pid: string | null): number {
-  const [jobs, setJobs] = useState<Job[]>([]);
-  useEffect(() => {
-    setJobs([]);
-    if (!pid) return;
-    api.jobs(pid).then(setJobs).catch(() => undefined);
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/api/jobs/ws`);
-    ws.onmessage = (e) => {
-      const m = JSON.parse(e.data);
-      if (m.type === "job_deleted") setJobs((js) => js.filter((j) => j.id !== m.id));
-      else if (m.type === "job" && m.job.project === pid)
-        setJobs((js) => (js.some((j) => j.id === m.job.id) ? js.map((j) => (j.id === m.job.id ? m.job : j)) : [m.job, ...js]));
-    };
-    const ping = setInterval(() => ws.readyState === 1 && ws.send("ping"), 30000);
-    return () => { clearInterval(ping); ws.close(); };
-  }, [pid]);
-  return jobs.filter((j) => j.status === "queued" || j.status === "running").length;
-}
+// The tabs that need Plotly, Three.js or KaTeX are separate chunks, fetched when first opened
+// (or a little earlier, see preload), so the dashboard, Cases, Files, Jobs and GPUs start without them.
+let viewerLoaded = false;
+const LOADERS = {
+  Results: () => import("./ResultsView"),
+  Plots: () => import("./PlotsView"),
+  Viewer: () => import("./ViewerView").then((m) => { viewerLoaded = true; return m; }),
+  Theory: () => import("./TheoryView"),
+};
+const ResultsView = memo(lazy(LOADERS.Results));
+const PlotsView = memo(lazy(LOADERS.Plots));
+const ViewerView = memo(lazy(LOADERS.Viewer));
+const TheoryView = memo(lazy(LOADERS.Theory));
+const RunPane = memo(RunView);
+const preload = (t: string) => { (LOADERS as Record<string, (() => Promise<unknown>) | undefined>)[t]?.().catch(() => undefined); };
 
 // A change of account remounts the whole app below the theme provider: every tab,
 // WebSocket, timer and cache starts fresh and nothing of the previous user remains.
@@ -57,9 +48,9 @@ export default function App() {
   }, [theme]);
   useEffect(() => {
     const on = () => {
-      clearPlaneCache();
-      clearLicCache();
-      clearViewerCaches();
+      clearApiCaches();
+      // planes, LIC textures and meshes live in the Viewer chunk: nothing to clear before it was loaded
+      if (viewerLoaded) import("./viewerCaches").then((m) => m.clearViewerModuleCaches()).catch(() => undefined);
       setSession((s) => s + 1);
     };
     window.addEventListener(USER_CHANGED, on);
@@ -85,9 +76,14 @@ function Session({ theme, setTheme }: { theme: Theme; setTheme: (t: Theme) => vo
   const [run, setRun] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const ui = useDialog();
-  const activeJobs = useActiveJobs(pid);
+  // queued/running jobs of the open project, live from the shared jobs store (also used by the Jobs tab)
+  const activeJobs = activeJobCount(useJobs(pid));
   const me = useUser();
-  const [loginOpen, setLoginOpen] = useState<false | { reason?: string }>(false);
+  // a session that starts because a login expired asks for the login again
+  const [loginOpen, setLoginOpen] = useState<false | { reason?: string }>(() => {
+    const reason = loginPrompt();
+    return reason ? { reason } : false;
+  });
   useEffect(() => {
     const on = () => setLoginOpen({ reason: "That needs a login (your session may have expired)." });
     window.addEventListener("mstar_post:login-needed", on);
@@ -99,27 +95,35 @@ function Session({ theme, setTheme }: { theme: Theme; setTheme: (t: Theme) => vo
   // tabs stay mounted once opened so their state survives switching
   const [visited, setVisited] = useState<Set<Tab>>(() => new Set(["Cases"]));
   const [resets, setResets] = useState<Partial<Record<Tab, number>>>({});
-  const scrolls = useRef<Partial<Record<Tab, number>>>({});
+  // window scroll position per view: each tab, the dashboard ("home") and the New project form
+  const where = creating ? "new" : home ? "home" : tab;
+  const scrolls = useRef<Record<string, number>>({});
+  const leave = () => { scrolls.current[where] = window.scrollY; };
 
-  const go = (t: Tab) => {
-    scrolls.current[tab] = window.scrollY;
+  // the handlers below keep their identity (useEvent), so the memoised tabs do not re-render with the header
+  const go = useEvent((t: Tab) => {
+    leave();
     setVisited((v) => (v.has(t) ? v : new Set(v).add(t)));
     setTab(t);
     setHome(false);
-  };
-  const open = (id: string) => {
+    setCreating(false);
+  });
+  const goHome = () => { leave(); setCreating(false); setHome(true); };
+  const startNew = useEvent(() => { leave(); setCreating(true); });
+  const open = useEvent((id: string) => {
+    leave();
     if (id !== pid) { setPid(id); setTab("Cases"); }
     setHome(false);
     setCreating(false);
-  };
-  const reset = (t: Tab) => setResets((r) => ({ ...r, [t]: (r[t] ?? 0) + 1 }));
+  });
+  const reset = useCallback((t: Tab) => setResets((r) => ({ ...r, [t]: (r[t] ?? 0) + 1 })), []);
   useEffect(() => {
     const id = requestAnimationFrame(() => {
-      window.scrollTo(0, scrolls.current[tab] ?? 0);
+      window.scrollTo(0, scrolls.current[where] ?? 0);
       window.dispatchEvent(new Event("resize"));  // Plotly sizes plots drawn while hidden
     });
     return () => cancelAnimationFrame(id);
-  }, [tab, home]);
+  }, [where]);
 
   const reloadList = () => api.projects().then(setProjects).catch((e) => setError(e.message));
   useEffect(() => { reloadList(); }, []);
@@ -134,19 +138,47 @@ function Session({ theme, setTheme }: { theme: Theme; setTheme: (t: Theme) => vo
     setProject(null);
     setRun(null);
     setJob(null);
-    setVisited(new Set(["Cases"]));
-    scrolls.current = {};
+    // project tabs start again; Files, GPUs and Theory do not belong to a project and stay as they are
+    setVisited((v) => new Set<Tab>(["Cases", ...[...v].filter((t) => GLOBAL_TABS.includes(t))]));
+    scrolls.current = Object.fromEntries(Object.entries(scrolls.current).filter(([k]) => k === "home" || GLOBAL_TABS.includes(k)));
     if (!pid) return;
+    let live = true;  // a slower reply of a project that is no longer the open one is dropped
     localStorage.setItem("mstar_post.project", pid);
-    api.project(pid).then(setProject).catch((e) => { setError(e.message); setPid(null); setHome(true); });
+    api.project(pid).then((p) => { if (live) setProject(p); })
+      .catch((e) => { if (live) { setError(e.message); setPid(null); setHome(true); } });
+    return () => { live = false; };
   }, [pid]);
+  // updates from the tabs (case selection, names, relocate, Viewer refresh): only a newer version of the
+  // open project may replace it, so a reply that arrives after a project switch cannot bring the old one back
+  const changeProject = useCallback((p: Project) => setProject((cur) => (cur && cur.id === p.id ? p : cur)), []);
+  // Results and Plots load Plotly: fetch those chunks once a project is open and the browser is idle
+  const projectId = project?.id;
+  useEffect(() => {
+    if (!projectId) return;
+    const id = window.setTimeout(() => { preload("Results"); preload("Plots"); }, 2500);
+    return () => clearTimeout(id);
+  }, [projectId]);
 
-  const onSubmitted = (j: Job) => {
+  const onSubmitted = useEvent((j: Job) => {
     setJob(j.id);
     go("Jobs");
-  };
+  });
+  const openResults = useEvent(() => { setRun(null); go("Results"); });
+  const resetResults = useEvent(() => { setRun(null); reset("Results"); });
+  const resetPlots = useEvent(() => {
+    if (!pid) return;
+    localStorage.removeItem(`mstar_post.plots.${pid}`);
+    localStorage.removeItem(`mstar_post.means.${pid}`);
+    localStorage.removeItem(`mstar_post.plotref.${pid}`);
+    localStorage.removeItem(`mstar_post.plots.hidden.${pid}`);
+    reset("Plots");
+  });
+  const refreshProject = useEvent((): Promise<unknown> => (pid ? api.project(pid, true).then(changeProject) : Promise.resolve()));
+  const openFiles = useEvent(() => go("Files"));
+  const openTheory = useEvent(() => go("Theory"));
+  const openGpus = useEvent(() => go("GPUs"));
 
-  const del = async (p: ProjectSummary) => {
+  const del = useEvent(async (p: ProjectSummary) => {
     if (!await ui.confirm({ title: "Delete project?", ok: "Delete project", danger: true,
       body: <p>Delete <b>{p.name}</b> and all its run outputs? Case folders are not touched.</p> })) return;
     try {
@@ -155,26 +187,27 @@ function Session({ theme, setTheme }: { theme: Theme; setTheme: (t: Theme) => vo
       if (p.id === pid) setPid(null);
       reloadList();
     } catch (e) { setError((e as Error).message); }
-  };
+  });
 
   const showDash = home && !creating;
   const showTab = !home && !creating;
   return (
     <div className="app">
       <header>
-        <b className="brand" onClick={() => setHome(true)} title="all projects" role="button">M-Star Post</b>
+        <b className="brand" onClick={goHome} title="all projects" role="button">M-Star Post</b>
         <div className="project-bar">
-          <button className={showDash ? "tab active" : "tab"} onClick={() => { setCreating(false); setHome(true); }}>Projects</button>
+          <button className={showDash ? "tab active" : "tab"} onClick={goHome}>Projects</button>
           <select value={pid ?? ""} onChange={(e) => e.target.value && open(e.target.value)} title="switch project">
             <option value="">{project ? "Switch project..." : "Open a project..."}</option>
             {projects.map((p) => <option key={p.id} value={p.id}>{p.name} ({p.n_included}/{p.n_cases})</option>)}
           </select>
-          {me.user && <button onClick={() => setCreating(true)} title="create a project from a study or case folder">New</button>}
+          {me.user && <button onClick={startNew} title="create a project from a study or case folder">New</button>}
         </div>
         <nav>
           {TABS.map((t) => (
             <button key={t} className={showTab && t === tab ? "tab active" : "tab"} disabled={!project && !GLOBAL_TABS.includes(t)}
                     title={!project && !GLOBAL_TABS.includes(t) ? "open a project first" : t === "Files" && !me.user ? "log in to browse files" : undefined}
+                    onMouseEnter={() => { if (project || GLOBAL_TABS.includes(t)) preload(t); }}
                     onClick={() => go(t)}>{t}{t === "Jobs" && activeJobs > 0 && <span className="badge pulse" title={`${activeJobs} running or queued`}>{activeJobs}</span>}</button>
           ))}
         </nav>
@@ -193,25 +226,25 @@ function Session({ theme, setTheme }: { theme: Theme; setTheme: (t: Theme) => vo
       {ui.dialog}
       {loginOpen && <LoginDialog passwordLogin={me.password_login} reason={loginOpen.reason} onClose={() => setLoginOpen(false)} />}
       {error && <div className="error banner" onClick={() => setError(null)}>{error} <span className="dismiss">(click to dismiss)</span></div>}
-      {creating && <NewProject projects={projects} onClose={() => setCreating(false)} onCreated={(p) => {
+      {creating && <NewProject projects={projects} onClose={() => { leave(); setCreating(false); }} onCreated={(p) => {
         reloadList();
         open(p.id);
       }} />}
       <main>
         {showDash && (
-          <Dashboard projects={projects} current={pid} lastOpened={lastOpened} onOpen={open} onNew={() => setCreating(true)}
-                     onDelete={del} onFiles={() => go("Files")} onTheory={() => go("Theory")} onGpus={() => go("GPUs")} />
+          <Dashboard projects={projects} current={pid} lastOpened={lastOpened} onOpen={open} onNew={startNew}
+                     onDelete={del} onFiles={openFiles} onTheory={openTheory} onGpus={openGpus} />
         )}
         {project && showTab && !GLOBAL_TABS.includes(tab) && (
           <Relocate key={project.id} project={project} onChange={(p) => {
-            setProject(p);
+            changeProject(p);
             reset("Viewer");
             reset("Plots");
           }} />
         )}
-        {visited.has("Theory") && <Pane show={showTab && tab === "Theory"}><TheoryView /></Pane>}
-        {visited.has("GPUs") && <Pane show={showTab && tab === "GPUs"}><GpuView active={showTab && tab === "GPUs"} /></Pane>}
-        {visited.has("Files") && <Pane show={showTab && tab === "Files"}>
+        {visited.has("Theory") && <Pane label="Theory" show={showTab && tab === "Theory"}><TheoryView /></Pane>}
+        {visited.has("GPUs") && <Pane label="GPUs" show={showTab && tab === "GPUs"}><GpuView active={showTab && tab === "GPUs"} /></Pane>}
+        {visited.has("Files") && <Pane label="Files" show={showTab && tab === "Files"}>
           {me.user ? <FilesView key={me.user} /> : (
             <div className="panel">
               <h2>Files</h2>
@@ -220,28 +253,20 @@ function Session({ theme, setTheme }: { theme: Theme; setTheme: (t: Theme) => vo
             </div>)}
         </Pane>}
         {project && (() => {
+          // `active` = the tab is really on screen (not behind the dashboard or the New project form):
+          // polling stops otherwise, and coming back refreshes the tab's lists
+          const on = (t: Tab) => showTab && tab === t;
           const pane = (t: Tab, el: JSX.Element) => visited.has(t) && (
-            <Pane key={`${t}|${project.id}|${resets[t] ?? 0}`} show={showTab && tab === t}>{el}</Pane>);
+            <Pane key={`${t}|${project.id}|${resets[t] ?? 0}`} label={t} show={on(t)}>{el}</Pane>);
           return <>
-            {pane("Cases", <CasesView project={project} onChange={setProject} active={tab === "Cases"} />)}
-            {pane("Run", <RunView project={project} onSubmitted={onSubmitted} />)}
-            {pane("Jobs", <JobsView project={project.id} selected={job} onSelect={setJob} owner={project.owner} onOpenResults={() => {
-              setRun(null);
-              go("Results");
-            }} />)}
+            {pane("Cases", <CasesView project={project} onChange={changeProject} active={on("Cases")} />)}
+            {pane("Run", <RunPane project={project} onSubmitted={onSubmitted} />)}
+            {pane("Jobs", <JobsView project={project.id} selected={job} onSelect={setJob} owner={project.owner}
+              onOpenResults={openResults} active={on("Jobs")} />)}
             {pane("Results", <ResultsView project={project} runName={run} onRunChange={setRun}
-              onProjectChange={setProject} active={tab === "Results"}
-              onReset={() => { setRun(null); reset("Results"); }} />)}
-            {pane("Plots", <PlotsView project={project} onProjectChange={setProject} active={tab === "Plots"}
-              onReset={() => {
-                localStorage.removeItem(`mstar_post.plots.${project.id}`);
-                localStorage.removeItem(`mstar_post.means.${project.id}`);
-                localStorage.removeItem(`mstar_post.plotref.${project.id}`);
-                localStorage.removeItem(`mstar_post.plots.hidden.${project.id}`);
-                reset("Plots");
-              }} />)}
-            {pane("Viewer", <ViewerView project={project} active={tab === "Viewer"}
-              onRefresh={() => api.project(project.id, true).then(setProject)} />)}
+              onProjectChange={changeProject} active={on("Results")} onReset={resetResults} />)}
+            {pane("Plots", <PlotsView project={project} onProjectChange={changeProject} active={on("Plots")} onReset={resetPlots} />)}
+            {pane("Viewer", <ViewerView project={project} active={on("Viewer")} onRefresh={refreshProject} />)}
           </>;
         })()}
       </main>
@@ -249,8 +274,16 @@ function Session({ theme, setTheme }: { theme: Theme; setTheme: (t: Theme) => vo
   );
 }
 
-function Pane({ show, children }: { show: boolean; children: React.ReactNode }) {
-  return <div style={{ display: show ? "contents" : "none" }}>{children}</div>;
+// a render error in one tab is caught here: the header and the other tabs stay usable;
+// Suspense shows a line while the chunk of a lazily loaded tab is on its way
+function Pane({ show, label, children }: { show: boolean; label: string; children: React.ReactNode }) {
+  return (
+    <div style={{ display: show ? "contents" : "none" }}>
+      <ErrorBoundary label={`The ${label} tab`}>
+        <Suspense fallback={<div className="panel muted">Loading {label}...</div>}>{children}</Suspense>
+      </ErrorBoundary>
+    </div>
+  );
 }
 
 function NewProject({ onClose, onCreated, projects }: { onClose: () => void; onCreated: (p: Project) => void; projects: ProjectSummary[] }) {

@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
-import { api, type GpuStatus } from "./api";
-import { fmtBytes } from "./FilesView";
+import { memo, useEffect, useRef, useState } from "react";
+import { api, fmtBytes, type GpuStatus } from "./api";
+import { usePageVisible } from "./visible";
 
 const mib = (v: number | null | undefined) => (v === null || v === undefined ? "" : fmtBytes(v * 1024 * 1024));
 const ago = (t: number | null) => {
@@ -12,19 +12,27 @@ const ago = (t: number | null) => {
 const caseOf = (cmd: string | null) => cmd?.match(/--input=(\S+)\/input\.xml/)?.[1] ?? null;
 
 // Live status of every GPU: load, memory (free %), temperature, power and the processes on it.
-export default function GpuView({ active }: { active: boolean }) {
+export default memo(function GpuView({ active }: { active: boolean }) {
   const [data, setData] = useState<GpuStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [auto, setAuto] = useState(true);
   const [open, setOpen] = useState<Record<number, boolean>>({});
-  const load = () => api.gpus().then((d) => { setData(d); setError(null); }).catch((e) => setError(e.message));
+  const busyLoad = useRef(false);
+  // one request at a time: a slow nvidia-smi must not pile up requests or let an older reply win
+  const load = () => {
+    if (busyLoad.current) return;
+    busyLoad.current = true;
+    api.gpus().then((d) => { setData(d); setError(null); }).catch((e) => setError(e.message))
+      .finally(() => { busyLoad.current = false; });
+  };
+  const shown = usePageVisible() && active;  // no polling while the tab or the browser window is hidden
   useEffect(() => {
-    if (!active) return;
+    if (!shown) return;
     load();
     if (!auto) return;
     const id = setInterval(load, 5000);
     return () => clearInterval(id);
-  }, [active, auto]);
+  }, [shown, auto]);
 
   const gpus = data?.gpus ?? [];
   const busy = gpus.filter((g) => g.processes.length).length;
@@ -102,4 +110,4 @@ export default function GpuView({ active }: { active: boolean }) {
         nvidia-smi and /proc.</div>
     </div>
   );
-}
+});

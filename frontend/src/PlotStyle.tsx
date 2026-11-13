@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Project } from "./api";
 import { caseName } from "./api";
 
@@ -38,7 +38,8 @@ export function usePlotStyle(pid: string): [PlotStyle, (s: PlotStyle) => void] {
     try { return { ...DEFAULT_STYLE, ...JSON.parse(localStorage.getItem(key) ?? "{}") }; } catch { return DEFAULT_STYLE; }
   };
   const [style, setStyle] = useState<PlotStyle>(load);
-  useEffect(() => setStyle(load()), [key]); // eslint-disable-line react-hooks/exhaustive-deps
+  const loadedFor = useRef(key);  // the initial state already is the saved style: reload only for another project
+  useEffect(() => { if (loadedFor.current !== key) { loadedFor.current = key; setStyle(load()); } }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => localStorage.setItem(key, JSON.stringify(style)), [key, style]);
   return [style, setStyle];
 }
@@ -84,16 +85,33 @@ export function styleLayout(s: PlotStyle, layout: Record<string, unknown>, nLege
 
 const ANGLES = ["auto", 0, -30, -45, -60, -90] as const;
 
+// A number of the style: what is typed stays in the box (also while it is not yet a valid value,
+// e.g. "2" on the way to "20"); the style changes with every valid value and the box shows the
+// applied value again when it loses the focus.
+function NumField({ label, value, min, max, step, onChange }: {
+  label: string; value: number; min: number; max: number; step: number; onChange: (v: number) => void;
+}) {
+  const [text, setText] = useState<string | null>(null);
+  const bad = text !== null && !(text.trim() !== "" && Number(text) >= min && Number(text) <= max);
+  return (
+    <label title={`${min} to ${max}`}>{label} <input type="number" className="short" min={min} max={max} step={step}
+      value={text ?? value} style={bad ? { outline: "1px solid var(--bad)" } : undefined}
+      onBlur={() => setText(null)}
+      onChange={(e) => {
+        setText(e.target.value);
+        const v = Number(e.target.value);
+        if (e.target.value.trim() !== "" && Number.isFinite(v) && v >= min && v <= max) onChange(v);
+      }} /></label>
+  );
+}
+
 export function PlotStyleEditor({ style, setStyle, project, caseIds }: {
   style: PlotStyle; setStyle: (s: PlotStyle) => void; project: Project; caseIds: string[];
 }) {
   const set = (p: Partial<PlotStyle>) => setStyle({ ...style, ...p });
   const num = (k: keyof PlotStyle, label: string, min: number, max: number, step = 1) => (
-    <label>{label} <input type="number" className="short" min={min} max={max} step={step}
-      value={style[k] as number} onChange={(e) => {
-        const v = Number(e.target.value);
-        if (Number.isFinite(v) && v >= min && v <= max) set({ [k]: v } as Partial<PlotStyle>);
-      }} /></label>
+    <NumField label={label} value={style[k] as number} min={min} max={max} step={step}
+              onChange={(v) => set({ [k]: v } as Partial<PlotStyle>)} />
   );
   const angle = (k: "xTickAngle" | "yTickAngle", label: string) => (
     <label>{label} <select value={String(style[k])}

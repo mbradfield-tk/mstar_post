@@ -1,21 +1,23 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type Plotly from "plotly.js-dist-min";
-import { api, caseName, download, fmt, toCsv, type Project, type Run, type VarEntry } from "./api";
+import { api, caseName, download, fmt, toCsv, type Project, type Run, type StatsFile, type VarEntry } from "./api";
 import Plot from "./Plot";
 import { caseColor, type PlotStyle } from "./PlotStyle";
-import { pct, runHasCases, selectedCaseIds } from "./results";
+import { pct, PCT_HELP, runHasCases, runStamp, selectedCaseIds } from "./results";
 
 type Kind = "stats" | "series" | "table" | "long";
 const KIND_LABEL: Record<Kind, string> = {
   stats: "M-Star Stats time series", series: "App script time series", table: "Result table", long: "Steady-state mean",
 };
-// one variable in one place; paths: case id -> file (per-case files) or "" -> the run-level file
+// one variable in one place; paths: case id -> file (per-case files) or "" -> the run-level file;
+// low = lower-case text the search words are matched against
 type Hit = { key: string; kind: Kind; variable: string; file: string; srcFile?: string; run?: Run;
-             cases: string[]; paths: Map<string, string> };
+             cases: string[]; paths: Map<string, string>; low: string };
 
-export default function VariableSearch({ project, style, refCase, onPlotSeries }: {
+export default function VariableSearch({ project, style, refCase, onPlotSeries, active = true }: {
   project: Project; style: PlotStyle; refCase: string;
   onPlotSeries: (src: string, file: string, col: string) => void;
+  active?: boolean;  // shown: the mode stays mounted while another one is shown
 }) {
   const store = `mstar_post.varsearch.${project.id}`;
   const [query, setQuery] = useState(() => localStorage.getItem(store) ?? "");
@@ -30,23 +32,41 @@ export default function VariableSearch({ project, style, refCase, onPlotSeries }
   const selKey = [...selIds].join("|");
   const selCases = project.cases.filter((c) => selIds.has(c.id));
 
+  // the run list, and the index of their variables whenever the runs changed (first show, a job finished
+  // or was made again while another mode or tab was shown)
+  const runsKey = useRef<string | null>(null);
   useEffect(() => {
-    api.runs(project.id).then(setRuns).catch((e) => setError(e.message));
-    api.variables(project.id).then(setEntries).catch((e) => setError(e.message));
-  }, [project.id]);
+    if (!active) return;
+    api.runs(project.id).then((rs) => {
+      const key = rs.map(runStamp).join("|");
+      if (key === runsKey.current) return;
+      runsKey.current = key;
+      setRuns(rs);
+      setError(null);
+      api.variables(project.id).then(setEntries).catch((e) => setError(e.message));
+    }).catch((e) => setError(e.message));
+  }, [project.id, active]);
   useEffect(() => {
-    selCases.filter((c) => !stats[c.id]).forEach((c) => api.stats(c.path)
-      .then((fs) => setStats((m) => ({ ...m, [c.id]: fs })))
-      .catch(() => setStats((m) => ({ ...m, [c.id]: [] }))));
+    const todo = selCases.filter((c) => !stats[c.id]);
+    if (!todo.length) return;
+    // one state update for all cases
+    Promise.all(todo.map((c) => api.stats(c.path).catch(() => [] as StatsFile[]).then((fs) => [c.id, fs] as const)))
+      .then((got) => setStats((m) => ({ ...m, ...Object.fromEntries(got) })));
   }, [selKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const hits = useMemo(() => {
     const out = new Map<string, Hit>();
-    const add = (key: string, h: Omit<Hit, "key" | "cases" | "paths">, cid: string | null, path: string) => {
-      const e: Hit = out.get(key) ?? { ...h, key, cases: [], paths: new Map() };
-      if (cid && !e.cases.includes(cid)) e.cases.push(cid);
+    const seen = new Map<string, Set<string>>();
+    const add = (key: string, h: Omit<Hit, "key" | "cases" | "paths" | "low">, cid: string | null, path: string) => {
+      let e = out.get(key);
+      if (!e) {
+        e = { ...h, key, cases: [], paths: new Map(), low: `${h.variable} ${h.file} ${h.srcFile ?? ""}`.toLowerCase() };
+        out.set(key, e);
+        seen.set(key, new Set());
+      }
+      if (cid && !seen.get(key)!.has(cid)) { seen.get(key)!.add(cid); e.cases.push(cid); }
       e.paths.set(cid ?? "", path);
-      out.set(key, e);
+      return e;
     };
     for (const c of selCases) for (const f of stats[c.id] ?? []) for (const col of f.columns)
       add(`stats|${f.file}|${col}`, { kind: "stats", variable: col, file: f.file }, c.id, f.file);
@@ -55,13 +75,16 @@ export default function VariableSearch({ project, style, refCase, onPlotSeries }
       const run = byName.get(e.run);
       if (!run) continue;
       if (e.case) {
+        // a file in a case folder: the same file of every selected case is one hit, also the per-case
+        // long tables (<case>/stats_summary.csv has no case column: the folder says which case it is)
         if (!selIds.has(e.case)) continue;
         const rel = e.path.startsWith(`${e.case}/`) ? e.path.slice(e.case.length + 1) : e.path;
-        for (const col of e.columns as string[]) {
-          if (e.kind === "series") add(`series|${e.run}|${rel}|${col}`, { kind: "series", variable: col, file: rel, run }, e.case, e.path);
-          else if (e.kind === "table") add(`table|${e.run}|${rel}|${col}`, { kind: "table", variable: col, file: rel, run }, e.case, e.path);
+        for (const col of e.columns) {
+          const [v, src] = Array.isArray(col) ? col : [col, ""];
+          if (e.kind === "long") add(`long|${e.run}|${rel}|${v}|${src}`, { kind: "long", variable: v, file: rel, srcFile: src || undefined, run }, e.case, e.path);
+          else add(`${e.kind}|${e.run}|${rel}|${v}`, { kind: e.kind, variable: v, file: rel, run }, e.case, e.path);
         }
-        if (e.kind !== "long") continue;
+        continue;
       }
       const cs = e.cases.filter((id) => selIds.has(id));
       if (e.cases.length && !cs.length) continue;
@@ -77,9 +100,9 @@ export default function VariableSearch({ project, style, refCase, onPlotSeries }
   }, [entries, runs, stats, selKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const words = query.toLowerCase().split(/\s+/).filter(Boolean);
-  const found = words.length ? hits.filter((h) => kinds.includes(h.kind)
-    && words.every((w) => `${h.variable} ${h.file} ${h.srcFile ?? ""}`.toLowerCase().includes(w)))
-    .sort((a, b) => a.variable.localeCompare(b.variable) || a.kind.localeCompare(b.kind)) : [];
+  const found = useMemo(() => (words.length ? hits.filter((h) => kinds.includes(h.kind) && words.every((w) => h.low.includes(w)))
+    .sort((a, b) => a.variable.localeCompare(b.variable) || a.kind.localeCompare(b.kind)) : []),
+    [hits, kinds, words.join(" ")]); // eslint-disable-line react-hooks/exhaustive-deps
   const MAX = 300;
   const loading = entries === null || selCases.some((c) => !stats[c.id]);
   const runLabel = (r?: Run) => r ? `${r.label ?? r.task ?? r.name} (${r.name.slice(0, 15)})` : "case folder";
@@ -130,7 +153,9 @@ export default function VariableSearch({ project, style, refCase, onPlotSeries }
 function HitView({ project, hit, style, refCase, onClose }: {
   project: Project; hit: Hit; style: PlotStyle; refCase: string; onClose: () => void;
 }) {
-  const [traces, setTraces] = useState<Plotly.Data[] | null>(null);
+  // what was read (one curve per case, or one for a run-level table); the traces are built from it
+  // on every change of the style, the reference case or the case names
+  const [curves, setCurves] = useState<{ id: string; x: (number | string | null)[]; y: (number | null)[]; marks?: boolean }[] | null>(null);
   const [bars, setBars] = useState<{ id: string; v: number | null; std?: number | null }[] | null>(null);
   const [xTitle, setXTitle] = useState("Time [s]");
   const [error, setError] = useState<string | null>(null);
@@ -138,34 +163,42 @@ function HitView({ project, hit, style, refCase, onClose }: {
   const runPath = hit.run ? `${hit.run.path}/` : "";
 
   useEffect(() => {
-    const line = (id: string, x: (number | string | null)[], y: (number | null)[]): Plotly.Data => ({
-      type: "scattergl", mode: "lines", name: caseName(project, id), x, y,
-      line: { color: color(id), width: id === refCase ? style.lineWidth * 1.9 : style.lineWidth },
-    });
     const num = (v: unknown) => (typeof v === "number" ? v : null);
     const go = async () => {
       if (hit.kind === "stats") {
         const ps = hit.cases.map((id) => {
           const c = project.cases.find((x) => x.id === id)!;
-          return api.series(c.path, hit.paths.get(id)!, [hit.variable]).then((s) => line(id, s.t, s.columns[hit.variable] ?? [])).catch(() => null);
+          return api.series(c.path, hit.paths.get(id)!, [hit.variable]).then((s) => ({ id, x: s.t, y: s.columns[hit.variable] ?? [] })).catch(() => null);
         });
-        setTraces((await Promise.all(ps)).filter((t): t is Plotly.Data => !!t));
+        setCurves((await Promise.all(ps)).filter((t): t is NonNullable<typeof t> => !!t));
       } else if (hit.kind === "series") {
         const s = await api.runSeries(project.id, hit.run!.name, hit.file, [hit.variable], hit.cases);
-        setTraces(Object.entries(s).map(([id, d]) => line(id, d.t, d.columns[hit.variable] ?? [])));
+        setCurves(Object.entries(s).map(([id, d]) => ({ id, x: d.t, y: d.columns[hit.variable] ?? [] })));
       } else if (hit.kind === "long") {
-        const t = await api.csv(project.id, `${runPath}${hit.file}`);
-        const ix = (n: string) => t.columns.findIndex((c) => c.trim().toLowerCase() === n);
-        const iC = ix("case"), iF = ix("file"), iV = ix("variable"), iM = ix("mean"), iS = ix("std");
-        const rows = t.rows.filter((r) => r[iV] === hit.variable && (iF < 0 || String(r[iF] ?? "") === (hit.srcFile ?? "")));
-        setBars(rows.filter((r) => iC < 0 || !hit.cases.length || hit.cases.includes(String(r[iC])))
-          .map((r) => ({ id: iC < 0 ? project.cases[0]?.id ?? "" : String(r[iC]), v: num(r[iM]), std: iS >= 0 ? num(r[iS]) : null })));
+        // one run-level table with a case column, or the same table in the folder of every case
+        const files = hit.paths.has("") ? [["", hit.file] as const] : hit.cases.filter((id) => hit.paths.has(id)).map((id) => [id, hit.paths.get(id)!] as const);
+        const tables = await Promise.all(files.map(([id, f]) => api.csv(project.id, `${runPath}${f}`).then((t) => [id, t] as const)
+          .catch((e) => { if (!id) throw e; return null; })));
+        const out: { id: string; v: number | null; std: number | null }[] = [];
+        for (const x of tables) {
+          if (!x) continue;
+          const [id, t] = x;
+          const ix = (n: string) => t.columns.findIndex((c) => c.trim().toLowerCase() === n);
+          const iC = ix("case"), iF = ix("file"), iV = ix("variable"), iM = ix("mean"), iS = ix("std");
+          for (const r of t.rows) {
+            if (r[iV] !== hit.variable || (iF >= 0 && String(r[iF] ?? "") !== (hit.srcFile ?? ""))) continue;
+            const cid = id || (iC >= 0 ? String(r[iC]) : project.cases[0]?.id ?? "");
+            if (!id && iC >= 0 && hit.cases.length && !hit.cases.includes(cid)) continue;
+            out.push({ id: cid, v: num(r[iM]), std: iS >= 0 ? num(r[iS]) : null });
+          }
+        }
+        setBars(out);
       } else if (hit.paths.has("")) {
         // run-level table without a case column: the variable against the first column
         const t = await api.csv(project.id, `${runPath}${hit.file}`);
         const j = t.columns.indexOf(hit.variable);
         setXTitle(t.columns[0]);
-        setTraces([{ type: "scatter", mode: "lines+markers", name: hit.variable, x: t.rows.map((r) => r[0]), y: t.rows.map((r) => num(r[j])) }]);
+        setCurves([{ id: "", x: t.rows.map((r) => r[0]), y: t.rows.map((r) => num(r[j])), marks: true }]);
       } else {
         // per-case files: one value per case (single row) or the variable against the first column
         const ids = hit.cases.filter((id) => hit.paths.has(id));
@@ -175,8 +208,7 @@ function HitView({ project, hit, style, refCase, onClose }: {
           setBars(ok.map(([id, t]) => ({ id, v: num(t.rows[0]?.[t.columns.indexOf(hit.variable)]) })));
         } else {
           setXTitle(ok[0]?.[1].columns[0] ?? "");
-          setTraces(ok.map(([id, t]) => ({ ...line(id, t.rows.map((r) => r[0]), t.rows.map((r) => num(r[t.columns.indexOf(hit.variable)]))),
-            type: "scatter", mode: "lines+markers" } as Plotly.Data)));
+          setCurves(ok.map(([id, t]) => ({ id, x: t.rows.map((r) => r[0]), y: t.rows.map((r) => num(r[t.columns.indexOf(hit.variable)])), marks: true })));
         }
       }
     };
@@ -190,9 +222,26 @@ function HitView({ project, hit, style, refCase, onClose }: {
   }, [hit.key]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const order = (id: string) => project.cases.findIndex((c) => c.id === id);
-  const sorted = bars ? [...bars].sort((a, b) => order(a.id) - order(b.id)) : null;
+  const sorted = useMemo(() => (bars ? [...bars].sort((a, b) => order(a.id) - order(b.id)) : null), [bars, project]); // eslint-disable-line react-hooks/exhaustive-deps
   const ref = sorted?.find((b) => b.id === refCase)?.v ?? null;
   const title = `${hit.variable}${hit.srcFile ? ` (${hit.srcFile})` : ""}`;
+  // figures keep their identity while nothing they show changes (typing in the search box must not redraw them)
+  const traces = useMemo(() => curves?.map((c): Plotly.Data => (c.id
+    ? { type: c.marks ? "scatter" : "scattergl", mode: c.marks ? "lines+markers" : "lines", name: caseName(project, c.id), x: c.x, y: c.y,
+        line: { color: color(c.id), width: c.id === refCase ? style.lineWidth * 1.9 : style.lineWidth } }
+    : { type: "scatter", mode: "lines+markers", name: hit.variable, x: c.x, y: c.y })) ?? null,
+    [curves, style, refCase, project]); // eslint-disable-line react-hooks/exhaustive-deps
+  const curveLayout = useMemo(() => ({
+    xaxis: { title: { text: xTitle } }, yaxis: { title: { text: hit.variable } },
+    legend: { orientation: "h" as const, y: 1.02, yanchor: "bottom" as const }, margin: { t: 40, r: 20, b: 50, l: 80 } }), [xTitle, hit.variable]);
+  const barData = useMemo((): Plotly.Data[] => (sorted ? [{
+    type: "bar", x: sorted.map((b) => caseName(project, b.id)), y: sorted.map((b) => b.v),
+    error_y: sorted.some((b) => b.std) ? { type: "data", array: sorted.map((b) => b.std ?? 0), visible: true } : undefined,
+    marker: { color: style.barsByCase ? sorted.map((b) => color(b.id)) : style.barColor,
+              line: { color: "#000", width: sorted.map((b) => (b.id === refCase ? 2 : 0)) } },
+    hovertemplate: "%{x}: %{y:.5g}<extra></extra>",
+  }] : []), [sorted, style, refCase, project]); // eslint-disable-line react-hooks/exhaustive-deps
+  const barLayout = useMemo(() => ({ title: { text: title, font: { size: 13 } }, margin: { t: 50, b: 110, l: 70, r: 20 } }), [title]);
   return (
     <div className="card">
       <div className="row">
@@ -205,21 +254,13 @@ function HitView({ project, hit, style, refCase, onClose }: {
       {error && <div className="error">{error}</div>}
       {!error && !traces && !sorted && <div className="muted">Loading...</div>}
       {traces && (traces.length
-        ? <Plot exportName={hit.variable} style={style} height={Math.round(420 * style.heightScale)} data={traces} layout={{
-            xaxis: { title: { text: xTitle } }, yaxis: { title: { text: hit.variable } },
-            legend: { orientation: "h", y: 1.02, yanchor: "bottom" }, margin: { t: 40, r: 20, b: 50, l: 80 } }} />
+        ? <Plot exportName={hit.variable} style={style} height={Math.round(420 * style.heightScale)} data={traces} layout={curveLayout} />
         : <div className="muted">No data for the selected cases.</div>)}
       {sorted && (sorted.length ? (
         <>
-          <Plot exportName={hit.variable} style={style} height={Math.round(380 * style.heightScale)} data={[{
-            type: "bar", x: sorted.map((b) => caseName(project, b.id)), y: sorted.map((b) => b.v),
-            error_y: sorted.some((b) => b.std) ? { type: "data", array: sorted.map((b) => b.std ?? 0), visible: true } : undefined,
-            marker: { color: style.barsByCase ? sorted.map((b) => color(b.id)) : style.barColor,
-                      line: { color: "#000", width: sorted.map((b) => (b.id === refCase ? 2 : 0)) } },
-            hovertemplate: "%{x}: %{y:.5g}<extra></extra>",
-          }]} layout={{ title: { text: title, font: { size: 13 } }, margin: { t: 50, b: 110, l: 70, r: 20 } }} />
+          <Plot exportName={hit.variable} style={style} height={Math.round(380 * style.heightScale)} data={barData} layout={barLayout} />
           <table className="grid narrow">
-            <thead><tr><th>case</th><th>value</th>{sorted.some((b) => b.std != null) && <th>std</th>}<th>% vs ref</th></tr></thead>
+            <thead><tr><th>case</th><th>value</th>{sorted.some((b) => b.std != null) && <th>std</th>}<th title={PCT_HELP}>% vs ref</th></tr></thead>
             <tbody>{sorted.map((b) => (
               <tr key={b.id} className={b.id === refCase ? "refrow" : ""}><td className="mono" title={b.id}>{caseName(project, b.id)}</td>
                 <td className="num">{fmt(b.v)}</td>{sorted.some((x) => x.std != null) && <td className="num">{fmt(b.std ?? null)}</td>}

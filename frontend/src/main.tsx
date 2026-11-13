@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import ErrorBoundary from "./ErrorBoundary";
 import { installColumnResize } from "./colresize";
 import { installStickyScroll } from "./stickyscroll";
 import "./styles.css";
@@ -10,6 +11,6 @@ installStickyScroll();
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <App />
+    <ErrorBoundary label="The app"><App /></ErrorBoundary>
   </React.StrictMode>,
 );

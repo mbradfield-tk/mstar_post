@@ -93,9 +93,9 @@ def case_info(cid: str, case: Path, stats: Path) -> dict:
     vol = s.get("Fluid volume (total, initial) [m^3]")
     if isinstance(vol, (int, float)):
         s["Volume [L]"] = 1000.0 * vol
-    rpm = [v for k, v in s.items() if k.startswith("Impeller speed") and isinstance(v, (int, float))]
+    rpm = [abs(v) for k, v in s.items() if k.startswith("Impeller speed") and isinstance(v, (int, float))]
     if rpm:
-        s["Agitator speed [rpm]"] = rpm[0] if len(rpm) == 1 else max(rpm)
+        s["Agitator speed [rpm]"] = max(rpm)  # M-Star's <freq> is signed (sense of rotation)
     _info_cache[key] = (time.monotonic(), info)
     return info
 
@@ -207,34 +207,26 @@ def decimate_idx(values: np.ndarray, max_points: int) -> np.ndarray:
     points) so peaks of turbulent traces survive, unlike a plain stride. Rows of
     `values` with only NaN keep their first sample. values: (n, k) or (n,)."""
     n = len(values)
+    max_points = max(1, max_points)
     if n <= max_points:
         return np.arange(n)
     v = np.asarray(values, float).reshape(n, -1)
-    edges = np.linspace(0, n, max_points + 1).astype(int)
-    keep = {0, n - 1}
-    with np.errstate(invalid="ignore"):
-        for a, b in zip(edges[:-1], edges[1:]):
-            if b <= a:
-                continue
-            blk = v[a:b]
-            hit = False
-            for j in range(blk.shape[1]):
-                if np.isfinite(blk[:, j]).any():
-                    keep.add(a + int(np.nanargmin(blk[:, j])))
-                    keep.add(a + int(np.nanargmax(blk[:, j])))
-                    hit = True
-            if not hit:
-                keep.add(a)
-    return np.fromiter(sorted(keep), int)
+    edges = np.linspace(0, n, max_points + 1).astype(int)[:-1]  # strictly increasing: n > max_points
+    bucket = np.repeat(np.arange(len(edges)), np.diff(np.append(edges, n)))
+    has = np.logical_or.reduceat(np.isfinite(v), edges, axis=0)  # (bucket, column)
+    keep = [np.array([0, n - 1]), edges[~has.any(axis=1)]]
+    nan = np.isnan(v)
+    for fill, ext in ((np.inf, np.minimum), (-np.inf, np.maximum)):
+        x = np.where(nan, fill, v)
+        best = ext.reduceat(x, edges, axis=0)
+        for j in range(v.shape[1]):
+            hit = np.flatnonzero((x[:, j] == best[bucket, j]) & has[bucket, j])
+            keep.append(hit[np.unique(bucket[hit], return_index=True)[1]])  # first row of each bucket
+    return np.unique(np.concatenate(keep))
 
 
-def series(stats_file: Path, columns: list[str], max_points: int = 4000) -> dict:
-    """Time series of the given columns, decimated to about max_points buckets
-    (min and max of each bucket kept)."""
-    table = _table(str(stats_file), stats_file.stat().st_mtime_ns)
-    if table is None:
-        raise ValueError(f"{stats_file.name} is not a stats table")
-    header, data = table
+def _columns(header: list[str], columns: list[str]) -> list[int]:
+    """Indices of the requested columns, by the unit-fixed name or the raw header."""
     raw = [h.strip() for h in header]
     names = [mss.fix_unit(h) for h in raw]  # M-Star's [-] made explicit
     cols = []
@@ -245,9 +237,50 @@ def series(stats_file: Path, columns: list[str], max_points: int = 4000) -> dict
             cols.append(raw.index(c))
         else:
             raise KeyError(c)
+    return cols
+
+
+def series(stats_file: Path, columns: list[str], max_points: int = 4000) -> dict:
+    """Time series of the given columns, decimated to about max_points buckets
+    (min and max of each bucket kept)."""
+    table = _table(str(stats_file), stats_file.stat().st_mtime_ns)
+    if table is None:
+        raise ValueError(f"{stats_file.name} is not a stats table")
+    header, data = table
+    cols = _columns(header, columns)
     rows = data[decimate_idx(data[:, cols] if cols else data[:, :1], max_points)]
     out = {"t": [float(x) for x in rows[:, 0]], "columns": {}}
     for c, j in zip(columns, cols):
         v = rows[:, j]
         out["columns"][c] = [float(x) if np.isfinite(x) else None for x in v]
     return out
+
+
+def window_stats(t: np.ndarray, v: np.ndarray, t_from: float | None = None,
+                 t_to: float | None = None) -> dict:
+    """n, mean, std (n - 1), min and max of the finite samples with t_from <= t <= t_to
+    (None = open end), and the last finite value of the whole column."""
+    ok = np.isfinite(v)
+    w = ok & np.isfinite(t)
+    if t_from is not None:
+        w &= t >= t_from
+    if t_to is not None:
+        w &= t <= t_to
+    x = v[w]
+    n = int(x.size)
+    return {"n": n, "mean": float(x.mean()) if n else None,
+            "std": float(x.std(ddof=1)) if n > 1 else None,
+            "min": float(x.min()) if n else None, "max": float(x.max()) if n else None,
+            "last": float(v[ok][-1]) if ok.any() else None}
+
+
+def series_stats(stats_file: Path, columns: list[str], t_from: float | None = None,
+                 t_to: float | None = None) -> dict:
+    """Window statistics of the given columns over every row of the file: the plotted
+    series are decimated to bucket extremes, which would bias a mean or std taken from them."""
+    table = _table(str(stats_file), stats_file.stat().st_mtime_ns)
+    if table is None:
+        raise ValueError(f"{stats_file.name} is not a stats table")
+    header, data = table
+    return {c: window_stats(data[:, 0], data[:, j], t_from, t_to)
+            for c, j in zip(columns, _columns(header, columns))}

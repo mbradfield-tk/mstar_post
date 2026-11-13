@@ -130,6 +130,24 @@ def _pid_alive(pid: int | None) -> bool:
     return stat.rsplit(")", 1)[-1].split()[0] != "Z"
 
 
+def _is_job_process(j: dict) -> bool:
+    """True when the stored PID still is this job's process: it runs in the job's run
+    folder (or, when its cwd cannot be read, was started with it on the command line).
+    A PID reused by something else after a reboot must never be signalled."""
+    if not _pid_alive(j["pid"]):
+        return False
+    run = str(j["run_dir"])
+    try:
+        cwd = os.readlink(f"/proc/{j['pid']}/cwd")
+        return cwd == run or cwd.startswith(run + "/")
+    except OSError:  # sudo-launched job: /proc/<pid>/cwd is root's
+        pass
+    try:
+        return run in Path(f"/proc/{j['pid']}/cmdline").read_bytes().decode(errors="replace")
+    except OSError:
+        return False
+
+
 def _clear_run_dir(j: dict, recreate: bool) -> Path:
     """Delete a job's run folder (only inside the projects folder); with
     recreate, make it and the commands' working folders again."""
@@ -153,13 +171,14 @@ class JobManager:
         self._procs: dict[str, asyncio.subprocess.Process] = {}
         self._cancel: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
+        self._clearing: set[str] = set()  # jobs whose run folder is being removed in a thread
         self._started = False
 
     async def startup(self) -> None:
         init_db()
         for j in list_jobs():
             if j["status"] == "running":
-                if _pid_alive(j["pid"]):  # orphaned by a backend restart
+                if _is_job_process(j):  # orphaned by a backend restart
                     try:
                         os.killpg(j["pid"], signal.SIGTERM)
                     except OSError:
@@ -217,11 +236,16 @@ class JobManager:
         self._sockets.discard(ws)
 
     async def delete(self, jid: str) -> None:
-        """Remove a finished job and its run folder."""
+        """Remove a finished job and its run folder (removed in a thread: a run folder can
+        hold gigabytes and must not stall the event loop)."""
         j = self._idle(jid)
-        _clear_run_dir(j, recreate=False)
-        with _conn() as c:
-            c.execute("DELETE FROM jobs WHERE id=?", (jid,))
+        self._clearing.add(jid)
+        try:
+            await asyncio.to_thread(_clear_run_dir, j, False)
+            with _conn() as c:
+                c.execute("DELETE FROM jobs WHERE id=?", (jid,))
+        finally:
+            self._clearing.discard(jid)
         for ws in list(self._sockets):
             try:
                 await ws.send_json({"type": "job_deleted", "id": jid, "project": j["project"]})
@@ -233,12 +257,16 @@ class JobManager:
         is then attributed to the user re-running it."""
         j = self._idle(jid)
         user = clean_user(user)
-        run = _clear_run_dir(j, recreate=True)
-        (run / "job.json").write_text(json.dumps(
-            {"id": jid, "task": j["task"], "label": j["label"], "user": user,
-             "params": j["params"], "commands": j["commands"]}, indent=2))
-        _update(jid, status="queued", created_at=time.time(), started_at=None,
-                finished_at=None, returncode=None, pid=None, step=0, error=None, user=user)
+        self._clearing.add(jid)
+        try:
+            run = await asyncio.to_thread(_clear_run_dir, j, True)
+            (run / "job.json").write_text(json.dumps(
+                {"id": jid, "task": j["task"], "label": j["label"], "user": user,
+                 "params": j["params"], "commands": j["commands"]}, indent=2))
+            _update(jid, status="queued", created_at=time.time(), started_at=None,
+                    finished_at=None, returncode=None, pid=None, step=0, error=None, user=user)
+        finally:
+            self._clearing.discard(jid)
         await self._broadcast(jid)
         await self._dispatch()
         return get_job(jid)
@@ -264,13 +292,14 @@ class JobManager:
         await self._broadcast(jid)
         return get_job(jid)
 
-    @staticmethod
-    def _idle(jid: str) -> dict:
+    def _idle(self, jid: str) -> dict:
         j = get_job(jid)
         if j is None:
             raise KeyError(jid)
         if j["status"] in ("queued", "running"):
             raise RuntimeError("job is still active; cancel it first")
+        if jid in self._clearing:
+            raise RuntimeError("job is already being deleted or re-run")
         return j
 
     # -- internals ---------------------------------------------------------
@@ -317,7 +346,7 @@ class JobManager:
         await self._broadcast(jid)
         log = Path(j["run_dir"]) / "job.log"
         status, rc, err = "done", 0, None
-        failed_steps = 0
+        failed_steps, aborted = 0, False
         try:
             for i, cmd in enumerate(j["commands"]):
                 if jid in self._cancel:
@@ -337,20 +366,29 @@ class JobManager:
                 self._procs[jid] = p
                 _update(jid, pid=p.pid)
                 await self._broadcast(jid)
-                rc = await p.wait()
+                step_rc = await p.wait()
                 self._procs.pop(jid, None)
-                if rc != 0:
-                    failed_steps += 1
+                if step_rc != 0:
+                    failed_steps, rc = failed_steps + 1, step_rc
                     with open(log, "ab") as fh:
-                        fh.write(f"[mstar_post] step {i + 1} exited with code {rc}\n".encode())
+                        fh.write(f"[mstar_post] step {i + 1} exited with code {step_rc}\n".encode())
                     if not cmd.get("continue_on_error"):
+                        aborted = True
                         break
             if jid in self._cancel:
                 status, err = "cancelled", None
             elif failed_steps:
-                status = "failed" if rc != 0 or failed_steps == len(j["commands"]) \
-                    else "done"
+                # per-case steps (continue_on_error): the job counts as done while any case
+                # succeeded, whichever case failed; the error line says how many did
+                status = "failed" if aborted or failed_steps == len(j["commands"]) else "done"
                 err = f"{failed_steps} of {len(j['commands'])} step(s) failed"
+        except asyncio.CancelledError:  # backend shutdown: the process was signalled, not finished
+            self._procs.pop(jid, None)
+            if jid in self._cancel:
+                status, err = "cancelled", None
+            else:
+                status, err, rc = "failed", "interrupted by a backend restart", None
+            raise
         except Exception as e:  # e.g. executable not found
             status, err, rc = "failed", str(e), -1
             with open(log, "ab") as fh:

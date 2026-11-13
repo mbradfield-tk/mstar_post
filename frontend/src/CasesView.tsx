@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
-import { api, caseName, download, fmt, toCsv, type Project, type ProjectCase, type Run, type SolveState } from "./api";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { api, cachedRuns, cachedTasks, caseName, download, fmt, RUNS_CHANGED, toCsv, type Project, type ProjectCase, type Run, type SolveState } from "./api";
 import ProjectMetaEditor from "./ProjectMeta";
 import { useUser } from "./user";
+import { usePageVisible } from "./visible";
 
 // Key settings shown as columns (matched by prefix); columns that are blank for every case are dropped.
 const KEY_SETTINGS = ["Volume [L]", "Agitator speed [rpm]", "Simulated time (input runtime)", "Wall time",
@@ -112,29 +113,39 @@ export function SolveTag({ s }: { s: SolveState | undefined }) {
   );
 }
 
-// Solver states of the project's cases, refreshed every 30 s while shown.
+// Solver states of the project's cases, refreshed every 30 s while shown (not in a background browser tab;
+// one request at a time, the next 30 s after the reply).
 export function useSolves(pid: string, active: boolean) {
   const [solves, setSolves] = useState<Record<string, SolveState> | null>(null);
+  const shown = usePageVisible() && active;
   useEffect(() => {
-    if (!active) return;
-    let live = true;
-    const load = () => api.solves(pid).then((s) => live && setSolves(s)).catch(() => undefined);
+    if (!shown) return;
+    let live = true, timer = 0;
+    const load = () => api.solves(pid).then((s) => { if (live) setSolves(s); }).catch(() => undefined)
+      .finally(() => { if (live) timer = window.setTimeout(load, 30000); });
     load();
-    const id = setInterval(load, 30000);
-    return () => { live = false; clearInterval(id); };
-  }, [pid, active]);
+    return () => { live = false; clearTimeout(timer); };
+  }, [pid, shown]);
   return solves;
 }
 
 type CaseJob = { task: string; label: string; done: number; other: number; runs: Run[] };
 
-// Per case: the job types whose runs included it (from each run's params.cases), refreshed when the tab is shown.
+// Per case: the job types whose runs included it (from each run's params.cases), refreshed when the tab is shown
+// and when a job of the project changes (RUNS_CHANGED from the jobs store); run list and tasks come from the shared cache.
 function useCaseJobs(pid: string, active: boolean) {
   const [out, setOut] = useState<Record<string, CaseJob[]> | null>(null);
+  const [rev, setRev] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    const on = (e: Event) => { const d = (e as CustomEvent).detail; if (d === null || d === pid) setRev((r) => r + 1); };
+    window.addEventListener(RUNS_CHANGED, on);
+    return () => window.removeEventListener(RUNS_CHANGED, on);
+  }, [pid, active]);
   useEffect(() => {
     if (!active) return;
     let live = true;
-    Promise.all([api.runs(pid), api.tasks()]).then(([runs, tasks]) => {
+    Promise.all([cachedRuns(pid), cachedTasks()]).then(([runs, tasks]) => {
       const label = (t: string) => tasks.find((x) => x.id === t)?.label ?? t;
       const m: Record<string, Record<string, CaseJob>> = {};
       for (const r of runs) {
@@ -149,7 +160,7 @@ function useCaseJobs(pid: string, active: boolean) {
       if (live) setOut(Object.fromEntries(Object.entries(m).map(([id, t]) => [id, Object.values(t)])));
     }).catch(() => undefined);
     return () => { live = false; };
-  }, [pid, active]);
+  }, [pid, active, rev]);
   return out;
 }
 
@@ -169,7 +180,7 @@ function JobTags({ jobs }: { jobs: CaseJob[] | undefined }) {
   );
 }
 
-export default function CasesView({ project, onChange, active = true }: {
+export default memo(function CasesView({ project, onChange, active = true }: {
   project: Project;
   onChange: (p: Project) => void;
   active?: boolean;
@@ -181,21 +192,31 @@ export default function CasesView({ project, onChange, active = true }: {
   const solves = useSolves(project.id, active);
   const jobs = useCaseJobs(project.id, active);
   const cols = useMemo(() => settingCols(project.cases), [project]);
-  const shown = project.cases.filter((c) => c.id.toLowerCase().includes(filter.toLowerCase()));
+  const shown = useMemo(() => {
+    const q = filter.toLowerCase();
+    return project.cases.filter((c) => c.id.toLowerCase().includes(q));
+  }, [project.cases, filter]);
   const groups = useMemo(() => {
     const g = new Map<string, ProjectCase[]>();
     for (const c of shown) {
       const k = c.id.includes("/") ? c.id.slice(0, c.id.lastIndexOf("/")) : "";
-      g.set(k, [...(g.get(k) ?? []), c]);
+      const list = g.get(k);
+      if (list) list.push(c); else g.set(k, [c]);
     }
     return g;
   }, [shown]);
 
+  // PATCHes of a project are sent one after the other (api.patchProject), so their replies arrive in the
+  // order of the clicks and each contains every earlier change; `latest` keeps the case details
+  // (the reply has none) of the newest project state, not of the render that started the request
+  const latest = useRef(project);
+  latest.current = project;
   const patch = async (body: Parameters<typeof api.patchProject>[1]) => {
     setError(null);
     try {
       const p = await api.patchProject(project.id, body);
-      onChange({ ...p, cases: p.cases.map((c) => ({ ...c, info: project.cases.find((o) => o.id === c.id)?.info })) });
+      const info = new Map(latest.current.cases.map((c) => [c.id, c.info]));
+      onChange({ ...p, cases: p.cases.map((c) => ({ ...c, info: info.get(c.id) })) });
     } catch (e) { setError((e as Error).message); }
   };
   const setIncluded = (ids: string[], v: boolean) =>
@@ -203,6 +224,7 @@ export default function CasesView({ project, onChange, active = true }: {
 
   const rediscover = async () => {
     setBusy(true);
+    setError(null);
     try {
       await api.rediscover(project.id);
       onChange(await api.project(project.id));
@@ -239,7 +261,7 @@ export default function CasesView({ project, onChange, active = true }: {
           {project.purpose && <span><span className="muted">Purpose</span> {project.purpose}</span>}
           <span className="muted">Viewing as guest: log in to select cases or edit the project.</span>
         </div>
-      ) : <ProjectMetaEditor project={project} onChange={onChange} />}
+      ) : <ProjectMetaEditor project={project} onChange={onChange} patch={patch} />}
       <div className="small">
         <span className="muted">Tick the cases to work on: only selected cases are used by Run, Plots, Viewer and the case time series until you change the selection. </span>
         Selected cases: {simTimeSummary(project.cases.filter((c) => c.included))}
@@ -295,7 +317,7 @@ export default function CasesView({ project, onChange, active = true }: {
       </div>
     </div>
   );
-}
+});
 
 function SettingsDiff({ cases }: { cases: ProjectCase[] }) {
   const keys = useMemo(() => {

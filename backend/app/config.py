@@ -22,6 +22,8 @@ WRITE_ROOTS = _paths("MSTAR_POST_WRITE_ROOTS", "/data:/data2")
 DATA_DIR = Path(os.environ.get("MSTAR_POST_DATA", TOOLS_DIR.parent / "mstar_post_data")).resolve()
 PROJECTS_DIR = DATA_DIR / "projects"
 CACHE_DIR = DATA_DIR / "cache"
+# converted surfaces, isosurfaces and streamlines kept on disk; least recently used go first
+CACHE_MAX_BYTES = int(float(os.environ.get("MSTAR_POST_CACHE_GB", "20")) * 1024 ** 3)
 DB_PATH = DATA_DIR / "jobs.db"
 MAX_JOBS = int(os.environ.get("MSTAR_POST_MAX_JOBS", "1"))
 

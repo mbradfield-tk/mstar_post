@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { caseName, download, fmt, toCsv, type Project, type Run } from "./api";
-import { COND, condOf, fmtPct, loadAllResults, pct, type Cell, type Column, type RunResults } from "./results";
+import { COND, condOf, fmtPct, loadAllResults, newestFirst, pct, PCT_HELP, runStamp, selectedCaseIds,
+         type Cell, type Column, type RunResults } from "./results";
 
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleDateString() : "");
 const STORE = "mstar_post.allresults";
@@ -10,7 +11,7 @@ const unitOf = (col: string) => col.match(/\[([^\]]*)\]\s*$/)?.[1] ?? "";
 // run per case): the summary means, every M-Star Stats steady-state mean and the derived
 // values. The user picks which columns to show.
 export default function AllResults({ project, runs, storeKey }: {
-  project: Project; runs: Run[];  // newest first; one run or all finished runs of a job type
+  project: Project; runs: Run[];  // one run or all runs of a job type, in any order
   storeKey: string;
 }) {
   const [loaded, setLoaded] = useState<Record<string, RunResults>>({});
@@ -25,31 +26,35 @@ export default function AllResults({ project, runs, storeKey }: {
   });
   useEffect(() => localStorage.setItem(store, JSON.stringify(picked)), [store, picked]);
 
-  const done = runs.filter((r) => r.status === "done" || r.status === "unknown");
+  // finished runs, newest results first; loaded results are kept per run stamp (a run made again is read again)
+  const done = newestFirst(runs.filter((r) => r.status === "done" || r.status === "unknown"));
+  const stamps = done.map(runStamp).join("|");
   useEffect(() => {
     let live = true;
-    done.filter((r) => !loaded[r.name]).forEach((r) =>
-      loadAllResults(project, r).then((res) => live && setLoaded((m) => ({ ...m, [r.name]: res })))
+    setError(null);
+    done.filter((r) => !loaded[runStamp(r)]).forEach((r) =>
+      loadAllResults(project, r).then((res) => live && setLoaded((m) => ({ ...m, [runStamp(r)]: res })))
         .catch((e) => live && setError(e.message)));
     return () => { live = false; };
-  }, [done.map((r) => r.name).join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
-  const pending = done.filter((r) => !loaded[r.name]).length;
+  }, [stamps]); // eslint-disable-line react-hooks/exhaustive-deps
+  const pending = done.filter((r) => !loaded[runStamp(r)]).length;
 
   const merged = useMemo(() => {
     const columns: Column[] = [];
+    const seen = new Set<string>();
     const rows = new Map<string, Record<string, Cell>>();
     const std = new Map<string, Record<string, number>>();
     const origin = new Map<string, Run>();
     for (const r of done) {
-      const res = loaded[r.name];
+      const res = loaded[runStamp(r)];
       if (!res) continue;
-      res.columns.forEach((c) => !columns.some((x) => x.col === c.col) && columns.push(c));
+      res.columns.forEach((c) => { if (!seen.has(c.col)) { seen.add(c.col); columns.push(c); } });
       for (const [cid, row] of res.rows) if (!rows.has(cid)) { rows.set(cid, row); origin.set(cid, r); std.set(cid, res.std?.get(cid) ?? {}); }
     }
-    return { columns, rows, std, origin };
-  }, [loaded, done.map((r) => r.name).join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
+    return { columns, rows, std, origin, byCol: new Map(columns.map((c) => [c.col, c])) };
+  }, [loaded, stamps]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const selected = new Set(project.cases.filter((c) => c.included).map((c) => c.id));
+  const selected = selectedCaseIds(project);  // the selected cases, or all when none is selected
   const order = new Map(project.cases.map((c, i) => [c.id, i]));
   const cases = [...merged.rows.keys()].filter((c) => !onlySelected || selected.has(c) || !order.has(c))
     .sort((a, b) => (order.get(a) ?? 1e9) - (order.get(b) ?? 1e9) || a.localeCompare(b));
@@ -57,18 +62,28 @@ export default function AllResults({ project, runs, storeKey }: {
   const refRow = ref ? merged.rows.get(ref) : undefined;
   const cond = (c: string, key: string) => condOf(project, c, key);
   const condCols = COND.filter((k) => cases.some((c) => cond(c, k.key) !== null));
-  const shownCols = picked.map((p) => merged.columns.find((c) => c.col === p)).filter((c): c is Column => !!c);
+  const pickedSet = useMemo(() => new Set(picked), [picked]);
+  const shownCols = picked.map((p) => merged.byCol.get(p)).filter((c): c is Column => !!c);
   const hasStd = shownCols.some((c) => cases.some((cid) => merged.std.get(cid)?.[c.col] !== undefined));
 
-  // column picker grouped by origin
+  // column picker grouped by origin; lower-case names once for the filter
   const words = filter.toLowerCase().split(/\s+/).filter(Boolean);
   const groups = useMemo(() => {
-    const g = new Map<string, Column[]>();
-    merged.columns.forEach((c) => g.set(c.group ?? c.source, [...(g.get(c.group ?? c.source) ?? []), c]));
+    const g = new Map<string, { c: Column; low: string }[]>();
+    merged.columns.forEach((c) => {
+      const k = c.group ?? c.source;
+      if (!g.has(k)) g.set(k, []);
+      g.get(k)!.push({ c, low: c.col.toLowerCase() });
+    });
     return [...g.entries()];
   }, [merged.columns]);
-  const matches = (c: Column) => words.every((w) => c.col.toLowerCase().includes(w));
-  const toggle = (cols: string[], on: boolean) => setPicked((p) => on ? [...p, ...cols.filter((c) => !p.includes(c))] : p.filter((c) => !cols.includes(c)));
+  // groups opened or closed by hand; the others open while they hold a shown variable or a filter is typed.
+  // Only open groups render their (possibly thousands of) check boxes.
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
+  const toggle = (cols: string[], on: boolean) => setPicked((p) => {
+    const have = new Set(p), drop = new Set(cols);
+    return on ? [...p, ...cols.filter((c) => !have.has(c))] : p.filter((c) => !drop.has(c));
+  });
 
   const exportCsv = () => download(`${project.id}_${storeKey}_all_results.csv`, toCsv(
     ["case", "run", ...COND.map((k) => k.key), ...shownCols.flatMap((c) => hasStd && showStd ? [c.col, `${c.col} std`] : [c.col]),
@@ -86,16 +101,20 @@ export default function AllResults({ project, runs, storeKey }: {
         {pending > 0 && <div className="muted small">Loading {pending} run{pending === 1 ? "" : "s"}...</div>}
         <div className="checklist tall">
           {groups.map(([g, cols]) => {
-            const vis = cols.filter(matches);
+            const vis = words.length ? cols.filter((x) => words.every((w) => x.low.includes(w))) : cols;
             if (!vis.length) return null;
-            const n = vis.filter((c) => picked.includes(c.col)).length;
+            const n = vis.reduce((k, x) => k + (pickedSet.has(x.c.col) ? 1 : 0), 0);
+            const open = words.length > 0 || (openGroups[g] ?? n > 0);
             return (
-              <details key={g} className="srcgroup" open={n > 0 || words.length > 0}>
+              <details key={g} className="srcgroup" open={open} onToggle={(e) => {
+                const now = e.currentTarget.open;  // also fires when React sets `open`: only a click differs
+                if (now !== open) setOpenGroups((m) => ({ ...m, [g]: now }));
+              }}>
                 <summary className="small"><b>{g}</b> <span className="muted">{n ? `${n} of ` : ""}{vis.length}</span>
                   <span className="grow" />
-                  <button className="small" onClick={(e) => { e.preventDefault(); toggle(vis.map((c) => c.col), true); }}>all</button>
-                  <button className="small" onClick={(e) => { e.preventDefault(); toggle(vis.map((c) => c.col), false); }}>none</button></summary>
-                {vis.map((c) => <label key={c.col} className="small srcfile" title={`from ${c.source}`}><input type="checkbox" checked={picked.includes(c.col)}
+                  <button className="small" onClick={(e) => { e.preventDefault(); toggle(vis.map((x) => x.c.col), true); }}>all</button>
+                  <button className="small" onClick={(e) => { e.preventDefault(); toggle(vis.map((x) => x.c.col), false); }}>none</button></summary>
+                {open && vis.map(({ c }) => <label key={c.col} className="small srcfile" title={`from ${c.source}`}><input type="checkbox" checked={pickedSet.has(c.col)}
                   onChange={(e) => toggle([c.col], e.target.checked)} />{c.col}</label>)}
               </details>);
           })}
@@ -106,7 +125,7 @@ export default function AllResults({ project, runs, storeKey }: {
         <div className="row small">
           <b>Cases ({cases.length})</b>
           <label><input type="checkbox" checked={onlySelected} onChange={(e) => setOnlySelected(e.target.checked)} /> selected cases only</label>
-          {refRow && <label><input type="checkbox" checked={showPct} onChange={(e) => setShowPct(e.target.checked)} /> % vs ref ({caseName(project, ref!)})</label>}
+          {refRow && <label title={PCT_HELP}><input type="checkbox" checked={showPct} onChange={(e) => setShowPct(e.target.checked)} /> % vs ref ({caseName(project, ref!)})</label>}
           {hasStd && <label><input type="checkbox" checked={showStd} onChange={(e) => setShowStd(e.target.checked)} /> show std</label>}
           <span className="grow" />
           {shownCols.length > 0 && cases.length > 0 && <button onClick={exportCsv}>Export CSV</button>}

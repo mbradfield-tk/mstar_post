@@ -56,6 +56,22 @@ def series(path: str, file: str, columns: list[str] = Query(...),
         raise HTTPException(422, str(e))
 
 
+@router.get("/series_stats")
+def series_stats(path: str, file: str, columns: list[str] = Query(...),
+                 t_from: float | None = None, t_to: float | None = None) -> dict:
+    """n, mean, std, min, max of each column for t_from <= t <= t_to and its last value,
+    from every row of the Stats file (the /series points are decimated)."""
+    s = cases.mss.locate_stats_dir(_case(path))
+    if s is None:
+        raise HTTPException(404, "no Stats folder")
+    try:
+        return {"stats": cases.series_stats(safe_child(s, file), columns, t_from, t_to)}
+    except KeyError as e:
+        raise HTTPException(404, f"no column {e} in {file}")
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
 def _plane_response(p: dict, h: int, w: int) -> Response:
     hdr = {"X-Height": str(h), "X-Width": str(w),
            "X-Axis": str(p["axis"]), "X-Index": str(p["index"]),

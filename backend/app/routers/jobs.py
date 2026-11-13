@@ -100,8 +100,18 @@ def log(jid: str, offset: int = 0, limit: int = 256 * 1024) -> dict:
     start = max(0, size - limit) if offset < 0 else min(offset, size)
     with open(p, "rb") as fh:
         fh.seek(start)
-        text = fh.read(limit).decode(errors="replace")
-    return {"offset": start + len(text.encode()), "size": size, "text": text}
+        raw = fh.read(max(8, limit))
+    if start + len(raw) < size:  # more to come: do not cut a UTF-8 character in two
+        for k in range(1, min(4, len(raw)) + 1):
+            b = raw[-k]
+            if b & 0xC0 != 0x80:  # the last character's first byte
+                need = 1 if b < 0x80 else 2 if b >> 5 == 0b110 else 3 if b >> 4 == 0b1110 else 4
+                if need > k:
+                    raw = raw[:-k]
+                break
+    # the next offset counts the bytes read: re-encoding the decoded text would drift on
+    # output that is not valid UTF-8 or on a character cut at the end of the chunk
+    return {"offset": start + len(raw), "size": size, "text": raw.decode(errors="replace")}
 
 
 @router.websocket("/jobs/ws")

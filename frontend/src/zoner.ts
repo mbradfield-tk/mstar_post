@@ -1,5 +1,6 @@
 import { api, type CsvTable, type Project, type Run } from "./api";
 import { cmapLut } from "./cmap";
+import { caseOfDir, newestFirst, runStamp } from "./results";
 
 // Data layer of Plots > Zones: the per-case outputs of finished cfd_zoner runs
 // (zones.csv, heterogeneity.csv, zone_weights.csv, class_boundaries.csv, zone slices,
@@ -10,10 +11,12 @@ export type ZoneClass = { id: number; label: string; mean: number; std: number; 
                           cells: number; volume: number; volFrac: number; contribution: number | null; upper: number | null };
 export type ZoneCase = {
   caseId: string; run: Run; dir: string;        // dir = "<case id>" or "<case id>/<variable slug>"
-  variable: string; unit: string;                // VTK array name and its unit (e.g. "W/kg")
+  variable: string; unit: string;                // VTK array name without "Time-Avg " and its unit (e.g. "W/kg")
   alias: string;                                 // requested variable (edr, velocity, ...) from zoner_summary.csv
   classes: ZoneClass[]; globalMean: number; het: Record<string, number>;
-  tSel: number | null; tSteady: number | null;
+  tSel: number | null; tSteady: number | null;   // analysis time (last frame used) and steady start
+  tAvg: number | null; nFrames: number | null;   // start of the averaging window and frames averaged
+  source: string;                                // what was analysed, for tooltips
 };
 export type ZoneSliceMeta = { view: string; title: string; uLabel: string; vLabel: string; u0: number; du: number; nu: number;
                               v0: number; dv: number; nv: number; coord: number };
@@ -22,32 +25,39 @@ export type ZoneSlice = ZoneSliceMeta & { u: number[]; v: number[]; cls: Int16Ar
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const col = (t: CsvTable, name: string) => t.columns.indexOf(name);
 
+// finished zoner runs, newest results first (a re-run counts with its new time)
 export const zonerRuns = (runs: Run[]) =>
-  runs.filter((r) => r.task === "cfd_zoner" && (r.status === "done" || r.status === "unknown"))
-    .sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0));
+  newestFirst(runs.filter((r) => r.task === "cfd_zoner" && (r.status === "done" || r.status === "unknown")));
 
-// (case id, dir) of every zoner output folder of a run; case ids contain "/", so match by prefix
+// (case id, dir) of every zoner output folder of a run; case ids contain "/" and may be nested,
+// so the longest id that is a prefix of the folder wins
 export function zonerDirsOf(project: Project, run: Run): { caseId: string; dir: string }[] {
   const out: { caseId: string; dir: string }[] = [];
   for (const f of run.csvs) {
     if (!f.endsWith("/zones.csv")) continue;
     const dir = f.slice(0, -"/zones.csv".length);
-    const c = project.cases.find((x) => dir === x.id || dir.startsWith(`${x.id}/`))
-      ?? (project.single ? project.cases[0] : undefined);
-    if (c) out.push({ caseId: c.id, dir });
+    const c = caseOfDir(project, dir) ?? (project.single ? project.cases[0]?.id : undefined);
+    if (c) out.push({ caseId: c, dir });
   }
   return out;
 }
 
 const unitOfVar = (v: string) => v.match(/\(([^)]+)\)\s*$/)?.[1] ?? "";
 
-async function loadZoneCase(project: Project, run: Run, caseId: string, dir: string): Promise<ZoneCase | null> {
-  const get = (f: string) => api.csv(project.id, `${run.path}/${dir}/${f}`).catch(() => null);
+const caseCache = new Map<string, Promise<ZoneCase | null>>();
+const loadZoneCase = (project: Project, run: Run, caseId: string, dir: string): Promise<ZoneCase | null> =>
+  once(caseCache, `${project.id}|${runStamp(run)}|${dir}|${caseId}`, (bad) => readZoneCase(project, run, caseId, dir, bad));
+
+async function readZoneCase(project: Project, run: Run, caseId: string, dir: string, bad: Flaky): Promise<ZoneCase | null> {
+  const get = (f: string) => csvOf(project, run, `${dir}/${f}`, bad);
   const [zones, het, weights, bounds, summary] = await Promise.all([
     get("zones.csv"), get("heterogeneity.csv"), get("zone_weights.csv"), get("class_boundaries.csv"), get("zoner_summary.csv")]);
   if (!zones || !zones.rows.length) return null;
   const meanCol = zones.columns.findIndex((c) => c.startsWith("mean "));
-  const variable = meanCol >= 0 ? zones.columns[meanCol].slice(5) : "";
+  // M-Star's own Time-Avg array and the zoner's average over the frames are the same quantity:
+  // cases with and without that array are compared under one variable
+  const array = meanCol >= 0 ? zones.columns[meanCol].slice(5) : "";
+  const variable = array.replace(/^Time-Avg /i, "");
   const w = new Map<number, number>(), up = new Map<number, number>();
   if (weights) {
     const cc = weights.columns.findIndex((c) => c.startsWith("contribution_to_mean"));
@@ -71,15 +81,25 @@ async function loadZoneCase(project: Project, run: Run, caseId: string, dir: str
   if (het) for (const r of het.rows) { const v = r[1]; h[String(r[0])] = typeof v === "number" ? v : v === "True" ? 1 : v === "False" ? 0 : NaN; }
   const vf = classes.reduce((s, c) => s + c.volFrac, 0);
   const globalMean = h.mstar_global_mean ?? h.global_mean ?? (vf ? classes.reduce((s, c) => s + c.volFrac * c.mean, 0) / vf : NaN);
-  let alias = "", tSel: number | null = null, tSteady: number | null = null;
+  let alias = "", tSel: number | null = null, tSteady: number | null = null, tAvg: number | null = null, nFrames: number | null = null;
   if (summary?.rows.length) {
     const r = summary.rows[0];
     summary.columns.forEach((c, i) => {
-      const m = c.match(/^(analysis time|steady start) \((.*)\) \[s\]$/);
-      if (m) { alias = m[2]; if (m[1] === "analysis time") tSel = num(r[i]); else tSteady = num(r[i]); }
+      const m = c.match(/^(analysis time|steady start|averaging start|frames averaged) \((.*)\) \[(?:s|count)\]$/);
+      if (!m) return;
+      alias = m[2];
+      if (m[1] === "analysis time") tSel = num(r[i]);
+      else if (m[1] === "steady start") tSteady = num(r[i]);
+      else if (m[1] === "averaging start") tAvg = num(r[i]);
+      else nFrames = num(r[i]);
     });
   }
-  return { caseId, run, dir, variable, unit: unitOfVar(variable), alias: alias || variable, classes, globalMean, het: h, tSel, tSteady };
+  const g = (v: number | null) => (v === null ? "?" : String(Number(v.toPrecision(4))));
+  const source = array !== variable ? `M-Star Time-Avg array at t = ${g(tSel)} s`
+    : nFrames !== null && nFrames > 1 ? `time-averaged over ${nFrames} frames, t = ${g(tAvg)} .. ${g(tSel)} s`
+    : tSel !== null ? `one frame at t = ${g(tSel)} s` : "";
+  return { caseId, run, dir, variable, unit: unitOfVar(variable), alias: alias || variable, classes, globalMean, het: h,
+           tSel, tSteady, tAvg, nFrames, source };
 }
 
 // Every (case, variable) of the project's finished zoner runs; the newest run wins per pair.
@@ -92,7 +112,7 @@ export async function loadZonerCases(project: Project, runs: Run[]): Promise<Zon
       const key = `${caseId}|${sub}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      jobs.push(loadZoneCase(project, run, caseId, dir));
+      jobs.push(loadZoneCase(project, run, caseId, dir).then((z) => z && { ...z, run }));  // cached per run stamp: current label
     }
   }
   const all = (await Promise.all(jobs)).filter((z): z is ZoneCase => z !== null);
@@ -102,41 +122,53 @@ export async function loadZonerCases(project: Project, runs: Run[]): Promise<Zon
   return [...best.values()];
 }
 
-const sliceCache = new Map<string, Promise<ZoneSlice[]>>();
-
-// The stored cross-sections (side, side2, top) of one zoner output folder.
-export function loadZoneSlices(project: Project, z: ZoneCase): Promise<ZoneSlice[]> {
-  const key = `${project.id}|${z.run.name}|${z.dir}`;
-  let p = sliceCache.get(key);
+// identity of the outputs of one zoner folder (a run made again gets a new one)
+export const zoneKey = (z: ZoneCase) => `${runStamp(z.run)}|${z.dir}`;
+const metaCache = new Map<string, Promise<ZoneSliceMeta[]>>();
+const sliceCache = new Map<string, Promise<ZoneSlice | null>>();
+// One load per key. A file the run does not have is a plain "nothing"; one that could not be read
+// (bad.v) or a failed load is not kept, so it is asked again the next time.
+type Flaky = { v: boolean };
+const csvOf = (project: Project, run: Run, rel: string, bad: Flaky) =>
+  (run.csvs.includes(rel) ? api.csv(project.id, `${run.path}/${rel}`).catch(() => { bad.v = true; return null; }) : Promise.resolve(null));
+function once<T>(cache: Map<string, Promise<T>>, key: string, load: (bad: Flaky) => Promise<T>): Promise<T> {
+  let p = cache.get(key);
   if (!p) {
-    p = (async () => {
-      const meta = await api.csv(project.id, `${z.run.path}/${z.dir}/zone_slices.csv`).catch(() => null);
-      if (!meta) return [];
-      const metas: ZoneSliceMeta[] = meta.rows.map((r) => ({
-        view: String(r[col(meta, "view")]), title: String(r[col(meta, "title")]),
-        uLabel: String(r[col(meta, "u_label")]), vLabel: String(r[col(meta, "v_label")]),
-        u0: num(r[col(meta, "u0 [m]")]) ?? 0, du: num(r[col(meta, "du [m]")]) ?? 1, nu: num(r[col(meta, "nu [count]")]) ?? 0,
-        v0: num(r[col(meta, "v0 [m]")]) ?? 0, dv: num(r[col(meta, "dv [m]")]) ?? 1, nv: num(r[col(meta, "nv [count]")]) ?? 0,
-        coord: num(r[col(meta, "plane_coordinate [m]")]) ?? 0 }));
-      const tables = await Promise.all(metas.map((m) => api.csv(project.id, `${z.run.path}/${z.dir}/zone_slice_${m.view}.csv`).catch(() => null)));
-      const out: ZoneSlice[] = [];
-      metas.forEach((m, i) => {
-        const t = tables[i];
-        if (!t || !t.rows.length) return;
-        const nu = t.columns.length - 1, nv = t.rows.length;
-        const cls = new Int16Array(nu * nv);
-        for (let j = 0; j < nv; j++) { const r = t.rows[j]; for (let k = 0; k < nu; k++) cls[j * nu + k] = Number(r[k + 1]) || 0; }
-        out.push({ ...m, nu, nv, u: t.columns.slice(1).map(Number), v: t.rows.map((r) => Number(r[0])), cls });
-      });
-      return out;
-    })();
-    p.catch(() => sliceCache.delete(key));
-    sliceCache.set(key, p);
+    const bad = { v: false }, q = load(bad);
+    const drop = () => { if (cache.get(key) === q) cache.delete(key); };
+    q.then(() => { if (bad.v) drop(); }, drop);
+    cache.set(key, p = q);
   }
   return p;
 }
 
-export const clearZonerCache = () => sliceCache.clear();
+// The cross-sections stored for one zoner output folder (side, side2, top): zone_slices.csv.
+export const loadZoneSliceMetas = (project: Project, z: ZoneCase): Promise<ZoneSliceMeta[]> =>
+  once(metaCache, `${project.id}|${zoneKey(z)}`, async (bad) => {
+    const meta = await csvOf(project, z.run, `${z.dir}/zone_slices.csv`, bad);
+    return (meta?.rows ?? []).map((r) => ({
+      view: String(r[col(meta!, "view")]), title: String(r[col(meta!, "title")]),
+      uLabel: String(r[col(meta!, "u_label")]), vLabel: String(r[col(meta!, "v_label")]),
+      u0: num(r[col(meta!, "u0 [m]")]) ?? 0, du: num(r[col(meta!, "du [m]")]) ?? 1, nu: num(r[col(meta!, "nu [count]")]) ?? 0,
+      v0: num(r[col(meta!, "v0 [m]")]) ?? 0, dv: num(r[col(meta!, "dv [m]")]) ?? 1, nv: num(r[col(meta!, "nv [count]")]) ?? 0,
+      coord: num(r[col(meta!, "plane_coordinate [m]")]) ?? 0 }));
+  });
+
+// One stored cross-section (the class matrix of a view), loaded when that view is shown.
+export const loadZoneSlice = (project: Project, z: ZoneCase, view: string): Promise<ZoneSlice | null> =>
+  once(sliceCache, `${project.id}|${zoneKey(z)}|${view}`, async (bad) => {
+    const metas = await loadZoneSliceMetas(project, z);
+    if (!metaCache.has(`${project.id}|${zoneKey(z)}`)) bad.v = true;  // the view list itself was not readable
+    const m = metas.find((x) => x.view === view);
+    const t = m ? await csvOf(project, z.run, `${z.dir}/zone_slice_${m.view}.csv`, bad) : null;
+    if (!m || !t || !t.rows.length) return null;
+    const nu = t.columns.length - 1, nv = t.rows.length;
+    const cls = new Int16Array(nu * nv);
+    for (let j = 0; j < nv; j++) { const r = t.rows[j]; for (let k = 0; k < nu; k++) cls[j * nu + k] = Number(r[k + 1]) || 0; }
+    return { ...m, nu, nv, u: t.columns.slice(1).map(Number), v: t.rows.map((r) => Number(r[0])), cls };
+  });
+
+export const clearZonerCache = () => { caseCache.clear(); metaCache.clear(); sliceCache.clear(); };
 
 // Turbo colors ranked by zone mean (red = highest, blue = lowest), darkened like the
 // script's zone_colors; `means` keyed by class id (or any key).

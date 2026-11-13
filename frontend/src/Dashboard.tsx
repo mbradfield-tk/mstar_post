@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { api, type ProjectMeta, type ProjectSummary } from "./api";
+import { memo, useEffect, useMemo, useState } from "react";
+import { cachedRuns, type ProjectMeta, type ProjectSummary } from "./api";
 import CaseCatalog from "./CaseCatalog";
 import { META_FIELDS, metaValues } from "./ProjectMeta";
 import { useUser } from "./user";
@@ -10,7 +10,7 @@ type Filters = Partial<Record<keyof ProjectMeta, string>>;
 type SortKey = keyof ProjectMeta | "name" | "root" | "cases" | "runs" | "created";
 
 // Start page: every project as a card; open one, create or delete.
-export default function Dashboard({ projects, current, lastOpened, onOpen, onNew, onDelete, onFiles, onTheory, onGpus }: {
+export default memo(function Dashboard({ projects, current, lastOpened, onOpen, onNew, onDelete, onFiles, onTheory, onGpus }: {
   projects: ProjectSummary[];
   current: string | null;
   lastOpened: string | null;
@@ -24,19 +24,37 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
   const [filter, setFilter] = useState("");
   const me = useUser();
   const [view, setView] = useState<"projects" | "cases">("projects");
-  const [meta, setMeta] = useState<Filters>(() => {
-    try { return JSON.parse(localStorage.getItem(FILTER_KEY) ?? "{}"); } catch { return {}; }
+  const [stored, setMeta] = useState<Filters>(() => {
+    try { return JSON.parse(localStorage.getItem(FILTER_KEY) ?? "{}") ?? {}; } catch { return {}; }
   });
-  useEffect(() => localStorage.setItem(FILTER_KEY, JSON.stringify(meta)), [meta]);
+  // a stored filter value that no project has any more (project deleted, field edited) is ignored:
+  // it would hide every project while its select shows "all" or is not there at all
+  const idsKey = projects.map((p) => p.id).join("|");
+  const options = useMemo(() => Object.fromEntries(META_FIELDS.map(({ key }) => [key, metaValues(projects, key)])) as Record<keyof ProjectMeta, string[]>,
+    [projects]);
+  const meta = useMemo<Filters>(() => (projects.length
+    ? Object.fromEntries(Object.entries(stored).filter(([k, v]) => v && options[k as keyof ProjectMeta]?.includes(v))) : stored),
+    [stored, options, projects.length]);
+  useEffect(() => { if (projects.length) localStorage.setItem(FILTER_KEY, JSON.stringify(meta)); }, [meta, projects.length]);
   const [runs, setRuns] = useState<Record<string, number>>({});
   const [layout, setLayout] = useState<"tiles" | "table">(() => (localStorage.getItem("mstar_post.dashboard.layout") as "table" | null) ?? "tiles");
   useEffect(() => localStorage.setItem("mstar_post.dashboard.layout", layout), [layout]);
   const [sort, setSort] = useState<{ key: SortKey; asc: boolean } | null>(null);
+  // run counts: from the shared run-list cache, two requests at a time (they must not queue in front of
+  // the requests of a project being opened); leaving the dashboard stops the remaining ones
   useEffect(() => {
-    let live = true;
-    projects.forEach((p) => api.runs(p.id).then((rs) => live && setRuns((m) => ({ ...m, [p.id]: rs.length }))).catch(() => undefined));
-    return () => { live = false; };
-  }, [projects.map((p) => p.id).join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
+    let alive = true;
+    const todo = projects.map((p) => p.id);
+    const next = (): Promise<void> => {
+      const id = todo.shift();
+      if (!alive || !id) return Promise.resolve();
+      return cachedRuns(id, 60000).then((rs) => { if (alive) setRuns((m) => (m[id] === rs.length ? m : { ...m, [id]: rs.length })); })
+        .catch(() => undefined).then(next);
+    };
+    void next();
+    void next();
+    return () => { alive = false; };
+  }, [idsKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const q = filter.toLowerCase();
   const matchMeta = (p: ProjectSummary) => META_FIELDS.every(({ key }) => !meta[key] || (p[key] ?? "").trim() === meta[key]);
@@ -88,7 +106,7 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
         <div className="row">
           <h2 className="grow">Projects <span className="muted">({shown.length === projects.length ? projects.length : `${shown.length} of ${projects.length}`})</span></h2>
           {META_FIELDS.map(({ key, label }) => {
-            const vals = metaValues(projects, key);
+            const vals = options[key];
             return vals.length ? (
               <label key={key} className="small">{label}{" "}
                 <select value={meta[key] ?? ""} onChange={(e) => setMeta({ ...meta, [key]: e.target.value || undefined })}>
@@ -164,4 +182,4 @@ export default function Dashboard({ projects, current, lastOpened, onOpen, onNew
       </div>}
     </div>
   );
-}
+});

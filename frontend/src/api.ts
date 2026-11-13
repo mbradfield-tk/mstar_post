@@ -69,6 +69,9 @@ export type PointValue = { file: string; value: number | null; cell: number[]; c
 export type VarEntry = { run: string; path: string; case: string | null; kind: "series" | "table" | "long";
   columns: (string | [string, string])[]; cases: string[] };
 export type Series = { t: number[]; columns: Record<string, (number | null)[]> };
+// statistics of one column over a time window, computed by the server on the full (undecimated) series:
+// n = finite samples in the window, std = sample std (null when n < 2), last = last finite value of the whole column
+export type SeriesStat = { n: number; mean: number | null; std: number | null; min: number | null; max: number | null; last: number | null };
 export type CsvTable = { columns: string[]; rows: (string | number | null)[][]; truncated: boolean };
 export type BrowseEntry = { name: string; path: string; dir: boolean; link: boolean; size: number | null;
   mtime: number; is_case: boolean };
@@ -98,12 +101,27 @@ async function req<T>(url: string, init?: RequestInit): Promise<T> {
     if (r.status === 401 && !url.startsWith("/api/login")) window.dispatchEvent(new Event("mstar_post:login-needed"));
     throw new Error(msg);
   }
-  return r.json() as Promise<T>;
+  try {
+    return await r.json() as T;
+  } catch {  // e.g. the page of a newer build asking a backend that does not know the endpoint yet
+    throw new Error(`${url.split("?")[0]}: the server did not answer with data (is the backend older than this page? restart the service)`);
+  }
 }
 
 const json = (method: string, body: unknown): RequestInit => ({
   method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
 });
+// Requests with the same key are sent one after the other (the next one when the previous reply is in).
+// Used for the PATCHes of a project: every reply then contains all earlier changes and replies cannot
+// overtake each other, however quickly boxes are ticked and in whatever order the server would handle them.
+const queues = new Map<string, Promise<unknown>>();
+function inOrder<T>(key: string, send: () => Promise<T>): Promise<T> {
+  const p = (queues.get(key) ?? Promise.resolve()).then(send, send);
+  const tail = p.catch(() => undefined);
+  queues.set(key, tail);
+  void tail.then(() => { if (queues.get(key) === tail) queues.delete(key); });
+  return p;
+}
 const qs = (o: Record<string, string | number | boolean | string[] | undefined | null>) => {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(o)) {
@@ -144,8 +162,14 @@ export const api = {
     const target = `dl-sink-${Date.now()}`;
     const fr = document.createElement("iframe");
     fr.name = target; fr.style.display = "none";
+    // inserted before the listener is added: Chromium fires the load of the initial about:blank
+    // synchronously on insertion (Firefox a little later), and that load must not remove the sink
+    document.body.appendChild(fr);
     fr.addEventListener("load", () => {
-      const text = fr.contentDocument?.body?.textContent?.trim() ?? "";
+      let doc: Document | null = null;
+      try { doc = fr.contentDocument; } catch { /* not readable: not our reply */ }
+      if (!doc || doc.URL === "about:blank") return;
+      const text = doc.body?.textContent?.trim() ?? "";
       if (text) {
         let msg = text;
         try { const j = JSON.parse(text); msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail ?? j); } catch { /* not JSON */ }
@@ -155,7 +179,6 @@ export const api = {
       fr.remove();
     });
     setTimeout(() => fr.remove(), 10 * 60 * 1000);
-    document.body.appendChild(fr);
     const f = document.createElement("form");
     f.method = "post";
     f.action = "/api/fs/download";
@@ -192,7 +215,8 @@ export const api = {
   createProject: (name: string, root: string, meta?: Partial<ProjectMeta>) =>
     req<Project>("/api/projects", json("POST", { name, root, ...meta })),
   patchProject: (id: string, body: Partial<{ name: string; included: Record<string, boolean>;
-    ref_case: string; notes: string; aliases: Record<string, string> } & ProjectMeta>) => req<Project>(`/api/projects/${id}`, json("PATCH", body)),
+    ref_case: string; notes: string; aliases: Record<string, string> } & ProjectMeta>) =>
+    inOrder(`project:${id}`, () => req<Project>(`/api/projects/${id}`, json("PATCH", body))),
   rediscover: (id: string) => req<Project>(`/api/projects/${id}/rediscover`, { method: "POST" }),
   relocate: (id: string, body: { root?: string; cases?: Record<string, string> }) =>
     req<Project>(`/api/projects/${id}/relocate`, json("POST", body)),
@@ -202,9 +226,9 @@ export const api = {
     req<{ runs: { run: string; changed?: number | null; skipped?: string; error?: string }[]; changed: number; log: string }>(
       `/api/projects/${id}/rename-body?${qs({ run })}`, { method: "POST" }),
   deleteRun: (id: string, name: string) =>
-    req(`/api/projects/${id}/runs/${encodeURIComponent(name)}`, { method: "DELETE" }),
+    req(`/api/projects/${id}/runs/${encodeURIComponent(name)}`, { method: "DELETE" }).finally(() => invalidateRuns(id)),
   run: (id: string, task: string, params: Record<string, unknown>, cases?: string[], label?: string) =>
-    req<Job>(`/api/projects/${id}/run`, json("POST", { task, params, cases, label })),
+    req<Job>(`/api/projects/${id}/run`, json("POST", { task, params, cases, label })).finally(() => invalidateRuns(id)),
   csv: (id: string, path: string) => req<CsvTable>(`/api/projects/${id}/csv?${qs({ path })}`),
   runTimeseries: (id: string, run: string) =>
     req<RunSeriesFile[]>(`/api/projects/${id}/runs/${encodeURIComponent(run)}/timeseries`),
@@ -212,6 +236,10 @@ export const api = {
   runSeries: (id: string, run: string, file: string, columns: string[], cases?: string[]) =>
     req<Record<string, Series>>(
       `/api/projects/${id}/runs/${encodeURIComponent(run)}/series?${qs({ file, columns, cases })}`),
+  // window statistics per case and column (t_from / t_to inclusive, omitted = open end)
+  runSeriesStats: (id: string, run: string, file: string, columns: string[], cases?: string[], tFrom?: number | null, tTo?: number | null) =>
+    req<Record<string, Record<string, SeriesStat>>>(
+      `/api/projects/${id}/runs/${encodeURIComponent(run)}/series_stats?${qs({ file, columns, cases, t_from: tFrom, t_to: tTo })}`),
   fileUrl: (id: string, path: string, download = false) =>
     `/api/projects/${id}/file?${qs({ path, download })}`,
   zipUrl: (id: string, path: string) => `/api/projects/${id}/zip?${qs({ path })}`,
@@ -230,6 +258,8 @@ export const api = {
   series: (path: string, file: string, columns: string[]) =>
     req<{ t: number[]; columns: Record<string, (number | null)[]> }>(
       `/api/case/series?${qs({ path, file, columns })}`),
+  seriesStats: (path: string, file: string, columns: string[], tFrom?: number | null, tTo?: number | null) =>
+    req<{ stats: Record<string, SeriesStat> }>(`/api/case/series_stats?${qs({ path, file, columns, t_from: tFrom, t_to: tTo })}`),
   line: (path: string, file: string, array: string, comp: string, p0: number[], p1: number[], n = 200) =>
     req<{ distance: number[]; value: (number | null)[]; unit: string }>(
       `/api/case/line?${qs({ path, file, array, comp, p0: p0.join(","), p1: p1.join(","), n })}`),
@@ -296,7 +326,7 @@ export async function copyText(text: string): Promise<boolean> {
 export function toCsv(columns: string[], rows: unknown[][]): string {
   const esc = (v: unknown) => {
     const s = v === null || v === undefined ? "" : String(v);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   return [columns, ...rows].map((r) => r.map(esc).join(",")).join("\n");
 }
@@ -308,4 +338,48 @@ export const fmt = (v: unknown, digits = 4): string => {
   return Number(v.toPrecision(digits)).toString();
 };
 
+export const fmtBytes = (b: number | null | undefined): string => {
+  if (b === null || b === undefined || !Number.isFinite(b)) return "";
+  const u = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let i = 0, v = b;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return `${v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)} ${u[i]}`;
+};
+
 export const AXES = ["x", "y", "z"] as const;
+
+// Shared reads of a project's run list and of the task registry: every tab asking within maxAge gets
+// the same reply (one request). The jobs store calls invalidateRuns on each job event of the project,
+// api.run / api.deleteRun after they finish; RUNS_CHANGED (detail = project id, null = all) lets views refetch.
+// The returned arrays are shared: do not mutate them.
+export const RUNS_CHANGED = "mstar_post:runs-changed";
+const runsCache = new Map<string, { at: number; p: Promise<Run[]> }>();
+let tasksCache: { at: number; p: Promise<TaskDef[]> } | null = null;
+
+export function cachedRuns(id: string, maxAge = 15000): Promise<Run[]> {
+  const hit = runsCache.get(id);
+  if (hit && Date.now() - hit.at < maxAge) return hit.p;
+  const entry = { at: Date.now(), p: api.runs(id) };
+  entry.p.catch(() => { if (runsCache.get(id) === entry) runsCache.delete(id); });
+  runsCache.set(id, entry);
+  return entry.p;
+}
+
+export function invalidateRuns(id?: string): void {
+  if (id) runsCache.delete(id); else runsCache.clear();
+  window.dispatchEvent(new CustomEvent(RUNS_CHANGED, { detail: id ?? null }));
+}
+
+export function cachedTasks(maxAge = 300000): Promise<TaskDef[]> {
+  if (tasksCache && Date.now() - tasksCache.at < maxAge) return tasksCache.p;
+  const entry = { at: Date.now(), p: api.tasks() };
+  entry.p.catch(() => { if (tasksCache === entry) tasksCache = null; });
+  tasksCache = entry;
+  return entry.p;
+}
+
+// account change: nothing fetched for the previous user is reused
+export function clearApiCaches(): void {
+  runsCache.clear();
+  tasksCache = null;
+}

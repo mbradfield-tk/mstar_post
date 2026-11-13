@@ -74,6 +74,13 @@ export function installStickyScroll() {
     });
     pending = e;
   }, { passive: true });
-  window.addEventListener("scroll", () => { if (box) place(); }, { passive: true });
-  window.addEventListener("resize", () => { if (box) place(); });
+  // one placement per frame: scroll and resize events arrive far more often than the screen is drawn
+  let placing = false;
+  const replace = () => {
+    if (!box || placing) return;
+    placing = true;
+    requestAnimationFrame(() => { placing = false; if (box) place(); });
+  };
+  window.addEventListener("scroll", replace, { passive: true });
+  window.addEventListener("resize", replace);
 }

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
-import { fmtBytes } from "./FilesView";
+import { fmtBytes } from "./api";
 
 // 3D preview of a CAD file (STL directly; STEP/IGES tessellated by the server).
 export default function MeshPreview({ url, name }: { url: string; name: string }) {
@@ -11,7 +11,8 @@ export default function MeshPreview({ url, name }: { url: string; name: string }
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
   const [wire, setWire] = useState(false);
-  const sceneRef = useRef<{ mesh: THREE.Mesh; edges: THREE.LineSegments; controls: OrbitControls; camera: THREE.PerspectiveCamera; fit: () => void } | null>(null);
+  const sceneRef = useRef<{ mesh: THREE.Mesh; controls: OrbitControls; camera: THREE.PerspectiveCamera; fit: () => void;
+                            draw: () => void; invalidate: () => void } | null>(null);
 
   useEffect(() => {
     const el = box.current;
@@ -19,7 +20,7 @@ export default function MeshPreview({ url, name }: { url: string; name: string }
     let live = true;
     setBusy(true);
     setError(null);
-    const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
     renderer.setSize(el.clientWidth, el.clientHeight);
     renderer.setClearColor(0x1e293b);
@@ -35,14 +36,25 @@ export default function MeshPreview({ url, name }: { url: string; name: string }
     const fill = new THREE.DirectionalLight(0xffffff, 0.35);
     fill.position.set(-2, -1, -1);
     scene.add(fill);
-    let frame = 0;
-    const draw = () => { controls.update(); renderer.render(scene, camera); frame = requestAnimationFrame(draw); };
-    draw();
+    // drawn on demand: one frame per change, more only while the damping still moves the camera
+    let frame = 0, dirty = true;
+    const draw = () => renderer.render(scene, camera);
+    const tick = () => {
+      frame = 0;
+      if (!el.clientWidth) return;
+      const moving = controls.update();
+      if (dirty || moving) { dirty = false; draw(); }
+      if (moving && !frame) frame = requestAnimationFrame(tick);
+    };
+    const invalidate = () => { dirty = true; if (!frame) frame = requestAnimationFrame(tick); };
+    controls.addEventListener("change", invalidate);
+    invalidate();
     const onResize = () => {
       if (!el.clientWidth) return;
       renderer.setSize(el.clientWidth, el.clientHeight);
       camera.aspect = el.clientWidth / el.clientHeight;
       camera.updateProjectionMatrix();
+      invalidate();
     };
     const ro = new ResizeObserver(onResize);
     ro.observe(el);
@@ -63,10 +75,9 @@ export default function MeshPreview({ url, name }: { url: string; name: string }
       geo.translate(-center.x, -center.y, -center.z);
       const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x9fb4d1, metalness: 0.15, roughness: 0.6, side: THREE.DoubleSide }));
       scene.add(mesh);
-      // feature edges make the shape readable; hidden by default on dense meshes
-      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo, 30), new THREE.LineBasicMaterial({ color: 0x1f2937 }));
-      edges.visible = geo.attributes.position.count / 3 < 200_000;
-      scene.add(edges);
+      // feature edges make the shape readable; not computed for dense meshes (slow, and not shown)
+      if (geo.attributes.position.count / 3 < 200_000)
+        scene.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo, 30), new THREE.LineBasicMaterial({ color: 0x1f2937 })));
       const r0 = size.length() / 2 || 1;
       scene.add(new THREE.AxesHelper(r0 * 0.6));
       const fit = () => {
@@ -75,9 +86,10 @@ export default function MeshPreview({ url, name }: { url: string; name: string }
         camera.updateProjectionMatrix();
         controls.target.set(0, 0, 0);
         controls.update();
+        invalidate();
       };
       fit();
-      sceneRef.current = { mesh, edges, controls, camera, fit };
+      sceneRef.current = { mesh, controls, camera, fit, draw, invalidate };
       setInfo({ tris: geo.attributes.position.count / 3, size: [size.x, size.y, size.z], bytes: buf.byteLength, source });
       setBusy(false);
     }).catch((e) => { if (live) { setError(e.message); setBusy(false); } });
@@ -86,9 +98,11 @@ export default function MeshPreview({ url, name }: { url: string; name: string }
       live = false;
       cancelAnimationFrame(frame);
       ro.disconnect();
+      controls.removeEventListener("change", invalidate);
       controls.dispose();
-      renderer.dispose();
       scene.traverse((o) => { const m = o as THREE.Mesh; m.geometry?.dispose?.(); (m.material as THREE.Material)?.dispose?.(); });
+      renderer.dispose();
+      renderer.forceContextLoss();
       el.innerHTML = "";
       sceneRef.current = null;
     };
@@ -96,7 +110,9 @@ export default function MeshPreview({ url, name }: { url: string; name: string }
 
   useEffect(() => {
     const s = sceneRef.current;
-    if (s) (s.mesh.material as THREE.MeshStandardMaterial).wireframe = wire;
+    if (!s) return;
+    (s.mesh.material as THREE.MeshStandardMaterial).wireframe = wire;
+    s.invalidate();
   }, [wire, info]);
 
   const unit = info && Math.max(...info.size) > 50 ? "mm" : "m";  // M-Star geometry is in m, CAD usually in mm
@@ -108,7 +124,7 @@ export default function MeshPreview({ url, name }: { url: string; name: string }
         <span className="grow" />
         <label><input type="checkbox" checked={wire} onChange={(e) => setWire(e.target.checked)} /> wireframe</label>
         <button className="small" onClick={() => sceneRef.current?.fit()}>Fit</button>
-        <button className="small" onClick={() => { const c = box.current?.querySelector("canvas"); if (c) { const a = document.createElement("a"); a.href = c.toDataURL("image/png"); a.download = `${name}.png`; a.click(); } }}>PNG</button>
+        <button className="small" onClick={() => { const c = box.current?.querySelector("canvas"); if (c) { sceneRef.current?.draw(); const a = document.createElement("a"); a.href = c.toDataURL("image/png"); a.download = `${name}.png`; a.click(); } }}>PNG</button>
       </div>
       {error && <div className="error">{error}</div>}
       <div ref={box} className="mesh-canvas" />

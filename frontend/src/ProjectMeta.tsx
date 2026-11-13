@@ -12,8 +12,11 @@ export const metaValues = (ps: ProjectSummary[], k: keyof ProjectMeta): string[]
   [...new Set(ps.map((p) => (p[k] ?? "").trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
 
 // Owner (fixed at creation, shown read-only) and editable associated project / purpose; saved on blur or Enter.
-export default function ProjectMetaEditor({ project, onChange, suggestions }: {
+// `patch` (Cases tab) sends the change through the caller's own PATCH queue, so its reply is ordered with the
+// case-selection replies and reported there.
+export default function ProjectMetaEditor({ project, onChange, suggestions, patch }: {
   project: Project; onChange: (p: Project) => void; suggestions?: Partial<Record<keyof ProjectMeta, string[]>>;
+  patch?: (body: Partial<ProjectMeta>) => Promise<void>;
 }) {
   const [vals, setVals] = useState<ProjectMeta>({ owner: project.owner ?? "", program: project.program ?? "", purpose: project.purpose ?? "" });
   const [error, setError] = useState<string | null>(null);
@@ -25,9 +28,11 @@ export default function ProjectMetaEditor({ project, onChange, suggestions }: {
     const v = vals[k].trim();
     if (v === (project[k] ?? "")) return;
     setError(null);
+    if (patch) { await patch({ [k]: v }); return; }
     try {
       const p = await api.patchProject(project.id, { [k]: v });
-      onChange({ ...p, cases: p.cases.map((c) => ({ ...c, info: project.cases.find((o) => o.id === c.id)?.info })) });
+      const info = new Map(project.cases.map((c) => [c.id, c.info]));
+      onChange({ ...p, cases: p.cases.map((c) => ({ ...c, info: info.get(c.id) })) });
     } catch (e) { setError((e as Error).message); }
   };
   return (

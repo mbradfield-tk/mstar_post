@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type Job, type Param, type Project, type TaskDef } from "./api";
 import { useUser } from "./user";
 
@@ -23,11 +23,30 @@ export default function RunView({ project, onSubmitted }: {
   const me = useUser();
   // has the base summary been run on the selected cases yet? (add-ons build on it)
   const [baseDone, setBaseDone] = useState<Set<string> | null>(null);
+  // The tab stays mounted while another one is shown: an observer on its own box tells when it is
+  // shown again (no prop from the app needed), and the list of finished base runs is read again then.
+  const root = useRef<HTMLDivElement>(null);
+  const [shown, setShown] = useState(true);
   useEffect(() => {
-    api.runs(project.id).then((rs) => setBaseDone(new Set(rs.filter((r) => r.task === "stats_summary" && r.status === "done")
-      .flatMap((r) => (Array.isArray(r.params?.cases) ? (r.params.cases as string[]) : []))))).catch(() => undefined);
-  }, [project.id]);
+    const el = root.current;
+    if (!el) return;
+    const io = new IntersectionObserver((es) => setShown(es[es.length - 1].isIntersecting));
+    io.observe(el);
+    return () => io.disconnect();
+  }, []);
+  const loadBase = () => api.runs(project.id).then((rs) => {
+    const ids = rs.filter((r) => r.task === "stats_summary" && r.status === "done")
+      .flatMap((r) => (Array.isArray(r.params?.cases) ? (r.params.cases as string[]) : []));
+    setBaseDone((old) => (old && old.size === new Set(ids).size && ids.every((id) => old.has(id)) ? old : new Set(ids)));
+  }).catch(() => undefined);
+  useEffect(() => { if (shown) loadBase(); }, [project.id, shown]); // eslint-disable-line react-hooks/exhaustive-deps
   const missingBase = baseDone ? included.filter((c) => !baseDone.has(c.id)) : [];
+  // while the hint is on screen, a base summary that finishes takes it away without leaving the tab
+  useEffect(() => {
+    if (!shown || !missingBase.length) return;
+    const id = setInterval(loadBase, 15000);
+    return () => clearInterval(id);
+  }, [project.id, shown, missingBase.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { api.tasks().then(setTasks).catch((e) => setError(e.message)); }, []);
   useEffect(() => { if (task) setValues(initial(task)); }, [task]);
@@ -50,7 +69,7 @@ export default function RunView({ project, onSubmitted }: {
   };
 
   return (
-    <div className="split">
+    <div className="split" ref={root}>
       <div className="side">
         <h3>Calculations</h3>
         {!tasks.length && !error && <div className="muted">Loading...</div>}

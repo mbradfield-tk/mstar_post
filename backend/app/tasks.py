@@ -166,7 +166,8 @@ def _dispersion_build(project: dict, cases: list[dict], prm: dict, run: Path) ->
                        ("eps_ratio", "--eps-ratio"), ("k_phi", "--k-phi"),
                        ("diff_c", "--diff-c"), ("diff_d", "--diff-d"),
                        ("partition", "--partition"), ("dc0", "--dc0"),
-                       ("zone_scales", "--zone-scales"), ("vertical_axis", "--vertical-axis")):
+                       ("zone_scales", "--zone-scales"), ("vertical_axis", "--vertical-axis"),
+                       ("workers", "--workers")):
         _opt(argv, flag, prm.get(name))
     if not prm.get("reuse", True):
         argv.append("--no-reuse")
@@ -221,6 +222,9 @@ DISPERSION = Task(
         P("reuse", "Reuse earlier results when VTK files are gone", "bool", True, group="Outputs",
           help="VOF-drop and uniformity metrics of cases whose .vtp/.vti output was deleted are taken "
                "from the newest earlier dispersion run of this project; the rest is recomputed"),
+        P("workers", "Frames analysed in parallel", "integer", 4, group="Outputs",
+          help="processes reading the VTK frames side by side (same results as 1); each holds one frame "
+               "in memory, about 35 bytes per voxel (5 GB for a 149 M-cell grid)"),
     ],
     build=_dispersion_build,
     presets=[
@@ -260,7 +264,10 @@ def _zoner_build(project: dict, cases: list[dict], prm: dict, run: Path) -> list
 ZONER = Task(
     id="cfd_zoner", label="CFD zoner", per_case=True,
     description="Add-on: value-based zoning of a Volume .vti field (k-means), per-zone "
-                "statistics and heterogeneity metrics (cfd_zoner.py), run per case. Writes "
+                "statistics and heterogeneity metrics (cfd_zoner.py), run per case. The field "
+                "analysed is the time average over the output frames from the steady start on "
+                "(or M-Star's Time-Avg array of the last frame when the output has one); all "
+                "liquid cells (non-zero velocity) of all GPU blocks are used. Writes "
                 "zones.csv, heterogeneity.csv, zoner_summary.csv (one row of scalar results), "
                 "the zone maps as data (zone_slices.csv + zone_slice_<view>.csv), the plot data "
                 "(histogram, exposure CDF, profiles, zone weights, time trace) as CSVs and "
@@ -269,7 +276,9 @@ ZONER = Task(
         P("variable", "Variables", "list", "edr",
           help="aliases: edr, tke, velocity, shear, tracer, kolmogorov, micromixing"),
         P("n_zones", "Number of zones", "integer", help="blank = auto (silhouette)"),
-        P("time", "Analysis time [s]", help="blank = steady-state detection"),
+        P("time", "Averaging start [s]",
+          help="blank = steady-state detection (last 25 % of the run without a plateau); frames from "
+               "this time to the last one are averaged, with 'Instantaneous field' it is the frame analysed"),
         P("steady_on", "Steady state on", "select", "variable",
           options=[{"value": "variable", "label": "variable"},
                    {"value": "power", "label": "power"}]),
@@ -277,7 +286,9 @@ ZONER = Task(
         P("window", "Window [s]", default=1.0),
         P("linear", "Cluster linear values", "bool", False),
         P("log_bins", "Fixed log bins", "bool", False),
-        P("instantaneous", "Instantaneous field", "bool", False),
+        P("instantaneous", "Instantaneous field", "bool", False,
+          help="analyse one instantaneous frame instead of the time average: its statistics "
+               "scatter from frame to frame"),
         P("min_zone_frac", "Min sub-zone fraction", default=0.005),
         P("no_impeller_zone", "No impeller zone", "bool", False),
     ],
