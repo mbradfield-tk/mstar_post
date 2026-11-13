@@ -5,6 +5,7 @@ import { api, caseName, copyText, download, fmt, toCsv, type CsvTable, type Proj
 import CaseNames from "./CaseNames";
 import CaseSelect from "./CaseSelect";
 import { useDialog } from "./Dialog";
+import DispersionScaling from "./DispersionScaling";
 import ErrorBoundary from "./ErrorBoundary";
 import Plot from "./Plot";
 import { caseColor, PlotStyleEditor, usePlotStyle, type PlotStyle } from "./PlotStyle";
@@ -14,14 +15,14 @@ import ZonesPlot from "./ZonesPlot";
 import { loadRunResults, newestFirst, pct, PCT_HELP, runHasCases, runSeriesFiles, runStamp, selectedCaseIds, shortName, unitOf,
          type Cell } from "./results";
 
-type Mode = "find" | "series" | "single" | "bars" | "scatter" | "detail" | "zones";
+type Mode = "find" | "series" | "single" | "bars" | "scatter" | "detail" | "zones" | "dispk";
 type MeansView = "bars" | "scatter" | "detail";
-const MODES: Mode[] = ["find", "series", "single", "bars", "scatter", "detail", "zones"];
+const MODES: Mode[] = ["find", "series", "single", "bars", "scatter", "detail", "zones", "dispk"];
 const isMeans = (m: Mode): m is MeansView => m === "bars" || m === "scatter" || m === "detail";
 // the three means modes are views of one pane (they share sources, cases and variables)
 const paneOf = (m: Mode) => (isMeans(m) ? "means" : m);
 const MODE_LABEL: Record<Mode, string> = { find: "Find variable", series: "Time series", single: "Case time series",
-  bars: "Compare means", scatter: "Trend (x-y)", detail: "Case detail", zones: "Zones" };
+  bars: "Compare means", scatter: "Trend (x-y)", detail: "Case detail", zones: "Zones", dispk: "Dispersion & K" };
 const MODE_HELP: Record<Mode, string> = {
   find: "search a variable in every result of the selected cases (M-Star Stats files, job tables and time series) and plot it",
   series: "M-Star Stats variables (or run metrics) over time for several cases in stacked panels",
@@ -30,6 +31,8 @@ const MODE_HELP: Record<Mode, string> = {
   scatter: "one mean against another across cases, with a power-law fit",
   detail: "every mean of one case against the reference case",
   zones: "CFD zoner results compared across cases: zone maps side by side, zone and heterogeneity bars, exposure curves",
+  dispk: "liquid-liquid dispersion: interfacial area corrected for incomplete dispersion (Estimate A from S, Estimate B from a_ss dx) "
+    + "and the k_c / k_d corrections, as hold-time and reaction-rate factors against the reference case",
 };
 
 export default function PlotsView({ project, onProjectChange, active, onReset }: {
@@ -113,6 +116,7 @@ export default function PlotsView({ project, onProjectChange, active, onReset }:
       {pane("series", MODE_LABEL.series, <SeriesPlot project={project} style={style} active={on("series")} refCase={ref} panelsRev={panelsRev} />)}
       {pane("single", MODE_LABEL.single, <StatsSeries project={project} style={style} active={on("single")} />)}
       {pane("zones", MODE_LABEL.zones, <ZonesPlot project={project} style={style} active={on("zones")} refCase={ref} />)}
+      {pane("dispk", MODE_LABEL.dispk, <DispersionScaling project={project} style={style} active={on("dispk")} refCase={ref} />)}
       {pane("means", MODE_LABEL[meansView], <MeansPlots project={project} view={meansView} style={style} active={on("means")} refCase={ref} />)}
     </div>
   );
