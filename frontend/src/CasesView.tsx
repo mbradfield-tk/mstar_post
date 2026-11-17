@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { api, cachedRuns, cachedTasks, caseName, download, fmt, RUNS_CHANGED, toCsv, type Project, type ProjectCase, type Run, type SolveState } from "./api";
+import { api, cachedRuns, cachedTasks, caseName, download, fmt, RUNS_CHANGED, solvesNow, toCsv, type Project, type ProjectCase, type Run, type SolveState } from "./api";
 import ProjectMetaEditor from "./ProjectMeta";
 import { useUser } from "./user";
 import { usePageVisible } from "./visible";
@@ -116,7 +116,7 @@ export function SolveTag({ s }: { s: SolveState | undefined }) {
 // Solver states of the project's cases, refreshed every 30 s while shown (not in a background browser tab;
 // one request at a time, the next 30 s after the reply).
 export function useSolves(pid: string, active: boolean) {
-  const [solves, setSolves] = useState<Record<string, SolveState> | null>(null);
+  const [solves, setSolves] = useState<Record<string, SolveState> | null>(() => solvesNow(pid));
   const shown = usePageVisible() && active;
   useEffect(() => {
     if (!shown) return;

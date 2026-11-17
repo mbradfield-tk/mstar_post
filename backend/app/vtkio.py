@@ -427,14 +427,14 @@ def _weight(path: Path, h: dict, assoc: str, take) -> tuple[np.ndarray | None, s
 def _plane_meta(h: dict, a: dict, axis: int, idx: int, dims, so, sp, values) -> dict:
     u, v = PLANE_AXES[axis]
     finite = values[np.isfinite(values)]
+    p01, p99 = (float(x) for x in np.percentile(finite, [1, 99])) if finite.size else (0.0, 0.0)
     return {
         "axis": axis, "index": idx, "count": dims[axis],
         "pos": so[axis] + idx * sp[axis],
         "u_axis": u, "v_axis": v, "u0": so[u], "v0": so[v], "du": sp[u], "dv": sp[v],
         "vmin": float(finite.min()) if finite.size else 0.0,
         "vmax": float(finite.max()) if finite.size else 0.0,
-        "p01": float(np.percentile(finite, 1)) if finite.size else 0.0,
-        "p99": float(np.percentile(finite, 99)) if finite.size else 0.0,
+        "p01": p01, "p99": p99,
         "mean": float(finite.mean()) if finite.size else 0.0,
         "unit": a["unit"], "time": h["time"],
     }
@@ -708,7 +708,7 @@ def _cached(out: Path) -> bool:
     """True when the cache file exists; its access time is set to now for the pruning
     order (the modification time stays: it is the file's ETag)."""
     try:
-        os.utime(out, (time.time(), out.stat().st_mtime))
+        os.utime(out, ns=(time.time_ns(), out.stat().st_mtime_ns))  # in ns: seconds as a float would shift the time a little
     except OSError:
         return out.is_file()
     return True

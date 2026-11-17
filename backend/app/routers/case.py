@@ -1,11 +1,13 @@
 """Case data: inventory, Stats series, planes, surfaces, isosurfaces, profiles."""
 from __future__ import annotations
 
+import hashlib
 import io
+import zlib
 from pathlib import Path
 
 import numpy as np
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -15,6 +17,57 @@ from app.paths import safe_child, safe_path
 router = APIRouter(prefix="/api/case", tags=["case"])
 _CMAPS = ("viridis", "plasma", "inferno", "magma", "turbo", "coolwarm", "RdBu_r",
           "Greys_r", "jet", "cividis")
+
+# Planes and meshes are megabytes each and the Viewer asks for several per frame: over a slow
+# link (VPN) their transfer is what a field change or a time step costs. They are therefore sent
+# compressed (in the worker thread of the request, not on the event loop) and with a validator,
+# so a browser that still holds one is answered 304 without the data being read again.
+_REVALIDATE = {"Cache-Control": "private, no-cache", "Vary": "Accept-Encoding"}
+_GZIP_MAX = 64 * 1024 ** 2  # larger files are sent as they are (streamed from disk)
+# part of every plane validator: planes computed by older code are not reused
+_CODE = "%x" % max(Path(f).stat().st_mtime_ns for f in (__file__, vtkio.__file__))
+
+
+def _gzip(data) -> bytes:
+    """gzip at level 1: on these binary arrays within 2 % of level 6 at a third of the time."""
+    c = zlib.compressobj(1, zlib.DEFLATED, 31)
+    return c.compress(data) + c.flush()
+
+
+def _accepts_gzip(request: Request) -> bool:
+    return "gzip" in request.headers.get("accept-encoding", "").lower()
+
+
+def _unchanged(request: Request, etag: str | None) -> Response | None:
+    """304 when the client already holds the response with this validator."""
+    held = [t.strip().removeprefix("W/") for t in request.headers.get("if-none-match", "").split(",")]
+    if etag and etag in held:
+        return Response(status_code=304, headers={"ETag": etag, **_REVALIDATE})
+    return None
+
+
+def _source_tag(f: Path, *what) -> str | None:
+    """Validator of a response computed from f (and its other blocks): changes with the files
+    (time of last change, size), with `what` and with the code; None when a file is missing."""
+    try:
+        stats = [(str(b), st.st_mtime_ns, st.st_size) for b in (vtkio.block_files(f) or [f]) for st in (b.stat(),)]
+    except OSError:
+        return None
+    return '"%s"' % hashlib.sha1(repr((_CODE, stats, what)).encode()).hexdigest()[:24]
+
+
+def _file_response(request: Request, f: Path, media_type: str) -> Response:
+    """A mesh file (STL, indexed mesh, streamlines): gzip-compressed for clients that accept
+    it (an indexed mesh shrinks to about 45 %, an STL to 30 %), 304 when unchanged."""
+    st = f.stat()
+    gz = _accepts_gzip(request) and 1024 <= st.st_size <= _GZIP_MAX
+    etag = '"%x-%x%s"' % (st.st_mtime_ns, st.st_size, "-gz" if gz else "")
+    if (r := _unchanged(request, etag)) is not None:
+        return r
+    if not gz:
+        return FileResponse(f, media_type=media_type, headers={"ETag": etag, **_REVALIDATE})
+    return Response(_gzip(f.read_bytes()), media_type=media_type,
+                    headers={"ETag": etag, "Content-Encoding": "gzip", **_REVALIDATE})
 
 
 def _case(path: str) -> Path:
@@ -72,7 +125,16 @@ def series_stats(path: str, file: str, columns: list[str] = Query(...),
         raise HTTPException(422, str(e))
 
 
-def _plane_response(p: dict, h: int, w: int) -> Response:
+def _enc(enc: str) -> str:
+    if enc not in ("", "shuf"):
+        raise HTTPException(422, "enc must be shuf or empty")
+    return enc
+
+
+def _plane_response(request: Request, p: dict, h: int, w: int, enc: str = "", etag: str | None = None) -> Response:
+    """enc 'shuf': the float32 values byte-shuffled (byte 0 of every value, then byte 1, ...;
+    header X-Shuffle: 4) and gzip-compressed. Lossless; a plane shrinks to 25 % (fractions,
+    density) to 75 % (turbulent fields) of its size, plain gzip of the floats to 30 - 85 %."""
     hdr = {"X-Height": str(h), "X-Width": str(w),
            "X-Axis": str(p["axis"]), "X-Index": str(p["index"]),
            "X-Count": str(p["count"]), "X-Pos": repr(p["pos"]),
@@ -84,38 +146,54 @@ def _plane_response(p: dict, h: int, w: int) -> Response:
            "X-Unit": p["unit"].encode("ascii", "replace").decode(),
            "X-Time": repr(p["time"]) if p["time"] is not None else "",
            "Access-Control-Expose-Headers": "*"}
-    return Response(np.ascontiguousarray(p["data"], "<f4").tobytes(),
-                    media_type="application/octet-stream", headers=hdr)
+    if etag:
+        hdr.update(ETag=etag, **_REVALIDATE)
+    data = np.ascontiguousarray(p["data"], "<f4")
+    if enc == "shuf":
+        hdr["X-Shuffle"] = "4"
+        data = np.ascontiguousarray(data.reshape(-1).view(np.uint8).reshape(-1, 4).T)
+        if _accepts_gzip(request):
+            hdr["Content-Encoding"] = "gzip"
+            return Response(_gzip(data), media_type="application/octet-stream", headers=hdr)
+    return Response(data.tobytes(), media_type="application/octet-stream", headers=hdr)
 
 
 @router.get("/plane")
-def plane(path: str, file: str, array: str, comp: str = "mag",
-          axis: int | None = None, pos: float | None = None, mask: bool = True, smooth: bool = False):
+def plane(request: Request, path: str, file: str, array: str, comp: str = "mag",
+          axis: int | None = None, pos: float | None = None, mask: bool = True, smooth: bool = False,
+          enc: str = ""):
     """Scalar plane as little-endian float32 (rows = v, columns = u), metadata in headers.
-    smooth: averaged with the neighbouring layers (1-2-1), like VTK's cell-to-point data."""
+    smooth: averaged with the neighbouring layers (1-2-1), like VTK's cell-to-point data.
+    enc=shuf: packed (see _plane_response)."""
     f = _vtk_file(_case(path), file)
+    etag = _source_tag(f, "plane", array, comp, axis, pos, mask, smooth, _enc(enc))
+    if (r := _unchanged(request, etag)) is not None:
+        return r
     try:
         p = vtkio.extract_plane(f, array, comp, axis, pos, mask, smooth)
     except KeyError:
         raise HTTPException(404, f"no array '{array}' in {f.name}")
     except ValueError as e:
         raise HTTPException(422, str(e))
-    return _plane_response(p, *p["data"].shape)
+    return _plane_response(request, p, *p["data"].shape, enc, etag)
 
 
 @router.get("/plane_vec")
-def plane_vec(path: str, file: str, array: str, axis: int | None = None,
-              pos: float | None = None, mask: bool = True):
+def plane_vec(request: Request, path: str, file: str, array: str, axis: int | None = None,
+              pos: float | None = None, mask: bool = True, enc: str = ""):
     """In-plane vector components: float32 u plane then v plane (each rows = v),
-    statistics of the in-plane speed in the headers."""
+    statistics of the in-plane speed in the headers. enc=shuf: packed as /plane."""
     f = _vtk_file(_case(path), file)
+    etag = _source_tag(f, "plane_vec", array, axis, pos, mask, _enc(enc))
+    if (r := _unchanged(request, etag)) is not None:
+        return r
     try:
         p = vtkio.extract_vector_plane(f, array, axis, pos, mask)
     except KeyError:
         raise HTTPException(404, f"no array '{array}' in {f.name}")
     except ValueError as e:
         raise HTTPException(422, str(e))
-    return _plane_response(p, *p["data"].shape[1:])
+    return _plane_response(request, p, *p["data"].shape[1:], enc, etag)
 
 
 @router.get("/fluid_center")
@@ -224,14 +302,14 @@ def _fmt(fmt: str) -> str:
 
 
 @router.get("/surface")
-def surface(path: str, file: str, max_tris: int = 400_000, fmt: str = "stl"):
+def surface(request: Request, path: str, file: str, max_tris: int = 400_000, fmt: str = "stl"):
     """A surface (.vtp/.stl/.vtk) simplified above max_tris, as binary STL or as the
     compact indexed mesh (fmt=mesh: b'MPM1', n_points, n_tris, float32 xyz, uint32 index)."""
     f = _vtk_file(_case(path), file)
     fmt = _fmt(fmt)
     if fmt == "stl" and f.suffix.lower() == ".stl" and f.stat().st_size < 50 * max_tris:
-        return FileResponse(f, media_type="model/stl")
-    return FileResponse(vtkio.surface_stl(f, max(1000, max_tris), fmt), media_type=_MESH_TYPES[fmt])
+        return _file_response(request, f, "model/stl")
+    return _file_response(request, vtkio.surface_stl(f, max(1000, max_tris), fmt), _MESH_TYPES[fmt])
 
 
 @router.get("/surface_warm")
@@ -244,7 +322,7 @@ def surface_warm(path: str, file: list[str] = Query(...), max_tris: int = 400_00
 
 
 @router.get("/iso")
-def iso(path: str, file: str, array: str, level: float, comp: str = "mag",
+def iso(request: Request, path: str, file: str, array: str, level: float, comp: str = "mag",
         stride: int = 1, max_tris: int = 600_000, fmt: str = "stl"):
     f = _vtk_file(_case(path), file)
     fmt = _fmt(fmt)
@@ -253,11 +331,11 @@ def iso(path: str, file: str, array: str, level: float, comp: str = "mag",
                                    max(1000, max_tris), fmt)
     except KeyError:
         raise HTTPException(404, f"no array '{array}' in {f.name}")
-    return FileResponse(out, media_type=_MESH_TYPES[fmt])
+    return _file_response(request, out, _MESH_TYPES[fmt])
 
 
 @router.get("/streamlines")
-def streamlines(path: str, file: str, array: str, axis: int | None = None,
+def streamlines(request: Request, path: str, file: str, array: str, axis: int | None = None,
                 pos: float | None = None, n_seeds: int = 20, max_steps: int = 2000,
                 stride: int = 1):
     """3D streamlines seeded on a plane (binary, see vtkio.streamlines)."""
@@ -269,7 +347,7 @@ def streamlines(path: str, file: str, array: str, axis: int | None = None,
         raise HTTPException(404, f"no array '{array}' in {f.name}")
     except ValueError as e:
         raise HTTPException(422, str(e))
-    return FileResponse(out, media_type="application/octet-stream")
+    return _file_response(request, out, "application/octet-stream")
 
 
 @router.get("/cmap/{name}")

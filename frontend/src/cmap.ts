@@ -11,7 +11,9 @@ export function cmapLut(name: string): Promise<Uint8ClampedArray> {
       const cv = document.createElement("canvas");
       cv.width = 256;
       cv.height = 1;
-      const ctx = cv.getContext("2d")!;
+      // read back at once: a CPU canvas (the default GPU-backed one blocks the page for a read-back,
+      // ~250 ms without hardware acceleration)
+      const ctx = cv.getContext("2d", { willReadFrequently: true })!;
       ctx.drawImage(img, 0, 0, 256, 1);
       return ctx.getImageData(0, 0, 256, 1).data;
     })();

@@ -34,6 +34,11 @@ export type Overlay = {
   lineColor: string;
 };
 
+/** Note in the middle of a pane while its plane is on the way; `late` = shown only when that takes a while. */
+export function PaneLoading({ text, late = false }: { text?: string; late?: boolean }) {
+  return text ? <div className={`pane-loading${late ? " late" : ""}`} role="status">{text}</div> : null;
+}
+
 export type Tool = "none" | "line" | "region" | "point";
 export type RegionShape = "polygon" | "rectangle" | "square" | "circle";
 // pts = outline in world coordinates (circles as a fine polygon), used for drawing and statistics
@@ -45,7 +50,11 @@ export type Region = { pts: number[][]; closed: boolean; shape?: RegionShape; in
 // line, polygon region, probe point; world coordinates) and PNG export of the full plane.
 function SliceCanvas({ plane, cmap, range, log, title, onLine, tool = "none", height = 480,
                        legend, overlay, exportName = "slice", background = "#f8fafc", smooth = false,
-                       region, regionShape = "polygon", onRegionPoint, onRegionClose, onRegionDrag, onPoint, marker }: {
+                       region, regionShape = "polygon", onRegionPoint, onRegionClose, onRegionDrag, onPoint, marker,
+                       loading = "", stale = false, loadingLate = false }: {
+  loading?: string;       // note while the wanted plane is on the way ("" = it is the one drawn)
+  stale?: boolean;        // the plane drawn is of another field than the wanted one: dimmed
+  loadingLate?: boolean;  // show the note only when loading takes a while (same field, next frame)
   plane: Plane | null;
   cmap: string;
   range: [number, number];
@@ -167,7 +176,7 @@ function SliceCanvas({ plane, cmap, range, log, title, onLine, tool = "none", he
     drawOverlay(ctx, plane, cw, ch, overlay, line, 1 / zv.s, region, marker);
   }, [plane, cw, ch, overlay?.lines, overlay?.lineColor, line, zv.s, region, marker?.join(), anyOverlay]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (!plane) return <div className="slice empty muted" style={{ height }}>{title ?? "no data"}</div>;
+  if (!plane) return <div className="slice empty muted" style={{ height }}>{loading || (title ?? "no data")}</div>;
 
   const world = (e: React.MouseEvent) => {
     const r = ref.current!.getBoundingClientRect();
@@ -232,7 +241,7 @@ function SliceCanvas({ plane, cmap, range, log, title, onLine, tool = "none", he
         </span>
       </div>
       <div ref={box} className="slice-box" style={{ height, background }}>
-        <div ref={stack} className="slice-stack"
+        <div ref={stack} className={`slice-stack${stale ? " pane-stale" : ""}`}
              style={{ width: cw, height: ch, transform: `translate(${zv.tx}px, ${zv.ty}px) scale(${zv.s})` }}
              onPointerDown={(e) => {
                if (dragShape && e.button === 0) {
@@ -276,6 +285,7 @@ function SliceCanvas({ plane, cmap, range, log, title, onLine, tool = "none", he
           <canvas ref={over} className="slice-overlay" style={{ width: cw, height: ch }} />
         </div>
         {legend && <ColorLegend cmap={cmap} range={range} log={log} dark={luminance(background) < 0.5} {...legend} />}
+        <PaneLoading text={loading} late={loadingLate} />
       </div>
     </div>
   );

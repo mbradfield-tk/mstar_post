@@ -38,8 +38,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="M-Star Post", lifespan=lifespan)
 
-# Viewer planes, meshes and streamlines, images and downloads are binary and barely shrink,
-# while gzip runs on the event loop (level 9 took 1.2 s for a 6 MB surface): sent as they are.
+# Viewer planes, meshes and streamlines, images and downloads are binary: the middleware's gzip
+# runs on the event loop (level 9 took 1.2 s for a 6 MB surface), so it leaves them alone. The
+# Viewer routes compress their own responses in the request thread instead (routers/case.py:
+# level 1, a plane or mesh in 10 to 35 ms), the others are sent as they are.
 _NO_GZIP = ("/api/case/plane", "/api/case/surface", "/api/case/iso", "/api/case/streamlines",
             "/api/fs/download", "/api/fs/mesh", "/api/fs/image")
 

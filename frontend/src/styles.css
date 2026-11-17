@@ -297,6 +297,13 @@ input[type="number"].short { width: 70px; }
 .slice-box { position: relative; display: flex; align-items: center; justify-content: center; background: var(--panel-2); border-radius: 6px; overflow: hidden; }
 .slice-stack { position: relative; flex-shrink: 0; }
 .slice-overlay { position: absolute; left: 0; top: 0; pointer-events: none; }
+/* a pane whose plane is on the way: note in the middle; the plane of another field is dimmed meanwhile */
+.pane-loading { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 3; max-width: 90%;
+  padding: 6px 12px; border-radius: 6px; background: var(--panel); color: var(--text); border: 1px solid var(--line);
+  box-shadow: var(--shadow); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  pointer-events: none; }
+.pane-loading.late { animation: fade-in 0.15s ease 0.3s backwards; }
+.pane-stale { opacity: 0.35; }
 .viewer3d { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px; }
 .viewer3d-wrap { position: relative; }
 .viewer3d-canvas { width: 100%; border-radius: 6px; overflow: hidden; }

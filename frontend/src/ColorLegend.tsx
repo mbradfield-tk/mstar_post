@@ -4,6 +4,16 @@ import { cmapLut, legendTicks } from "./cmap";
 
 export type LegendInfo = { label: string; unit: string; notes?: string[] };  // notes: lines under the bar (e.g. means)
 
+/** The legend ticks as text: 3 significant digits, more (up to 7) when neighbouring ticks would
+ *  read the same, as for a narrow range on a large value (pressure 101200 .. 101900 Pa). */
+export function tickLabels(range: [number, number], log: boolean): string[] {
+  const ts = legendTicks(range, log), distinct = new Set(ts).size;
+  for (let d = 3; ; d++) {
+    const out = ts.map((v) => fmt(v, d));
+    if (d >= 7 || new Set(out).size === distinct) return out;
+  }
+}
+
 const lutStrip = (cv: HTMLCanvasElement, lut: Uint8ClampedArray) => {
   cv.width = 1;
   cv.height = 256;
@@ -31,7 +41,7 @@ export default function ColorLegend({ cmap, range, log, label, unit, notes, dark
       <div className="legend-unit">[{unit || "-"}]{log ? " log" : ""}</div>
       <div className="legend-body">
         <canvas ref={ref} />
-        <div className="legend-ticks">{legendTicks(range, log).map((v, i) => <span key={i}>{fmt(v, 3)}</span>)}</div>
+        <div className="legend-ticks">{tickLabels(range, log).map((s, i) => <span key={i}>{s}</span>)}</div>
       </div>
       {notes?.map((s, i) => <div key={i} className="legend-note">{s}</div>)}
     </div>
@@ -70,10 +80,10 @@ export function drawLegend(ctx: CanvasRenderingContext2D, box: { x: number; y: n
   ctx.lineWidth = 1;
   ctx.strokeRect(box.x + 0.5, y + 0.5, barW, barH);
   ctx.textBaseline = "middle";
-  legendTicks(range, log).forEach((v, i, a) => {
+  tickLabels(range, log).forEach((s, i, a) => {
     const ty = y + (barH * i) / (a.length - 1);
     ctx.fillRect(box.x + barW, ty, 4, 1);
-    ctx.fillText(fmt(v, 3), box.x + barW + 7, ty);
+    ctx.fillText(s, box.x + barW + 7, ty);
   });
   ctx.textBaseline = "top";
   let ny = y + barH + fs * 0.6;

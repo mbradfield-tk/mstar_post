@@ -1,16 +1,41 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, AXES, copyText, download, fmt, toCsv, type Inventory, type OutputKind, type PointValue, type Project } from "./api";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import { api, AXES, copyText, download, fmt, solvesNow, toCsv, type Inventory, type OutputKind, type PointValue, type Project, type ProjectCase, type SolveState } from "./api";
 import { SolveTag, useSolves } from "./CasesView";
-import { hasFinite, logRange, smoothed } from "./cmap";
+import { cmapLut, hasFinite, logRange, smoothed } from "./cmap";
 import { traceStreamlines, type Vec2 } from "./flow";
 import { clearLicCache, licNow, runLic } from "./lic";
-import { clearPlaneCache, fetchPlane, holdPlanes, isAbort, planeNow, type Plane } from "./plane";
-import Plot from "./Plot";
+import { clearPlaneCache, fetchPlane, fieldOf, holdPlanes, isAbort, planeNow, type Plane } from "./plane";
 import SliceCanvas, { type Overlay, type Region, type RegionShape, type Tool } from "./SliceCanvas";
 import Viewer3D, { CameraSync, clearViewerCaches, layerColor, prefetchMesh, type LineLayer, type MeshLayer } from "./Viewer3D";
 
+// The plots here (line profile, region and point time courses) are rarely opened: Plotly (1.4 MB
+// compressed) is loaded with the first of them, not before the Viewer can start.
+const LazyPlot = lazy(() => import("./Plot"));
+const Plot = (props: ComponentProps<typeof LazyPlot>) => (
+  <Suspense fallback={<div className="small muted">loading the plot...</div>}><LazyPlot {...props} /></Suspense>);
+
 const MAX_CASES = 4;
 const SLIDER_WAIT = 100;  // ms the time / position slider must rest before its frame or plane is fetched
+// Output shown for an inventory: the wanted one when the case has it, else "Volume", else the first
+// volume that is not BoundaryConditions, else the first volume, else the first slice.
+const kindFor = (inv: Inventory, want: string): string => {
+  const imgs = inv.kinds.filter((k) => k.type === "volume" || k.type === "slice");
+  return (imgs.find((k) => k.kind === want) ?? imgs.find((k) => k.kind === "Volume")
+    ?? imgs.find((k) => k.type === "volume" && !/boundary/i.test(k.kind)) ?? imgs.find((k) => k.type === "volume") ?? imgs[0])?.kind ?? "";
+};
+// Field shown for an output: the wanted one when it has it, else the velocity magnitude, a scalar
+// velocity, any velocity, the first array.
+const arrayFor = (kind: OutputKind, want: string): string => (kind.arrays.some((a) => a.name === want) ? want
+  : (kind.arrays.find((a) => /^velocity magnitude/i.test(a.name)) ?? kind.arrays.find((a) => /velocity/i.test(a.name) && a.ncomp === 1)
+     ?? kind.arrays.find((a) => /velocity/i.test(a.name)) ?? kind.arrays[0])?.name ?? "");
+// the most recently run case: solver log start, else the last write of its log, else the last one listed
+const newestCase = (cases: ProjectCase[], s: Record<string, SolveState> | null): string | undefined => {
+  const when = (id: string) => s?.[id]?.started ?? s?.[id]?.log_mtime ?? -Infinity;
+  return cases.length ? cases.reduce((b, c) => (when(c.id) >= when(b.id) ? c : b)).id : undefined;
+};
+type PaneLoad = { text: string; stale: boolean; late: boolean };
+const NOT_LOADING: PaneLoad = { text: "", stale: false, late: false };
+const NO_CPLANES: Plane[] = [];
 const MEAN_WAIT = 300;    // ms a frame must stay shown before its global mean is requested
 const BG_PRESETS = ["#f4f6f9", "#ffffff", "#808080", "#000000", "#1e293b"];
 const NO_LAYERS: MeshLayer[] = [];
@@ -53,6 +78,18 @@ const bounds = (k: OutputKind, axis: number): [number, number] => {
   const e = k.extent!, o = k.origin!, s = k.spacing!;
   return [o[axis] + e[2 * axis] * s[axis], o[axis] + e[2 * axis + 1] * s[axis]];
 };
+// Centre of the cell layer (sample layer for point data) a plane at pos falls on, as the server
+// picks it (vtkio._plane_geom). Planes are asked for at these positions, so two requests for one
+// layer are one URL and one download: the main plane and the centre plane of its axis in the
+// default view, or neighbouring slider positions inside one cell.
+const layerPos = (k: OutputKind, arrName: string, axis: number, pos: number): number => {
+  const e = k.extent, o = k.origin, s = k.spacing;
+  if (!e || !o || !s || !(s[axis] > 0)) return pos;
+  const cell = k.arrays.find((a) => a.name === arrName)?.assoc !== "point";
+  const span = e[2 * axis + 1] - e[2 * axis], count = cell ? Math.max(span, 1) : span + 1;
+  const first = o[axis] + (e[2 * axis] + (cell && span > 0 ? 0.5 : 0)) * s[axis];
+  return first + Math.min(count - 1, Math.max(0, Math.round((pos - first) / s[axis]))) * s[axis];
+};
 // volume output of the isosurface: the selected output when it is a volume, else as the default
 // output ("Volume", else the first that is not BoundaryConditions, else the first volume)
 const volKindOf = (inv: Inventory | null | undefined, selected: string): OutputKind | undefined => {
@@ -60,11 +97,11 @@ const volKindOf = (inv: Inventory | null | undefined, selected: string): OutputK
   return vols.find((k) => k.kind === selected) ?? vols.find((k) => k.kind === "Volume")
     ?? vols.find((k) => !/boundary/i.test(k.kind)) ?? vols[0];
 };
-// posed moving-body surfaces replace the static impeller STL; the vessel shell starts hidden
+// posed moving-body surfaces replace the static impeller STL; walls show see-through (0.2), the vessel shell starts hidden
 const geoDefaults = (inv: Inventory) => {
   const moving = inv.kinds.some((k) => k.type === "surface" && /movingbody/i.test(k.kind));
   return Object.fromEntries(inv.geometry.map((g) => [g.name, {
-    on: !/fluid height|box|vessel|tank|shell|wall|static/i.test(g.name) && !(moving && /moving|agitator|impeller|rotor/i.test(g.name)),
+    on: !/fluid height|box|vessel|tank|shell|static/i.test(g.name) && !(moving && /moving|agitator|impeller|rotor/i.test(g.name)),
     opacity: /wall|vessel|tank|shell|static/i.test(g.name) ? 0.2 : 0.9,
   }]));
 };
@@ -161,25 +198,37 @@ function typedRegion(shape: RegionShape, axis: number, ua: number, va: number, p
 export default function ViewerView({ project, onRefresh, active = true }: { project: Project; onRefresh: () => Promise<unknown>; active?: boolean }) {
   const cases = project.cases.filter((c) => c.included);
   const solves = useSolves(project.id, active);
-  // first selected case is the reference: its outputs, times and 3D settings drive the view
-  const [sel, setSel] = useState<string[]>(() => {
-    const r = project.ref_case && cases.some((c) => c.id === project.ref_case) ? project.ref_case : cases[0]?.id;
-    return r ? [r] : [];
+  // first selected case is the reference: its outputs, times and 3D settings drive the view.
+  // It starts on the most recently run case (newestCase), at once from the solver states the Cases
+  // tab has read, else when the first reply is in (a few ms), unless the user picked meanwhile.
+  const [sel, setSelRaw] = useState<string[]>(() => {
+    const s = solvesNow(project.id), id = s && newestCase(cases, s);
+    return id ? [id] : [];
   });
+  const picked = useRef(sel.length > 0);
+  const setSel = (s: string[]) => { picked.current = true; setSelRaw(s); };
+  const [solvesLate, setSolvesLate] = useState(false);
+  useEffect(() => { const id = setTimeout(() => setSolvesLate(true), 3000); return () => clearTimeout(id); }, []);
+  useEffect(() => {
+    const id = newestCase(cases, solves);
+    if (picked.current || !id || (!solves && !solvesLate)) return;
+    picked.current = true;
+    setSelRaw([id]);
+  }, [solves, solvesLate, cases.length]); // eslint-disable-line react-hooks/exhaustive-deps
   const ref = sel[0] ?? "";
   const [invs, setInvs] = useState<Record<string, Inventory>>({});
   const requested = useRef(new Set<string>());
   const [layout, setLayout] = useState<"2d" | "3d" | "both">("both");
-  const [kindName, setKindName] = useState("");
+  const [kindSel, setKindName] = useState("");  // output and field last in use: see kindName / array below
   const [ti, setTi] = useState(0);
-  const [array, setArray] = useState("");
+  const [arraySel, setArray] = useState("");
   const [compSel, setComp] = useState("mag");  // component picked for vector fields (see comp below)
   const [axis, setAxis] = useState(2);
   const [pos, setPos] = useState<number | null>(null);
   // tiF / posF = the frame and plane position that are fetched and shown: they follow the sliders
   // once those have rested for `wait` ms; buttons, typed values and playback apply at once
-  const [tiF, setTiF] = useState(0);
-  const [posF, setPosF] = useState<number | null>(null);
+  const [tiSet, setTiF] = useState(0);
+  const [posSet, setPosF] = useState<number | null>(null);
   const slow = useRef<{ ti?: number; pos?: number }>({});
   const setFrame = (i: number, wait = 0) => {
     setTi(i);
@@ -192,6 +241,20 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
     if (wait) slow.current.pos = window.setTimeout(() => setPosF(p), wait); else setPosF(p);
   };
   useEffect(() => () => { clearTimeout(slow.current.ti); clearTimeout(slow.current.pos); }, []);
+  const followLast = useRef(true);  // start on the newest frame; set again by Refresh when the last frame was shown
+  const framed = useRef(false);     // the first frame has been set (until then the newest one is shown)
+  // What is shown follows from the inventory of the reference case in the render that receives it:
+  // its output (the one in use, else the default), the field, the newest frame and the middle plane.
+  // The planes and surfaces of that view are therefore asked for at once, not two rounds of effects
+  // later behind the first 3D draw. The effects further down only store these values.
+  const invA = invs[ref] ?? null;
+  const kindName = invA ? kindFor(invA, kindSel) : kindSel;
+  const kind = invA?.kinds.find((k) => k.kind === kindName);
+  const array = kind ? arrayFor(kind, arraySel) : arraySel;
+  const isVolume = kind?.type === "volume";
+  const [lo, hi] = kind && kind.extent ? bounds(kind, axis) : [0, 0];
+  const tiF = kind && !framed.current ? Math.max(0, kind.times.length - 1) : tiSet;
+  const posF = posSet ?? (isVolume && kind?.extent ? (lo + hi) / 2 : null);
   const [cmap, setCmap] = useState("turbo");
   const [cmaps, setCmaps] = useState<string[]>(["turbo"]);
   const [rangeMode, setRangeMode] = useState<RangeMode>("robust");
@@ -201,7 +264,10 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const [smooth, setSmooth] = useState(() => localStorage.getItem("mstar_post.viewer.smooth") === "1");
   useEffect(() => { localStorage.setItem("mstar_post.viewer.smooth", smooth ? "1" : "0"); }, [smooth]);
   const [planes, setPlanes] = useState<Record<string, Plane | null>>({});
-  const [planesFor, setPlanesFor] = useState("");  // urlsKey whose planes have all arrived
+  // urlsKey / extraKey / cpKey whose planes have all arrived or failed: until then a pane is "loading"
+  const [planesFor, setPlanesFor] = useState("");
+  const [xFor, setXFor] = useState("");
+  const [cpFor, setCpFor] = useState("");
   const [busy3d, setBusy3d] = useState<Record<string, number>>({});  // meshes still loading per 3D pane
   const [fps, setFps] = useState(() => Number(localStorage.getItem("mstar_post.viewer.fps")) || 4);
   useEffect(() => { localStorage.setItem("mstar_post.viewer.fps", String(fps)); }, [fps]);
@@ -253,10 +319,8 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const [xPlanes, setXPlanes] = useState<Record<number, Plane | null>>({});
   const [refreshing, setRefreshing] = useState(false);
   const [note, setNote] = useState<string | null>(null);
-  const followLast = useRef(true);  // start on the newest frame; set again by Refresh when the last frame was shown
 
   const pathOf = (id: string) => cases.find((c) => c.id === id)?.path ?? "";
-  const invA = invs[ref] ?? null;
 
   // Re-read the outputs of the shown cases (new time steps, fields) and keep every view setting.
   const refresh = async () => {
@@ -295,6 +359,9 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   }, [note]);
 
   useEffect(() => { api.cmaps().then(setCmaps); }, []);
+  // colour table: asked for while the first planes are read, not after they have arrived (and not
+  // next to the inventory: its first request on a fresh server is slow and would hold that up)
+  useEffect(() => { if (invA) cmapLut(cmap).catch(() => undefined); }, [cmap, !!invA]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     for (const id of sel) {
       const p = pathOf(id);
@@ -307,15 +374,9 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
       }).catch((e) => { requested.current.delete(id); setError(`${id}: ${e.message}`); });
     }
   }, [sel.join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => {
-    if (!invA) return;
-    const imgs = invA.kinds.filter((k) => k.type === "volume" || k.type === "slice");
-    setKindName((cur) => imgs.some((k) => k.kind === cur) ? cur
-      : (imgs.find((k) => k.kind === "Volume") ?? imgs.find((k) => k.type === "volume" && !/boundary/i.test(k.kind))
-         ?? imgs.find((k) => k.type === "volume") ?? imgs[0])?.kind ?? "");
-  }, [invA]);
+  // the output in use is kept: it stays while the inventory of a new reference case is read
+  useEffect(() => { if (invA) setKindName(kindName); }, [invA, kindName]);
 
-  const kind = invA?.kinds.find((k) => k.kind === kindName);
   const arr = kind?.arrays.find((a) => a.name === array);
   // component in use: none for a scalar, else the picked one (magnitude when this field does not have it);
   // derived here, so a change of field never fetches with the component of the previous one first
@@ -324,12 +385,8 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
 
   useEffect(() => {
     if (!kind) return;
-    if (!kind.arrays.some((a) => a.name === array)) {
-      const pick = kind.arrays.find((a) => /^velocity magnitude/i.test(a.name))
-        ?? kind.arrays.find((a) => /velocity/i.test(a.name) && a.ncomp === 1)
-        ?? kind.arrays.find((a) => /velocity/i.test(a.name)) ?? kind.arrays[0];
-      setArray(pick?.name ?? "");
-    }
+    framed.current = true;
+    setArray(array);
     const last = Math.max(0, kind.times.length - 1);
     if (followLast.current) {
       followLast.current = false;
@@ -346,8 +403,6 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
       setF({ vec: (vecArrays.find((a) => /velocity/i.test(a.name)) ?? vecArrays[0]).name });
   }, [kind]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const isVolume = kind?.type === "volume";
-  const [lo, hi] = kind && kind.extent ? bounds(kind, axis) : [0, 0];
   // the plane starts in the middle of a new output or normal axis; the two pickers below set it
   // together with the output / axis, so nothing is fetched at the old position first
   useEffect(() => { if (isVolume) setPlanePos((lo + hi) / 2); }, [kindName, axis, isVolume]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -359,9 +414,12 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const pickAxis = (a: number) => { setAxis(a); mid(kind, a); };
   const pickKind = (name: string) => { setKindName(name); mid(invA?.kinds.find((k) => k.kind === name), axis); };
 
+  // plane position sent to the server for an output and field: the centre of its cell layer (layerPos)
+  const posOn = (k: OutputKind, arrName: string): number | null =>
+    (isVolume && posF !== null ? layerPos(k, arrName, axis, posF) : null);
   const urlFor = (path: string, k: OutputKind | undefined, idx: number) =>
     k && array ? api.planeUrl(path, k.files[idx][0], array, comp, isVolume ? axis : null,
-                              isVolume ? posF : null, mask, smooth) : null;
+                              posOn(k, array), mask, smooth) : null;
   // other cases show their output time nearest to the reference time
   const frameOf = (id: string): [OutputKind, number] | null => {
     const k = invs[id]?.kinds.find((x) => x.kind === kindName);
@@ -370,6 +428,15 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   };
   const urls = sel.map((id) => { const f = frameOf(id); return f ? urlFor(pathOf(id), f[0], f[1]) : null; });
   const urlsKey = urls.join("\n");
+  const withPlanes = layout !== "3d" || planeIn3d;  // the plane is shown (2D pane, or "plane" in the 3D view)
+  // The first planes and the colour table are asked for in this render: the effects below run
+  // after the panes have mounted, and the first 3D pane sets up WebGL then (0.1 to 0.4 s).
+  const early = useRef(false);
+  if (!early.current && withPlanes && urls.some((u) => u)) {
+    early.current = true;
+    urls.forEach((u) => { if (u) fetchPlane(u).catch(() => undefined); });
+    cmapLut(cmap).catch(() => undefined);
+  }
 
   const shownExtras = extras.filter((e) => sel.includes(e.id));
   const extraArr = (e: Extra) => frameOf(e.id)?.[0].arrays.find((a) => a.name === e.array);
@@ -377,21 +444,21 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const extraUrls = shownExtras.map((e) => {
     const f = frameOf(e.id);
     return f && extraArr(e) ? api.planeUrl(pathOf(e.id), f[0].files[f[1]][0], e.array, extraComp(e),
-      isVolume ? axis : null, isVolume ? posF : null, mask, smooth) : null;
+      isVolume ? axis : null, posOn(f[0], e.array), mask, smooth) : null;
   });
   const extraKey = JSON.stringify(shownExtras.map((e, i) => [e.key, extraUrls[i]]));
   useEffect(() => {
-    if (layout === "3d" && !planeIn3d) return;
+    if (!withPlanes) { setXFor(extraKey); return; }
     let live = true;
     const ac = new AbortController();
-    shownExtras.forEach((e, i) => {
+    Promise.all(shownExtras.map((e, i) => {
       const u = extraUrls[i];
-      if (!u) { setXPlanes((m) => ({ ...m, [e.key]: null })); return; }
-      fetchPlane(u, ac.signal).then((p) => live && setXPlanes((m) => ({ ...m, [e.key]: p })))
+      if (!u) { setXPlanes((m) => ({ ...m, [e.key]: null })); return null; }
+      return fetchPlane(u, ac.signal).then((p) => live && setXPlanes((m) => ({ ...m, [e.key]: p })))
         .catch((err) => live && !isAbort(err) && setError(`${e.id} (${e.array}): ${err.message}`));
-    });
+    })).then(() => live && setXFor(extraKey));
     return () => { live = false; giveUp(ac); };
-  }, [extraKey, layout, planeIn3d, gen]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [extraKey, withPlanes, gen]); // eslint-disable-line react-hooks/exhaustive-deps
   // planes of cases and extra views that are no longer shown are let go
   useEffect(() => {
     const keep = <T,>(m: Record<string, T>, ok: (k: string) => boolean): Record<string, T> =>
@@ -415,19 +482,23 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const setExtra = (key: number, patch: Partial<Extra>) =>
     setExtras((xs) => xs.map((e) => (e.key === key ? { ...e, ...patch } : e)));
 
+  // The planes of all shown cases replace the previous ones together: the shared colour range and
+  // the legends never mix two fields (or frames). A plane that failed leaves its pane empty.
   useEffect(() => {
-    if (layout === "3d" && !planeIn3d) { setPlanesFor(urlsKey); return; }
+    if (!withPlanes) { setPlanesFor(urlsKey); return; }
     let live = true;
     const ac = new AbortController();
     setError(null);
-    Promise.allSettled(sel.map((id, i) => {
+    Promise.all(sel.map((id, i) => {
       const u = urls[i];
-      if (!u) { setPlanes((m) => ({ ...m, [id]: null })); return null; }
-      return fetchPlane(u, ac.signal).then((p) => live && setPlanes((m) => ({ ...m, [id]: p })))
-        .catch((e) => live && !isAbort(e) && setError(`${id}: ${e.message}`));
-    })).then(() => live && setPlanesFor(urlsKey));
+      return u ? fetchPlane(u, ac.signal).catch((e) => { if (live && !isAbort(e)) setError(`${id}: ${e.message}`); return null; }) : null;
+    })).then((ps) => {
+      if (!live) return;
+      setPlanes((m) => ({ ...m, ...Object.fromEntries(sel.map((id, i) => [id, ps[i]])) }));
+      setPlanesFor(urlsKey);
+    });
     return () => { live = false; giveUp(ac); };
-  }, [urlsKey, layout, planeIn3d, gen]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [urlsKey, withPlanes, gen]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // global (fluid-volume) mean of the shown field per case and extra view, keyed by the mean URL.
   // A full-volume pass on the server: asked only for a frame that stays shown (not in playback, not
@@ -440,25 +511,13 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   };
   const meanKeys = [...sel.map((id) => meanKey(id, array, comp)),
                     ...shownExtras.map((e) => meanKey(e.id, e.array, extraComp(e)))].filter((k): k is string => !!k);
-  useEffect(() => {
-    if (playing) return;
-    const timer = setTimeout(() => {
-      for (const k of meanKeys) {
-        if (meanReq.current.has(k)) continue;
-        meanReq.current.add(k);
-        setVmeans((v) => ({ ...v, [k]: "busy" }));
-        const [path, file, arrName, c, m] = k.split("|");
-        api.volumeMean(path, file, arrName, c, m === "true")
-          .then((r) => setVmeans((v) => ({ ...v, [k]: { mean: r.mean, mask: r.mask } })))
-          .catch(() => { meanReq.current.delete(k); setVmeans((v) => ({ ...v, [k]: null })); });
-      }
-    }, MEAN_WAIT);
-    return () => clearTimeout(timer);
-  }, [meanKeys.join("\n"), playing, gen]); // eslint-disable-line react-hooks/exhaustive-deps
-  const meanNotes = (p: Plane | null, key: string | null): string[] => {
+  const meanSince = useRef(0);  // when the wanted means last changed
+  useEffect(() => { meanSince.current = performance.now(); }, [meanKeys.join("\n")]); // eslint-disable-line react-hooks/exhaustive-deps
+  // p = the plane that is drawn: the legend shows its own plane mean and the global mean of its file and field
+  const meanNotes = (p: Plane | null, withPlaneMean = true): string[] => {
     const out: string[] = [];
-    if (p && Number.isFinite(p.mean)) out.push(`plane mean ${fmt(p.mean, 4)}`);
-    const g = key ? vmeans[key] : undefined;
+    if (p && withPlaneMean && Number.isFinite(p.mean)) out.push(`plane mean ${fmt(p.mean, 4)}`);
+    const g = p ? vmeans[fieldOf(p).meanKey] : undefined;
     if (g === "busy") out.push("global mean ...");
     else if (g && typeof g.mean === "number") out.push(`global mean ${fmt(g.mean, 4)} (${g.mask === "none" ? "whole grid" : "fluid"})`);
     return out;
@@ -483,28 +542,62 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
       }).catch((e) => { if (req.get(id) === file) req.delete(id); setError(`${id} (fluid center): ${e.message}`); });
     });
   }, [cpFiles.join("\n"), cp.on, cp.yAuto]); // eslint-disable-line react-hooks/exhaustive-deps
-  const cpUrlsOf = (id: string, file: string | null): string[] | null => {
-    if (!file) return null;
+  // x = cx and z = cz planes at once; the y plane joins when the fluid centre is known (a
+  // whole-volume pass on the server), so the 3D view does not wait for it
+  const cpUrlsOf = (id: string, k: OutputKind | undefined, file: string | null): string[] | null => {
+    if (!file || !k) return null;
     const yc = cp.yAuto ? fluidC[id]?.[1] : cp.cy;
-    if (yc === undefined) return null;
-    return [0, 1, 2].map((ax) => api.planeUrl(pathOf(id), file, array, comp, ax,
-                                               [cp.cx, yc, cp.cz][ax], mask, smooth));
+    return [0, 1, 2].filter((ax) => ax !== 1 || yc !== undefined)
+      .map((ax) => api.planeUrl(pathOf(id), file, array, comp, ax, layerPos(k, array, ax, [cp.cx, yc ?? 0, cp.cz][ax]), mask, smooth));
   };
-  const cpUrls = sel.map((id, i) => cpUrlsOf(id, cpFiles[i]));
+  const cpUrls = sel.map((id, i) => cpUrlsOf(id, frameOf(id)?.[0], cpFiles[i]));
   const cpKey = JSON.stringify(cpUrls);
+  // The centre planes are asked for when the main planes are in (mainIn): over a slow link the
+  // transfer is what takes the time, and the plane the user changed comes first, alone. A new set
+  // gives up the loads of the previous one; a main plane that changes meanwhile does not.
+  const mainIn = planesFor === urlsKey;
+  const cpWanted = cpFiles.map((f) => !!f).join();
+  const cpJob = useRef<{ ac: AbortController; started: boolean } | null>(null);
   useEffect(() => {
-    let live = true;
-    const ac = new AbortController();
-    sel.forEach((id, i) => {
+    const job = { ac: new AbortController(), started: false };
+    cpJob.current = job;
+    // no centre planes wanted: clear; otherwise the shown planes stay until their replacements are in
+    sel.forEach((id, i) => { if (!cpUrls[i]) setCplanes((m) => (m[id]?.length ? { ...m, [id]: [] } : m)); });
+    return () => { if (cpJob.current === job) cpJob.current = null; giveUp(job.ac); };
+  }, [cpKey, cpWanted, gen]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const job = cpJob.current;
+    if (!job || job.started || !mainIn) return;
+    job.started = true;
+    const live = () => cpJob.current === job;
+    Promise.all(sel.map((id, i) => {
       const us = cpUrls[i];
-      // no center planes wanted: clear; fluid centre not known yet: the shown planes stay
-      if (!us) { if (!cpFiles[i]) setCplanes((m) => ({ ...m, [id]: [] })); return; }
-      Promise.all(us.map((u) => fetchPlane(u, ac.signal)))
-        .then((ps) => live && setCplanes((m) => ({ ...m, [id]: ps })))
-        .catch((e) => live && !isAbort(e) && setError(`${id} (center planes): ${e.message}`));
-    });
-    return () => { live = false; giveUp(ac); };
-  }, [cpKey, cpFiles.map((f) => !!f).join(), gen]); // eslint-disable-line react-hooks/exhaustive-deps
+      if (!us) return null;
+      return Promise.all(us.map((u) => fetchPlane(u, job.ac.signal)))
+        .then((ps) => live() && setCplanes((m) => ({ ...m, [id]: ps })))
+        .catch((e) => live() && !isAbort(e) && setError(`${id} (center planes): ${e.message}`));
+    })).then(() => live() && setCpFor(cpKey));
+  }, [cpKey, cpWanted, gen, mainIn]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The global means are asked once every plane of the frame is in (main, extra-view and centre
+  // planes: the whole-volume pass on the server doubles the time of a plane read at the same time)
+  // and the frame has been wanted for MEAN_WAIT.
+  const planesIn = planesFor === urlsKey && xFor === extraKey && cpFor === cpKey;
+  useEffect(() => {
+    if (playing || !planesIn) return;
+    const timer = setTimeout(() => {
+      for (const k of meanKeys) {
+        if (meanReq.current.has(k)) continue;
+        meanReq.current.add(k);
+        setVmeans((v) => ({ ...v, [k]: "busy" }));
+        const [path, file, arrName, c, m] = k.split("|");
+        api.volumeMean(path, file, arrName, c, m === "true")
+          .then((r) => setVmeans((v) => ({ ...v, [k]: { mean: r.mean, mask: r.mask } })))
+          .catch(() => { meanReq.current.delete(k); setVmeans((v) => ({ ...v, [k]: null })); });
+      }
+    }, Math.max(0, MEAN_WAIT - (performance.now() - meanSince.current)));
+    return () => clearTimeout(timer);
+  }, [meanKeys.join("\n"), playing, gen, planesIn]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // in-plane vector planes for streamlines / LIC
   const vecOk = vecArrays.some((a) => a.name === flow.vec);
@@ -512,7 +605,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const vecUrls = sel.map((id) => {
     const f = frameOf(id);
     return want2d && f ? api.planeVecUrl(pathOf(id), f[0].files[f[1]][0], flow.vec,
-                                         isVolume ? axis : null, isVolume ? posF : null, mask) : null;
+                                         isVolume ? axis : null, posOn(f[0], flow.vec), mask) : null;
   });
   const vecKey = vecUrls.join("\n");
   useEffect(() => {
@@ -570,7 +663,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const lines3d: Record<string, LineLayer[]> = Object.fromEntries(sel.map((id) => {
     const f = frameOf(id);
     if (!flow.stream3d || !vecOk || !f || f[0].type !== "volume") return [id, []];
-    return [id, [{ key: "stream", url: api.streamlinesUrl(pathOf(id), f[0].files[f[1]][0], flow.vec, axis, posF,
+    return [id, [{ key: "stream", url: api.streamlinesUrl(pathOf(id), f[0].files[f[1]][0], flow.vec, axis, posOn(f[0], flow.vec),
                                                            flow.seeds3d, f[0].file_size > 4e8 ? 2 : 1),
                    color: array === flow.vec && comp === "mag" ? null : flow.color3d, cmap, range: [0, 0], log }]];
   }));
@@ -581,7 +674,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   // meshes. The promises settle when the assets are there or have failed.
   const fetchAhead = (frame: number, lic: boolean): Promise<unknown>[] => {
     if (!kind) return [];
-    const tt = kind.times[frame], jobs: Promise<unknown>[] = [], withPlanes = layout !== "3d" || planeIn3d;
+    const tt = kind.times[frame], jobs: Promise<unknown>[] = [];
     const get = (u: string | null) => { if (u) jobs.push(fetchPlane(u)); };
     sel.forEach((id) => {
       const k = invs[id]?.kinds.find((x) => x.kind === kindName);
@@ -591,12 +684,12 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
         get(urlFor(path, k, idx));
         for (const e of shownExtras) {
           const a = e.id === id ? k.arrays.find((x) => x.name === e.array) : undefined;
-          if (a) get(api.planeUrl(path, file, e.array, a.ncomp > 1 ? e.comp || "mag" : "", isVolume ? axis : null, isVolume ? posF : null, mask, smooth));
+          if (a) get(api.planeUrl(path, file, e.array, a.ncomp > 1 ? e.comp || "mag" : "", isVolume ? axis : null, posOn(k, e.array), mask, smooth));
         }
       }
-      if (cp.on && layout !== "2d" && k.type === "volume" && array) cpUrlsOf(id, file)?.forEach(get);
+      if (cp.on && layout !== "2d" && k.type === "volume" && array) cpUrlsOf(id, k, file)?.forEach(get);
       if (want2d) {
-        const vu = api.planeVecUrl(path, file, flow.vec, isVolume ? axis : null, isVolume ? posF : null, mask);
+        const vu = api.planeVecUrl(path, file, flow.vec, isVolume ? axis : null, posOn(k, flow.vec), mask);
         jobs.push(lic && showLic ? fetchPlane(vu).then((p) => runLic(vu, toVec2(p), flow.licScale, flow.licL, id)) : fetchPlane(vu));
       }
     });
@@ -627,7 +720,19 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
     return () => clearTimeout(id);
   }, [playing, planesFor, urlsKey, busyTotal, ti, kind, layout, fps, ahead, extraKey, cpKey, vecKey, showLic, flow.licScale, flow.licL, planeIn3d, gen]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const shown = sel.map((id) => planes[id]).filter((p): p is Plane => !!p);
+  // The planes the colour range and the legend describe: the plane of each case, or its centre planes
+  // when the plane itself is not shown (3D view without "plane"). Only planes of one field: while a
+  // newly selected field loads, the planes still drawn are of the previous one.
+  const shown = useMemo(() => {
+    const all = withPlanes ? sel.map((id) => planes[id]).filter((p): p is Plane => !!p) : sel.flatMap((id) => cplanes[id] ?? []);
+    return all.filter((p) => fieldOf(p).key === fieldOf(all[0]).key);
+  }, [withPlanes, planes, cplanes, sel.join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
+  const shownKey = shown.length ? fieldOf(shown[0]).key : null;  // field on screen (null: nothing drawn yet)
+  // centre planes of another field than the one on screen are not drawn (they would get its colour range)
+  const cpShown = useMemo(() => Object.fromEntries(sel.map((id) => {
+    const ps = cplanes[id] ?? NO_CPLANES;
+    return [id, ps.every((p) => fieldOf(p).key === shownKey) ? ps : NO_CPLANES];
+  })), [cplanes, shownKey, sel.join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
   // a plane without fluid cells (all masked) has no range of its own: it is left out of shared ranges
   const ranged = shown.filter((p) => hasFinite(p.data));
   const rangeKey = ranged.map((p) => `${p.p01},${p.p99},${p.vmin},${p.vmax}`).join("|");
@@ -643,19 +748,21 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const range: [number, number] = useMemo(() => {
     const r = log ? logRange(baseRange, shown.map((p) => p.data)) : baseRange, k = rangeRef.current;
     return r[0] === k[0] && r[1] === k[1] ? k : (rangeRef.current = r);
-  }, [baseRange, log, planes, sel.join("|")]); // eslint-disable-line react-hooks/exhaustive-deps
-  // "shared": views of the same field share one color range (with the main rows when it is the main field)
+  }, [baseRange, log, shown]); // eslint-disable-line react-hooks/exhaustive-deps
+  // "shared": views of the same field share one color range (with the main rows when it is the main field);
+  // "the same field" is that of the planes drawn, so a view whose new field is still loading keeps its range
   const rangeRaw = (e: Extra): [number, number] => {
     const p = xPlanes[e.key];
+    const fk = p ? fieldOf(p).key : `${e.array}|${extraComp(e)}`;
     const lg = (r: [number, number], ps: Plane[]) => (e.log ? logRange(r, ps.map((q) => q.data)) : r);
     if (e.range === "manual") return lg(e.manual, p ? [p] : []);
     const span = (ps: Plane[], mode: RangeMode): [number, number] => mode === "auto"
       ? [Math.min(...ps.map((p) => p.vmin)), Math.max(...ps.map((p) => p.vmax))]
       : [Math.min(...ps.map((p) => p.p01)), Math.max(...ps.map((p) => p.p99))];
     if (e.range !== "shared") return p ? lg(span([p], e.range), [p]) : [0, 1];
-    const same = (x: Extra) => x.range === "shared" && x.array === e.array && extraComp(x) === extraComp(e);
-    if (e.array === array && extraComp(e) === comp) return e.log === log ? range : lg(baseRange, shown);
-    const ps = shownExtras.filter(same).map((x) => xPlanes[x.key]).filter((p): p is Plane => !!p && hasFinite(p.data));
+    if (fk === (shownKey ?? `${array}|${comp}`)) return e.log === log ? range : lg(baseRange, shown);
+    const ps = shownExtras.filter((x) => x.range === "shared").map((x) => xPlanes[x.key])
+      .filter((q): q is Plane => !!q && fieldOf(q).key === fk && hasFinite(q.data));
     return ps.length ? lg(span(ps, rangeMode === "auto" ? "auto" : "robust"), ps) : [0, 1];
   };
   // the same array as long as the values are the same, so an unrelated render does not recolor the view
@@ -668,6 +775,16 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   };
   const labelOf = (name: string, c: string, ncomp: number) =>
     `${name}${ncomp > 1 ? (c === "mag" ? " |mag|" : ` (${AXES[Number(c)] ?? c})`) : ""}`;
+  // label of the field a plane holds (a component is only asked for vector fields)
+  const planeLabel = (p: Plane) => { const f = fieldOf(p); return labelOf(f.array, f.comp, f.comp === "" ? 1 : 3); };
+  // What a pane says while its plane is on the way. A plane of another field stays (dimmed) until
+  // the new one is in, with the name of the field being loaded; for a new frame or plane position
+  // of the same field the note only appears when it takes a while (late); nothing during playback.
+  const loadingOf = (p: Plane | null | undefined, url: string | null, settled: boolean, key: string, label: string): PaneLoad => {
+    if (playing || settled || !url || p?.url === url) return NOT_LOADING;
+    const other = !!p && fieldOf(p).key !== key;
+    return { text: !p || other ? `Loading ${label}...` : "Loading...", stale: other, late: !!p && !other };
+  };
 
   // Line profile along a picked line. It is read again when the field or the frame changes (the line
   // stays) and dropped when the plane changes; an answer for an older state is not shown.
@@ -687,10 +804,10 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   useEffect(() => { if (profiles && profiles.key !== lineKey) onLine(profiles.p0, profiles.p1); }, [lineKey]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { lineAsk.current++; setProfiles(null); }, [kindName, axis, posF]);
 
-  // 3D layers per case at time tt; geometry/surface toggles are shared by name
-  const buildLayers = (tt: number): Record<string, MeshLayer[]> => Object.fromEntries(sel.map((id) => {
+  // 3D layers per case at time tt; geometry/surface toggles are shared by name (only: the cases to build them for)
+  const buildLayers = (tt: number, only?: Set<string>): Record<string, MeshLayer[]> => Object.fromEntries(sel.map((id) => {
     const inv = invs[id], path = pathOf(id);
-    if (!inv) return [id, []];
+    if (!inv || (only && !only.has(id))) return [id, []];
     const out: MeshLayer[] = inv.geometry.map((g, i) => ({
       key: `geo:${g.name}`, url: api.surfaceUrl(path, g.file), color: layerColor(i),
       opacity: geo[g.name]?.opacity ?? 0.5, visible: !!geo[g.name]?.on,
@@ -711,8 +828,21 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
     }
     return [id, out];
   }));
-  const layersBy: Record<string, MeshLayer[]> = useMemo(() => buildLayers(t),
-    [sel.join("|"), invs, geo, surf, iso, t, detail, kindName]); // eslint-disable-line react-hooks/exhaustive-deps
+  // The 3D surfaces follow the main planes: those of a new frame (and all of them when the view
+  // opens) are asked for once its main planes are in, so the planes do not share the connection
+  // with megabytes of meshes; the surfaces of the previous frame stay meanwhile. In playback
+  // everything was fetched ahead.
+  const t3Ref = useRef<number | null>(null);
+  const in3d = useRef(new Set<string>());  // cases whose first main plane is in (a case added later waits for its own)
+  if (!invA) t3Ref.current = null;  // nothing to show yet (the time is not known before the inventory)
+  else if (mainIn || playing) {
+    t3Ref.current = t;
+    sel.forEach((id) => { if (invs[id]) in3d.current.add(id); });
+  }
+  const t3 = t3Ref.current;
+  const ids3 = sel.filter((id) => in3d.current.has(id)).join("|");
+  const layersBy: Record<string, MeshLayer[]> = useMemo(() => (t3 === null ? {} : buildLayers(t3, in3d.current)),
+    [sel.join("|"), ids3, invs, geo, surf, iso, t3, detail, kindName]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // surfaces of other time steps: the server converts the 40 frames around the current one in
   // the background (re-requested when the time moves more than 15 frames from the last warm-up)
@@ -720,22 +850,39 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const surfKinds = Object.entries(surf).filter(([, o]) => o.on).map(([k]) => k).join("|");
   const warmed = useRef<Record<string, number>>({});
   useEffect(() => {
-    if (!surfKinds || layout === "2d") return;
+    if (!surfKinds || layout === "2d" || t3 === null) return;
     for (const id of sel) {
       const inv = invs[id];
-      if (!inv) continue;
+      if (!inv || !in3d.current.has(id)) continue;
       for (const k of inv.kinds.filter((x) => x.type === "surface" && surf[x.kind]?.on)) {
-        const i0 = nearest(k, t);
+        const i0 = nearest(k, t3);
         const wk = `${id}|${k.kind}|${detail}`;
         if (Math.abs((warmed.current[wk] ?? -1e9) - i0) > 15) {
           warmed.current[wk] = i0;
           const order = [...k.files.keys()].sort((a, b) => Math.abs(a - i0) - Math.abs(b - i0));
           api.surfaceWarm(pathOf(id), order.slice(0, 40).flatMap((i) => k.files[i]), detail).catch(() => undefined);
         }
-        if (i0 + 1 < k.files.length) k.files[i0 + 1].forEach((f) => prefetchMesh(api.surfaceUrl(pathOf(id), f, detail, "mesh")));
       }
     }
-  }, [surfKinds, detail, layout, sel.join("|"), invs, t]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [surfKinds, detail, layout, sel.join("|"), ids3, invs, t3]); // eslint-disable-line react-hooks/exhaustive-deps
+  // The surfaces of the next frame are fetched when everything of the shown frame has been there
+  // for a moment (not while stepping or loading), and given up when another field or plane is
+  // asked for: what the user is waiting for is not slowed down by a download made on spec.
+  const nextMeshes = !surfKinds || layout === "2d" || t3 === null ? [] : sel.flatMap((id) =>
+    (invs[id]?.kinds ?? []).filter((k) => k.type === "surface" && surf[k.kind]?.on)
+      .flatMap((k) => (k.files[nearest(k, t3) + 1] ?? []).map((f) => api.surfaceUrl(pathOf(id), f, detail, "mesh"))));
+  const nextKey = nextMeshes.join("\n");
+  const frameShown = planesIn && t3 === t && !playing && Object.values(busy3d).every((b) => !b);
+  const aheadAc = useRef<AbortController | null>(null);
+  useEffect(() => () => aheadAc.current?.abort(), [kindName, array, comp, axis, posF, mask, smooth]);
+  useEffect(() => {
+    if (!frameShown || !nextKey) return;
+    const timer = setTimeout(() => {
+      const ac = aheadAc.current = new AbortController();
+      nextMeshes.forEach((u) => prefetchMesh(u, ac.signal));
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [frameShown, nextKey]); // eslint-disable-line react-hooks/exhaustive-deps
   const lines3dBy: Record<string, LineLayer[]> = useMemo(() => Object.fromEntries(Object.entries(lines3d)
     .map(([id, ls]) => [id, ls.map((l) => ({ ...l, range }))])), [lines3dKey, range]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -803,7 +950,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
         const p = planes[id];
         if (!k || !array || !p || p.axis !== region.axis) return null;
         const r = await api.regionSeries(pathOf(id), k.files.map((f) => f[0]), array, comp, isVolume ? axis : null,
-          isVolume ? posF : null, region.pts.map((q) => [q[p.uAxis], q[p.vAxis]]), mask, smooth);
+          posOn(k, array), region.pts.map((q) => [q[p.uAxis], q[p.vAxis]]), mask, smooth);
         return { id, unit: r.frames[0]?.unit ?? p.unit, t: r.frames.map((f, i) => f.time ?? k.times[i]),
                  mean: r.frames.map((f) => f.mean), std: r.frames.map((f) => f.std) };
       }));
@@ -815,13 +962,13 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
     if (!region?.closed) return [];
     const rowsOut: { id: string; label: string; unit: string; s: RegionStats }[] = [];
     const stats = (p: Plane) => regionStats(p, region.pts, smooth ? smoothed(p.data, p.w, p.h) : p.data);
-    sel.forEach((id) => { const p = planes[id]; if (p && p.axis === region.axis) rowsOut.push({ id, label: labelOf(array, comp, arr?.ncomp ?? 1), unit: p.unit, s: stats(p) }); });
+    sel.forEach((id) => { const p = planes[id]; if (p && p.axis === region.axis) rowsOut.push({ id, label: planeLabel(p), unit: p.unit, s: stats(p) }); });
     shownExtras.forEach((e) => {
       const p = xPlanes[e.key];
-      if (p && p.axis === region.axis) rowsOut.push({ id: e.id, label: labelOf(e.array, extraComp(e), extraArr(e)?.ncomp ?? 1), unit: p.unit, s: stats(p) });
+      if (p && p.axis === region.axis) rowsOut.push({ id: e.id, label: planeLabel(p), unit: p.unit, s: stats(p) });
     });
     return rowsOut;
-  }, [region, planes, xPlanes, sel.join("|"), extraKey, array, comp, smooth]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [region, planes, xPlanes, sel.join("|"), extraKey, smooth]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // point probe: value of the cell nearest to (x, y, z) in the current frame of every shown case and extra view
   const probeP = useMemo(() => (probe.every((s) => s.trim() !== "" && Number.isFinite(Number(s))) ? probe.map(Number) : null), [probe]);
@@ -887,8 +1034,22 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
   const both = layout === "both";
   const paneH = rows === 1 ? (both ? 480 : 620) : rows === 2 ? (both ? 400 : 440) : 330;
   const fieldLabel = `${array}${arr && arr.ncomp > 1 ? (comp === "mag" ? " |mag|" : ` (${AXES[Number(comp)] ?? comp})`) : ""}`;
-  const legendFor = (id: string) => array ? { label: fieldLabel, unit: planes[id]?.unit ?? arr?.unit ?? "",
-                                              notes: meanNotes(planes[id] ?? null, meanKey(id, array, comp)) } : undefined;
+  // the legend of a pane describes what it draws: the plane of the case, else its centre planes
+  // (no plane mean for those), else (nothing drawn yet) the selected field
+  const legendFor = (id: string) => {
+    const p = withPlanes ? planes[id] : cpShown[id][0];
+    if (p) return { label: planeLabel(p), unit: p.unit, notes: meanNotes(p, withPlanes) };
+    return array ? { label: fieldLabel, unit: arr?.unit ?? "", notes: [] } : undefined;
+  };
+  const fieldKey = `${array}|${comp}`;
+  const mainLoad = sel.map((id, i) => (withPlanes ? loadingOf(planes[id], urls[i], planesFor === urlsKey, fieldKey, fieldLabel) : NOT_LOADING));
+  // 3D pane: also while its centre planes are on the way (named when those of the field on screen are missing)
+  const load3d = sel.map((id, i): PaneLoad => {
+    const us = cpUrls[i], ps = cplanes[id] ?? NO_CPLANES;
+    if (mainLoad[i].text || playing || !us || cpFor === cpKey || (ps.length === us.length && us.every((u, j) => ps[j].url === u))) return mainLoad[i];
+    const none = !cpShown[id].length;
+    return { text: none ? `Loading ${fieldLabel}...` : "Loading...", stale: false, late: !none };
+  });
 
   return (
     <div className="split">
@@ -1216,7 +1377,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
         {error && <div className="error">{error}</div>}
         <div className="viewer-wrap">
           <div className={`viewer-grid${!both && rows > 1 ? " cols2" : ""}`}>
-            {sel.map((id) => {
+            {sel.map((id, i) => {
               const has = !!invs[id]?.kinds.some((k) => k.kind === kindName);
               const legend = legendFor(id);
               return (
@@ -1226,6 +1387,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                   <div className={`viewer-row${both ? " both" : ""}`}>
                     {layout !== "3d" && (
                       <SliceCanvas plane={planes[id] ?? null} cmap={cmap} range={range} log={log} height={paneH}
+                                   loading={mainLoad[i].text} stale={mainLoad[i].stale} loadingLate={mainLoad[i].late}
                                    tool={tool} onLine={cb.onLine} legend={legend} overlay={overlayOf(id)}
                                    region={regionFor(planes[id] ?? null)} onRegionPoint={cb.onRegionPoint} onRegionClose={cb.onRegionClose}
                                    regionShape={regionShape} onRegionDrag={cb.onRegionDrag}
@@ -1237,8 +1399,9 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                     {layout !== "2d" && invs[id] && (
                       <Viewer3D layers={layersBy[id] ?? NO_LAYERS} plane={planeIn3d ? planes[id] ?? null : null}
                                 cmap={cmap} range={range} log={log} height={paneH} background={bg} smooth={smooth}
+                                loading={load3d[i].text} stale={load3d[i].stale} loadingLate={load3d[i].late}
                                 legend={legend} overlay={overlayOf(id)} lines={lines3dBy[id]}
-                                extraPlanes={cp.on ? cplanes[id] : undefined}
+                                extraPlanes={cp.on ? cpShown[id] : undefined}
                                 exportName={`${id}_3d_t${fmt(t)}`}
                                 onLoading={onLoading3d} loadKey={id} reload={gen}
                                 sync={syncCams && rows > 1 ? camSync : undefined} />
@@ -1247,11 +1410,12 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                 </div>
               );
             })}
-            {shownExtras.map((e) => {
+            {shownExtras.map((e, i) => {
               const a = extraArr(e);
               const p = xPlanes[e.key] ?? null;
               const lab = labelOf(e.array, extraComp(e), a?.ncomp ?? 1);
-              const lg = { label: lab, unit: p?.unit ?? a?.unit ?? "", notes: meanNotes(p, meanKey(e.id, e.array, extraComp(e))) };
+              const lg = p ? { label: planeLabel(p), unit: p.unit, notes: meanNotes(p) } : { label: lab, unit: a?.unit ?? "", notes: [] };
+              const ld = withPlanes ? loadingOf(p, extraUrls[i], xFor === extraKey, `${e.array}|${extraComp(e)}`, lab) : NOT_LOADING;
               const r = rangeOf(e);
               return (
                 <div key={`x${e.key}`} className="viewer-case">
@@ -1260,6 +1424,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                   <div className={`viewer-row${both ? " both" : ""}`}>
                     {layout !== "3d" && (
                       <SliceCanvas plane={p} cmap={e.cmap} range={r} log={e.log} height={paneH}
+                                   loading={ld.text} stale={ld.stale} loadingLate={ld.late}
                                    tool={tool === "line" ? "none" : tool} onLine={cb.onLine} legend={lg} overlay={overlayOf(e.id)}
                                    region={regionFor(p)} onRegionPoint={cb.onRegionPoint} onRegionClose={cb.onRegionClose}
                                    regionShape={regionShape} onRegionDrag={cb.onRegionDrag}
@@ -1270,6 +1435,7 @@ export default function ViewerView({ project, onRefresh, active = true }: { proj
                     {layout !== "2d" && invs[e.id] && (
                       <Viewer3D layers={layersBy[e.id] ?? NO_LAYERS} plane={planeIn3d ? p : null}
                                 cmap={e.cmap} range={r} log={e.log} height={paneH} background={bg} smooth={smooth}
+                                loading={ld.text} stale={ld.stale} loadingLate={ld.late}
                                 legend={lg} overlay={overlayOf(e.id)}
                                 exportName={`${e.id}_${e.array}_3d_t${fmt(t)}`}
                                 onLoading={onLoading3d} loadKey={`x${e.key}`} reload={gen}

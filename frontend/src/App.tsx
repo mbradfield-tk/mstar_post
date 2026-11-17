@@ -151,13 +151,16 @@ function Session({ theme, setTheme }: { theme: Theme; setTheme: (t: Theme) => vo
   // updates from the tabs (case selection, names, relocate, Viewer refresh): only a newer version of the
   // open project may replace it, so a reply that arrives after a project switch cannot bring the old one back
   const changeProject = useCallback((p: Project) => setProject((cur) => (cur && cur.id === p.id ? p : cur)), []);
-  // Results and Plots load Plotly: fetch those chunks once a project is open and the browser is idle
+  // Results and Plots load Plotly: fetch those chunks once a project is open and the browser is idle.
+  // Not while the Viewer is in front: it is downloading planes and surfaces then, and over a slow
+  // link 1.4 MB of Plotly on the same connection would hold those up.
   const projectId = project?.id;
+  const inViewer = where === "Viewer";
   useEffect(() => {
-    if (!projectId) return;
+    if (!projectId || inViewer) return;
     const id = window.setTimeout(() => { preload("Results"); preload("Plots"); }, 2500);
     return () => clearTimeout(id);
-  }, [projectId]);
+  }, [projectId, inViewer]);
 
   const onSubmitted = useEvent((j: Job) => {
     setJob(j.id);

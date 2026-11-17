@@ -5,7 +5,7 @@ import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import ColorLegend, { drawLegend, savePng, type LegendInfo } from "./ColorLegend";
 import { cmapLut, colorize, hexRgb, luminance, shadeLic, upsample } from "./cmap";
 import { isAbort, LoadCache, type Plane } from "./plane";
-import { sameProps, type Overlay } from "./SliceCanvas";
+import { PaneLoading, sameProps, type Overlay } from "./SliceCanvas";
 
 export type MeshLayer = {
   key: string;      // stable id (url changes reload the geometry)
@@ -86,8 +86,10 @@ export function clearViewerCaches(): void {
   meshes.clear();
   lineCache.clear();
 }
-/** Fetch and decode a mesh ahead of time (e.g. the next time step); settles when it is there or failed. */
-export const prefetchMesh = (url: string): Promise<void> => meshes.get(url).then(() => undefined, () => undefined);
+/** Fetch and decode a mesh ahead of time (e.g. the next time step); settles when it is there or
+ *  failed. With a signal the download is given up when the caller aborts and no pane wants the mesh. */
+export const prefetchMesh = (url: string, signal?: AbortSignal): Promise<void> =>
+  meshes.get(url, signal).then(() => undefined, () => undefined);
 
 type Lines = { pts: Float32Array; speed: Float32Array; offsets: Uint32Array };
 const lineCache = new Map<string, Promise<Lines>>();
@@ -220,7 +222,11 @@ function styleMesh(m: THREE.Mesh, l: MeshLayer): void {
 // textured plane (optionally LIC-shaded), with an in-view legend. Drawn on demand.
 function Viewer3D({ layers, plane, cmap, range, log, height = 560, sync, lines = NO_LINES,
                     background = "#f4f6f9", legend, overlay, exportName = "view3d",
-                    extraPlanes = NO_PLANES, smooth = false, onLoading, loadKey, reload = 0 }: {
+                    extraPlanes = NO_PLANES, smooth = false, onLoading, loadKey, reload = 0,
+                    loading: planeLoading = "", stale = false, loadingLate = false }: {
+  loading?: string;       // note while the wanted planes are on the way (see SliceCanvas)
+  stale?: boolean;        // the planes drawn are of another field than the wanted one: dimmed
+  loadingLate?: boolean;
   layers: MeshLayer[];
   plane: Plane | null;
   cmap: string;
@@ -711,7 +717,7 @@ function Viewer3D({ layers, plane, cmap, range, log, height = 560, sync, lines =
         {(meshErr || lineErr) && <span className="error">{[meshErr, lineErr].filter(Boolean).join("; ")}</span>}
       </div>
       <div className="viewer3d-wrap" title={`${tips[mode]}; wheel: zoom; double-click: set rotation center`}>
-        <div ref={host} className="viewer3d-canvas" style={{ height }} />
+        <div ref={host} className={`viewer3d-canvas${stale ? " pane-stale" : ""}`} style={{ height }} />
         {mode === "box" && (
           <div className="boxzoom"
                onPointerDown={(e) => {
@@ -736,6 +742,7 @@ function Viewer3D({ layers, plane, cmap, range, log, height = 560, sync, lines =
           </div>
         )}
         {showLegend && <ColorLegend cmap={cmap} range={range} log={log} dark={dark} {...legend!} />}
+        <PaneLoading text={planeLoading} late={loadingLate} />
       </div>
     </div>
   );

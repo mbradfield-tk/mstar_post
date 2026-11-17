@@ -211,7 +211,8 @@ export const api = {
   projects: () => req<ProjectSummary[]>("/api/projects"),
   allCases: () => req<CatalogCase[]>("/api/cases"),
   project: (id: string, refresh = false) => req<Project>(`/api/projects/${id}${refresh ? "?refresh=true" : ""}`),
-  solves: (id: string) => req<Record<string, SolveState>>(`/api/projects/${id}/solves`),
+  solves: (id: string) => req<Record<string, SolveState>>(`/api/projects/${id}/solves`)
+    .then((s) => { solvesCache.set(id, s); return s; }),
   createProject: (name: string, root: string, meta?: Partial<ProjectMeta>) =>
     req<Project>("/api/projects", json("POST", { name, root, ...meta })),
   patchProject: (id: string, body: Partial<{ name: string; included: Record<string, boolean>;
@@ -264,11 +265,12 @@ export const api = {
     req<{ distance: number[]; value: (number | null)[]; unit: string }>(
       `/api/case/line?${qs({ path, file, array, comp, p0: p0.join(","), p1: p1.join(","), n })}`),
   cmaps: () => req<string[]>("/api/case/cmaps"),
+  // enc=shuf: the plane comes packed (byte-shuffled floats, gzip): see plane.ts loadPlane
   planeUrl: (path: string, file: string, array: string, comp: string,
              axis: number | null, pos: number | null, mask = true, smooth = false) =>
-    `/api/case/plane?${qs({ path, file, array, comp, axis, pos, mask, smooth })}`,
+    `/api/case/plane?${qs({ path, file, array, comp, axis, pos, mask, smooth, enc: "shuf" })}`,
   planeVecUrl: (path: string, file: string, array: string, axis: number | null, pos: number | null,
-                mask = true) => `/api/case/plane_vec?${qs({ path, file, array, axis, pos, mask })}`,
+                mask = true) => `/api/case/plane_vec?${qs({ path, file, array, axis, pos, mask, enc: "shuf" })}`,
   streamlinesUrl: (path: string, file: string, array: string, axis: number, pos: number | null,
                    n_seeds: number, stride = 1) =>
     `/api/case/streamlines?${qs({ path, file, array, axis, pos, n_seeds, stride })}`,
@@ -378,8 +380,14 @@ export function cachedTasks(maxAge = 300000): Promise<TaskDef[]> {
   return entry.p;
 }
 
+// Solver states of a project as last read (the Cases tab and the Viewer poll them): a tab opened
+// later starts with these instead of waiting for its first reply.
+const solvesCache = new Map<string, Record<string, SolveState>>();
+export const solvesNow = (pid: string): Record<string, SolveState> | null => solvesCache.get(pid) ?? null;
+
 // account change: nothing fetched for the previous user is reused
 export function clearApiCaches(): void {
   runsCache.clear();
+  solvesCache.clear();
   tasksCache = null;
 }

@@ -516,6 +516,48 @@ def test_fluid_weighted_mean(tmp_path):
     assert vtkio.point_value(p, "Energy Dissipation Rate (W/kg)", "", [0.25, 0.05, 0.05])["solid"] is False
 
 
+def test_packed_planes_and_validators(client):
+    """enc=shuf: the same floats, byte-shuffled and gzip-compressed. Planes and mesh files carry
+    a validator: 304 without a body while the file is unchanged, the data again once it is rewritten."""
+    case = client.root / "R1" / "caseA"
+    vol = "out/Output/Volume/block0/Volume.2.00000e+00.vti"
+    q = {"path": str(case), "file": vol, "array": "Velocity Vector (m/s)", "comp": "0", "axis": 2, "pos": 0.015}
+    raw = client.get("/api/case/plane", params=q)
+    r = client.get("/api/case/plane", params={**q, "enc": "shuf"})
+    assert r.headers["x-shuffle"] == "4" and r.headers["content-encoding"] == "gzip" and "x-shuffle" not in raw.headers
+    unshuffled = np.frombuffer(r.content, np.uint8).reshape(4, -1).T.copy().view("<f4").ravel()  # the client un-gzips
+    np.testing.assert_array_equal(unshuffled, np.frombuffer(raw.content, "<f4"))
+    plain = client.get("/api/case/plane", params={**q, "enc": "shuf"}, headers={"Accept-Encoding": "identity"})
+    assert "content-encoding" not in plain.headers and plain.content == r.content
+    assert client.get("/api/case/plane", params={**q, "enc": "zip"}).status_code == 422
+    v = client.get("/api/case/plane_vec", params={"path": str(case), "file": vol, "array": "Velocity Vector (m/s)",
+                                                  "axis": 2, "pos": 0.015, "mask": False, "enc": "shuf"})
+    d = np.frombuffer(v.content, np.uint8).reshape(4, -1).T.copy().view("<f4").reshape(2, 5, 6)
+    np.testing.assert_array_equal(d[0], np.arange(6 * 5 * 4, dtype=np.float32).reshape(4, 5, 6)[1])
+
+    tag = r.headers["etag"]
+    assert tag != raw.headers["etag"] and r.headers["cache-control"] == "private, no-cache"
+    again = client.get("/api/case/plane", params={**q, "enc": "shuf"}, headers={"If-None-Match": tag})
+    assert again.status_code == 304 and not again.content and again.headers["etag"] == tag
+    other = client.get("/api/case/plane", params={**q, "enc": "shuf", "pos": 0.0}, headers={"If-None-Match": tag})
+    assert other.status_code == 200  # another plane of the same file
+    f = case / vol
+    st = f.stat()
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))
+    new = client.get("/api/case/plane", params={**q, "enc": "shuf"}, headers={"If-None-Match": tag})
+    assert new.status_code == 200 and new.headers["etag"] != tag and new.content == r.content
+
+    vof = {"path": str(case), "file": "out/Output/VolumeVOFSurface/block0/VOFSurface.1.00000e+00.vtp", "fmt": "mesh"}
+    m = client.get("/api/case/surface", params=vof)
+    assert m.status_code == 200 and m.content[:4] == b"MPM1"
+    assert (m.headers.get("content-encoding") == "gzip") == (len(m.content) >= 1024)
+    m2 = client.get("/api/case/surface", params=vof, headers={"If-None-Match": m.headers["etag"]})
+    assert m2.status_code == 304 and not m2.content
+    stl = {"path": str(case), "file": "Vessel.stl"}
+    s = client.get("/api/case/surface", params=stl)
+    assert s.status_code == 200 and client.get("/api/case/surface", params=stl, headers={"If-None-Match": s.headers["etag"]}).status_code == 304
+
+
 def test_meshes(client):
     case = str(client.root / "R1" / "caseA")
     r = client.get("/api/case/surface", params={
@@ -943,10 +985,16 @@ def test_surface_cache_single_builder(tmp_path, monkeypatch):
 
 
 def test_binary_responses_not_gzipped(client):
+    """The gzip middleware (event loop, level 6) leaves the binary routes alone; the Viewer's
+    mesh routes compress their own response in the request thread (routers/case._file_response)."""
     case = str(client.root / "R1" / "caseA")
     r = client.get("/api/case/surface", headers={"Accept-Encoding": "gzip"}, params={
         "path": case, "file": "out/Output/VolumeVOFSurface/block0/VOFSurface.1.00000e+00.vtp", "fmt": "mesh"})
-    assert r.status_code == 200 and len(r.content) > 4096 and "content-encoding" not in r.headers
+    assert r.status_code == 200 and len(r.content) > 4096 and r.content[:4] == b"MPM1"
+    assert r.headers["content-encoding"] == "gzip" and int(r.headers["content-length"]) < len(r.content)
+    r = client.get("/api/case/surface", headers={"Accept-Encoding": "identity"}, params={
+        "path": case, "file": "out/Output/VolumeVOFSurface/block0/VOFSurface.1.00000e+00.vtp", "fmt": "mesh"})
+    assert r.status_code == 200 and "content-encoding" not in r.headers and int(r.headers["content-length"]) == len(r.content)
     r = client.get("/api/tasks", headers={"Accept-Encoding": "gzip"})
     assert len(r.content) > 4096 and r.headers["content-encoding"] == "gzip"
     r = client.get("/api/no/such/endpoint")  # not the page of the UI

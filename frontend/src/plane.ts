@@ -1,5 +1,6 @@
 // Float32 planes from /api/case/plane with an LRU cache (ported from tak_lbm SliceView).
 export type Plane = {
+  url: string;  // what it was read for (case, file, array, component, plane): see fieldOf
   w: number; h: number; data: Float32Array;
   axis: number; index: number; count: number; pos: number;
   uAxis: number; vAxis: number; u0: number; v0: number; du: number; dv: number;
@@ -85,6 +86,17 @@ export class LoadCache<T> {
   }
 }
 
+// The float32 values of a packed plane (X-Shuffle: 4 = byte 0 of every value, then byte 1, ...;
+// the gzip around it is undone by the browser): a few ms for a 600 x 600 plane.
+function unshuffle(buf: ArrayBuffer): Float32Array {
+  const src = new Uint8Array(buf), n = src.length >> 2, out = new Uint8Array(n * 4);
+  for (let b = 0; b < 4; b++) {
+    const part = src.subarray(b * n, (b + 1) * n);
+    for (let i = 0, o = b; i < n; i++, o += 4) out[o] = part[i];
+  }
+  return new Float32Array(out.buffer);
+}
+
 async function loadPlane(url: string, signal: AbortSignal): Promise<Plane> {
   const r = await fetch(url, { signal });
   if (!r.ok) {
@@ -96,7 +108,7 @@ async function loadPlane(url: string, signal: AbortSignal): Promise<Plane> {
   const n = (k: string) => Number(h.get(k));
   const buf = await r.arrayBuffer();
   return {
-    w: n("x-width"), h: n("x-height"), data: new Float32Array(buf),
+    url, w: n("x-width"), h: n("x-height"), data: h.get("x-shuffle") === "4" ? unshuffle(buf) : new Float32Array(buf),
     axis: n("x-axis"), index: n("x-index"), count: n("x-count"), pos: n("x-pos"),
     uAxis: n("x-u-axis"), vAxis: n("x-v-axis"), u0: n("x-u0"), v0: n("x-v0"),
     du: n("x-du"), dv: n("x-dv"), vmin: n("x-vmin"), vmax: n("x-vmax"),
@@ -114,3 +126,20 @@ export const planeNow = (url: string): Plane | undefined => planes.peek(url);
 /** The plane URLs on screen (main, extra, centre and vector planes): never dropped from the cache. */
 export const holdPlanes = (urls: Iterable<string>): void => planes.hold(urls);
 export const clearPlaneCache = (): void => planes.clear();
+
+export type PlaneField = { array: string; comp: string; key: string; meanKey: string };
+const fields = new WeakMap<Plane, PlaneField>();
+/** The field a plane holds, from its URL: array, component ("" = scalar), key = both, and meanKey =
+ *  case | file | array | component | mask. Legends, colour ranges and statistics take the field
+ *  from the plane that is drawn, not from the field that is selected (it may still be loading). */
+export function fieldOf(p: Plane): PlaneField {
+  let f = fields.get(p);
+  if (!f) {
+    const q = new URLSearchParams(p.url.slice(p.url.indexOf("?") + 1));
+    const array = q.get("array") ?? "", comp = q.get("comp") ?? "";
+    f = { array, comp, key: `${array}|${comp}`,
+          meanKey: `${q.get("path")}|${q.get("file")}|${array}|${comp}|${q.get("mask") ?? "true"}` };
+    fields.set(p, f);
+  }
+  return f;
+}
