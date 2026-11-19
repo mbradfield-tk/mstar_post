@@ -203,6 +203,33 @@ def test_task_registry_base_and_addons(client):
     assert "stats_summary" in jobs.launcher_argv("dispersion", a, "bob") and "dispersion" not in jobs.launcher_argv("dispersion", a, "bob")[:8]
 
 
+def test_gas_liquid_task(client):
+    from fastapi import HTTPException
+    from app import tasks as T
+    t = next(t for t in client.get("/api/tasks").json() if t["id"] == "gas_liquid")
+    assert t["label"] == "Gas-Liquid Mass Transfer" and t["group"] == "addon"
+    # the Run tab checks the selected cases against this case setting
+    assert t["requires"]["setting"] == "Fluid model" and t["requires"]["value"] == "free surface"
+    assert [o["value"] for p in t["params"] if p["name"] == "route" for o in p["options"]] == ["free-surface"]
+    p = {"id": "x", "single": False, "root": "/r", "ref_case": "a"}
+    cases = [{"id": "a", "path": "/r/a"}]
+    a = T.GAS_LIQUID.build(p, cases, T.coerce(T.GAS_LIQUID, {"diffusivity": "2e-9"}), Path("/tmp/run"))[0]["argv"]
+    assert a[a.index("--gas-liquid") + 1] == "free-surface" and a[a.index("--gas-diffusivity") + 1] == "2e-09"
+    assert "--addons-only" in a and "--gas-no-local" not in a and "--gas-nu" not in a
+    assert a[a.index("--cases") + 1] == "a" and a[a.index("--workers") + 1] == "4"
+    stats_only = T.GAS_LIQUID.build(p, cases, T.coerce(T.GAS_LIQUID, {"diffusivity": 2e-9, "local": False,
+                                                                     "reuse": False, "nu": 1e-6}), Path("/tmp/run"))
+    assert {"--gas-no-local", "--no-reuse", "--gas-nu"} <= set(stats_only[0]["argv"])
+    # the diffusivity has no default: a run without it (or with 0) is refused, not started
+    assert next(p for p in t["params"] if p["name"] == "diffusivity")["required"] is True
+    for missing in ({}, {"diffusivity": ""}, {"diffusivity": 0}):
+        with pytest.raises(HTTPException) as e:
+            T.GAS_LIQUID.build(p, cases, T.coerce(T.GAS_LIQUID, missing), Path("/tmp/run"))
+        assert e.value.status_code == 422
+    # same script as the base summary: the root launcher knows it under that task id
+    assert "stats_summary" in jobs.launcher_argv("gas_liquid", a, "bob")
+
+
 def test_guest_and_login(client):
     p = client.post("/api/projects", json={"name": "g", "root": str(client.root)}).json()
     assert client.get("/api/whoami").json()["user"] == "tester"

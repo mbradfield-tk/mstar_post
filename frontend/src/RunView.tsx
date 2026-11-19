@@ -51,6 +51,14 @@ export default function RunView({ project, onSubmitted }: {
   useEffect(() => { api.tasks().then(setTasks).catch((e) => setError(e.message)); }, []);
   useEffect(() => { if (task) setValues(initial(task)); }, [task]);
 
+  // selected cases the task cannot run on (their setting is known and differs); unknown = not flagged
+  const req = task?.requires;
+  const unmet = req ? included.filter((c) => {
+    const v = c.info?.settings?.[req.setting];
+    return v !== undefined && v !== null && v !== req.value;
+  }) : [];
+  const noneFit = !!req && included.length > 0 && unmet.length === included.length;
+
   const groups = useMemo(() => {
     const g = new Map<string, Param[]>();
     task?.params.forEach((p) => g.set(p.group, [...(g.get(p.group) ?? []), p]));
@@ -104,6 +112,15 @@ export default function RunView({ project, onSubmitted }: {
                 {" "}<a onClick={() => setSel("stats_summary")}>Run it first</a>
               </div>
             )}
+            {req && unmet.length > 0 && (
+              <div className={noneFit ? "error" : "note small"}
+                   title={unmet.map((c) => `${c.id}: ${String(c.info?.settings?.[req.setting])}`).join("\n")}>
+                This calculation needs {req.what}. {noneFit ? "None of the selected cases uses it"
+                  : `${unmet.length} of the ${included.length} selected cases ${unmet.length === 1 ? "does" : "do"} not use it and will be reported as failed; the others run`}
+                {" "}(<span className="mono">{unmet.slice(0, 3).map((c) => c.id).join(", ")}{unmet.length > 3 ? ", ..." : ""}</span>).
+                The <b>Fluid model</b> column of the Cases tab shows the model of each case.
+              </div>
+            )}
             {!!task.presets.length && (
               <div className="row">
                 <span className="muted">Presets:</span>
@@ -134,8 +151,9 @@ export default function RunView({ project, onSubmitted }: {
               <label>Job name <input className="wide" value={name} onChange={(e) => setName(e.target.value)}
                 placeholder="default: task + options + case count" /></label>
             </div>
-            <button className="primary big" disabled={busy || !included.length || !me.user} onClick={submit}
-                    title={!me.user ? "log in to run calculations" : included.length ? undefined : "include at least one case on the Cases tab"}>
+            <button className="primary big" disabled={busy || !included.length || !me.user || noneFit} onClick={submit}
+                    title={!me.user ? "log in to run calculations" : !included.length ? "include at least one case on the Cases tab"
+                      : noneFit ? `none of the selected cases uses ${req?.what}` : undefined}>
               {busy ? "Submitting..." : "Run"}
             </button>
           </>
@@ -158,7 +176,7 @@ function Field({ p, value, onChange }: { p: Param; value: unknown; onChange: (v:
         );
       case "number": case "integer":
         return <input type="number" step="any" value={value === null || value === undefined ? "" : String(value)}
-                      placeholder="auto" onChange={(e) => onChange(e.target.value)} />;
+                      placeholder={p.required ? "required" : "auto"} onChange={(e) => onChange(e.target.value)} />;
       default:
         return <input className="wide" value={String(value ?? "")} onChange={(e) => onChange(e.target.value)}
                       placeholder={p.type === "list" ? "space-separated" : ""} />;

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api, copyText, download, fmt, toCsv, type CatalogCase } from "./api";
 
 // Key settings shown as columns (matched by prefix), as in the project Cases tab.
-const KEY_SETTINGS = ["Volume [L]", "Agitator speed [rpm]", "dx [m]", "Fluid 1 name", "Fluid 2 name",
+const KEY_SETTINGS = ["Volume [L]", "Agitator speed [rpm]", "dx [m]", "Fluid model", "Fluid 1 name", "Fluid 2 name",
   "Simulated time (input runtime)", "Wall time"];
 type SortKey = "uid" | "name" | "path" | "end" | "projects";
 

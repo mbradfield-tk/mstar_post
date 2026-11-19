@@ -14,6 +14,21 @@ export const KEY_METRICS: [RegExp, string][] = [
   [/^Blend Time t95/, "t95 blend (correlation)"],
   [/^Kolmogorov Scale at Mean Resolved Dissipation \[/, "Kolmogorov"],
   [/^Mixing Time/i, "Mixing time"],
+  // free-surface kLa: the local (VTK) estimates first; the Stats-based ones fill in when the VTK output is gone
+  [/^kLa Lamont-Scott, local/, "kLa Lamont-Scott (local)"],
+  [/^kLa Lamont-Scott, bulk/, "kLa Lamont-Scott (bulk eps)"],
+  [/^kLa Kastanek, local/, "kLa Kastanek (local)"],
+  [/^kLa Higbie, local/, "kLa Higbie (local)"],
+  [/^kLa Thomas, local/, "kLa Thomas (local)"],
+  [/^kLa Surface Divergence, local/, "kLa surface divergence (local)"],
+  [/^Specific Free-Surface Area a/, "a (free surface)"],
+  [/^Free-Surface Area Enhancement/, "A/A0"],
+  [/^Concentration Film Thickness \/ Voxel Size/, "Film / dx"],
+  [/^Grid Refinement for a Resolved Concentration Film/, "Refinement (film)"],
+  [/^kLa Lamont-Scott, surface mean/, "kLa Lamont-Scott (surface, Stats)"],
+  [/^kLa Kastanek, bulk/, "kLa Kastanek (bulk eps)"],
+  [/^kLa Higbie, surface mean/, "kLa Higbie (surface, Stats)"],
+  [/^kLa Thomas, surface mean/, "kLa Thomas (surface, Stats)"],
   [/^Specific Interfacial Area \[/, "a"],
   [/^Interfacial Area A_int \[/, "A_int"],
   [/^Overall K_oc a, circulating drops/, "K_oc a (circ.)"],
@@ -216,8 +231,8 @@ async function readRunResults(project: Project, run: Run, full: boolean): Promis
 }
 
 // the stats summary's long tables: one row per case x Stats file x variable with mean/std
-// (batch_summary.csv of the base run; batch_summary_dispersion.csv etc. of add-on runs)
-const longTablesOf = (run: Run) => run.csvs.filter((f) => /^(batch_summary|stats_summary)(_[a-z]+)?\.csv$/.test(f)
+// (batch_summary.csv of the base run; batch_summary_dispersion.csv, batch_summary_gas_liquid.csv etc. of add-on runs)
+const longTablesOf = (run: Run) => run.csvs.filter((f) => /^(batch_summary|stats_summary)(_[a-z_]+)?\.csv$/.test(f)
   && !/_(means|settings)\.csv$/.test(f));
 
 // Everything a run knows per case: the summary means plus every M-Star Stats variable of

@@ -28,10 +28,13 @@ export type ProjectSummary = {
 export type Param = {
   name: string; label: string; type: "number" | "integer" | "bool" | "string" | "list" | "select";
   default: unknown; help: string; group: string; options?: { value: string; label: string }[];
+  required?: boolean;  // no default: the run is refused without a value
 };
 export type TaskDef = {
   id: string; label: string; description: string; params: Param[];
   presets: { label: string; params: Record<string, unknown> }[]; per_case: boolean; group?: "base" | "addon";
+  // a case setting the task needs (e.g. "Fluid model" = "free surface"); the script refuses other cases
+  requires?: { setting: string; value: string; what: string } | null;
 };
 export type Job = {
   id: string; project: string; task: string; label: string; user?: string | null;

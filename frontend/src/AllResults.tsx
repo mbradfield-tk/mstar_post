@@ -6,6 +6,8 @@ import { COND, condOf, fmtPct, loadAllResults, newestFirst, pct, PCT_HELP, runSt
 const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleDateString() : "");
 const STORE = "mstar_post.allresults";
 const unitOf = (col: string) => col.match(/\[([^\]]*)\]\s*$/)?.[1] ?? "";
+// alphabetical regardless of case, digits by value ("Fluid 2" before "Fluid 10")
+const ALPHA = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
 
 // Every per-case result of one run, or of all finished runs of a job type merged (newest
 // run per case): the summary means, every M-Star Stats steady-state mean and the derived
@@ -66,7 +68,8 @@ export default function AllResults({ project, runs, storeKey }: {
   const shownCols = picked.map((p) => merged.byCol.get(p)).filter((c): c is Column => !!c);
   const hasStd = shownCols.some((c) => cases.some((cid) => merged.std.get(cid)?.[c.col] !== undefined));
 
-  // column picker grouped by origin; lower-case names once for the filter
+  // column picker grouped by origin, groups and their variables in alphabetical order;
+  // lower-case names once for the filter
   const words = filter.toLowerCase().split(/\s+/).filter(Boolean);
   const groups = useMemo(() => {
     const g = new Map<string, { c: Column; low: string }[]>();
@@ -75,7 +78,8 @@ export default function AllResults({ project, runs, storeKey }: {
       if (!g.has(k)) g.set(k, []);
       g.get(k)!.push({ c, low: c.col.toLowerCase() });
     });
-    return [...g.entries()];
+    g.forEach((cols) => cols.sort((a, b) => ALPHA.compare(a.c.col, b.c.col)));
+    return [...g.entries()].sort((a, b) => ALPHA.compare(a[0], b[0]));
   }, [merged.columns]);
   // groups opened or closed by hand; the others open while they hold a shown variable or a filter is typed.
   // Only open groups render their (possibly thousands of) check boxes.

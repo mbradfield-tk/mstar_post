@@ -6,7 +6,7 @@ import { usePageVisible } from "./visible";
 
 // Key settings shown as columns (matched by prefix); columns that are blank for every case are dropped.
 const KEY_SETTINGS = ["Volume [L]", "Agitator speed [rpm]", "Simulated time (input runtime)", "Wall time",
-  "Fluid 1 name", "Fluid 1 density", "Fluid 1 dynamic viscosity", "Fluid 2 name", "Fluid 2 density", "Fluid 2 dynamic viscosity",
+  "Fluid model", "Fluid 1 name", "Fluid 1 density", "Fluid 1 dynamic viscosity", "Fluid 2 name", "Fluid 2 density", "Fluid 2 dynamic viscosity",
   "dx [m]", "Impeller diameter", "Surface tension", "Max Courant"];
 // significant digits per column (prefix match); default 4
 const DIGITS: [string, number][] = [["Wall time", 3], ["Impeller diameter", 3], ["Max Courant", 2], ["Fluid 1 density", 4], ["Fluid 2 density", 4],

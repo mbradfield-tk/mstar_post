@@ -28,11 +28,14 @@ class Task:
     presets: list[dict] = field(default_factory=list)
     group: str = "addon"          # "base" = run first on every simulation; "addon" = optional extras
     launcher: str | None = None   # task id the root-installed launcher knows (same script); default = id
+    # a case setting the task needs, {"setting": key of case_info settings, "value", "what"}: the
+    # Run tab names the selected cases that do not have it (the script refuses those cases)
+    requires: dict | None = None
 
     def public(self) -> dict:
         return {"id": self.id, "label": self.label, "description": self.description,
                 "params": self.params, "presets": self.presets, "per_case": self.per_case,
-                "group": self.group}
+                "group": self.group, "requires": self.requires}
 
 
 def P(name, label, type="number", default=None, help="", group="", **kw) -> dict:
@@ -58,6 +61,8 @@ def coerce(task: Task, raw: dict) -> dict:
     for p in task.params:
         v = raw.get(p["name"], p["default"])
         if v is None or v == "":
+            if p.get("required"):
+                raise HTTPException(422, f"{p['label']}: required")
             out[p["name"]] = None
             continue
         try:
@@ -234,6 +239,63 @@ DISPERSION = Task(
 )
 
 
+def _gas_liquid_build(project: dict, cases: list[dict], prm: dict, run: Path) -> list[dict]:
+    if not (prm.get("diffusivity") or 0) > 0:
+        raise HTTPException(422, "Gas diffusivity in the liquid [m2/s]: must be a positive number")
+    argv = _stats_argv(project, cases, run) + ["--gas-liquid", prm.get("route") or "free-surface",
+                                               "--addons-only"]
+    for name, flag in (*_STEADY, ("diffusivity", "--gas-diffusivity"), ("nu", "--gas-nu"),
+                       ("renewal_length", "--renewal-length"), ("workers", "--workers")):
+        _opt(argv, flag, prm.get(name))
+    if not prm.get("local", True):
+        argv.append("--gas-no-local")
+    if not prm.get("reuse", True):
+        argv.append("--no-reuse")
+    return [{"argv": argv}]
+
+
+GAS_LIQUID = Task(
+    id="gas_liquid", label="Gas-Liquid Mass Transfer", launcher="stats_summary",
+    description="Add-on for runs with M-Star's free-surface model: liquid-side mass transfer of a gas "
+                "through the free surface. Specific free-surface area a = A/V_liq and kL, kLa of "
+                "several models (Lamont-Scott, Kawase-Moo-Young, Kastanek, rigid surface, Higbie, "
+                "Thomas, surface divergence), each from the Stats files (bulk dissipation = impeller "
+                "power / liquid mass, and the surface means of Interface.txt; at every Stats sample) "
+                "and from the fields at the surface in the VTK output, integrated over the surface "
+                "(per VOF surface frame). Also the grid a calculation without a kL model would need "
+                "(Kolmogorov scale and concentration film at the surface against the voxel size), "
+                "whether the grid holds the surface shape and entrained bubbles, and whether the "
+                "liquid mixes faster than the gas transfers. Writes batch_summary_gas_liquid*.csv "
+                "and per case gas_liquid_timeseries.csv, gas_liquid_surface.csv and "
+                "gas_liquid_assessment.csv; the base Stats summary is not repeated.",
+    requires={"setting": "Fluid model", "value": "free surface", "what": "M-Star's free-surface model"},
+    params=[
+        P("route", "Transfer route", "select", "free-surface", group="Gas-liquid system",
+          options=[{"value": "free-surface", "label": "Free surface only (no sparged or entrained gas)"}],
+          help="the gas reaches the liquid through the free surface alone; needs M-Star's free-surface model"),
+        P("diffusivity", "Gas diffusivity in the liquid [m2/s]", group="Gas-liquid system", required=True,
+          help="of the dissolved gas in the liquid, e.g. O2 in water at 25 C: 2.1e-9"),
+        P("nu", "Liquid kinematic viscosity [m2/s]", group="Gas-liquid system", help="blank = input.xml"),
+        P("renewal_length", "Surface renewal length L [m]", group="Gas-liquid system",
+          help="Higbie contact time t_c = L / surface speed; blank = half the tank diameter"),
+        *_STEADY_PARAMS,
+        P("local", "Local estimate from the VTK output", "bool", True, group="Local estimate",
+          help="kL from the dissipation, speed and surface divergence at the free surface (Volume VOF "
+               "Surface .vtp + Volume .vti), integrated over the surface; off = Stats files only"),
+        P("reuse", "Reuse earlier results when VTK files are gone", "bool", True, group="Local estimate",
+          help="the local estimate of cases whose .vtp/.vti output was deleted is taken from the newest "
+               "earlier Gas-Liquid Mass Transfer run of this project; the rest is recomputed"),
+        P("workers", "Frames analysed in parallel", "integer", 4, group="Local estimate",
+          help="processes reading the VOF surface frames side by side (same results as 1)"),
+    ],
+    build=_gas_liquid_build,
+    presets=[
+        {"label": "Stats + local (VTK)", "params": {}},
+        {"label": "Stats files only", "params": {"local": False}},
+    ],
+)
+
+
 def _per_case_dirs(cases: list[dict], run: Path) -> list[Path]:
     from app.jobs import make_shared_dir
     dirs = []
@@ -358,4 +420,4 @@ CUSTOM = Task(
     build=_custom_build,
 )
 
-TASKS: dict[str, Task] = {t.id: t for t in (STATS, DISPERSION, UA, ZONER, CUSTOM)}
+TASKS: dict[str, Task] = {t.id: t for t in (STATS, DISPERSION, GAS_LIQUID, UA, ZONER, CUSTOM)}
