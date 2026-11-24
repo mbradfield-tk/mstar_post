@@ -14,6 +14,7 @@ export default function RunView({ project, onSubmitted }: {
 }) {
   const [tasks, setTasks] = useState<TaskDef[]>([]);
   const [sel, setSel] = useState<string>("stats_summary");
+  const [showList, setShowList] = useState(true);
   const [values, setValues] = useState<Values>({});
   const [name, setName] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -76,31 +77,48 @@ export default function RunView({ project, onSubmitted }: {
     setBusy(false);
   };
 
+  const openTask = (id: string) => {
+    setSel(id);
+    setShowList(false);
+  };
+
   return (
-    <div className="split" ref={root}>
-      <div className="side">
-        <h3>Calculations</h3>
-        {!tasks.length && !error && <div className="muted">Loading...</div>}
-        {([["base", "Base", "run on every simulation first"], ["addon", "Add-ons", "extra physics on top of the base summary"]] as const).map(([g, title, hint]) => {
-          const ts = tasks.filter((t) => (t.group ?? "addon") === g);
-          if (!ts.length) return null;
-          return (
-            <div key={g} className="run-group">
-              <div className="small muted task-group" title={hint}>{title}</div>
-              {ts.map((t) => (
-                <div key={t.id} className={`taskcard${t.id === sel ? " active" : ""}`} onClick={() => setSel(t.id)}>
-                  <b>{t.label}</b>
-                  <div className="small muted">{t.description.split(/(?<=\.)\s/)[0]}</div>
-                </div>
-              ))}
-              {g === "addon" && <div className="taskcard disabled">
-                <b>kLa from scalar dissolution</b>
-                <div className="small muted">planned</div>
-              </div>}
-            </div>);
-        })}
-      </div>
-      <div className="main panel">
+    <div className="panel" ref={root}>
+      {showList ? (
+        <>
+          <h2>Calculations</h2>
+          {error && <div className="error">{error}</div>}
+          {!tasks.length && !error && <div className="muted">Loading...</div>}
+          {tasks.length > 0 && <div className="tablewrap">
+            <table className="grid project-table">
+              <thead><tr><th>Calculation</th><th>Type</th><th>Description</th><th /></tr></thead>
+              <tbody>
+                {([["base", "Base", "run on every simulation first"], ["addon", "Add-on", "extra physics on top of the base summary"]] as const).map(([g, title, hint]) => {
+                  const ts = tasks.filter((t) => (t.group ?? "addon") === g);
+                  if (!ts.length) return null;
+                  return [
+                    ...ts.map((t) => (
+                      <tr key={t.id} className="clickable" onClick={() => openTask(t.id)}>
+                        <td><b>{t.label}</b></td>
+                        <td title={hint}>{title}</td>
+                        <td className="muted">{t.description.split(/(?<=\.)\s/)[0]}</td>
+                        <td><button className="small" aria-label={`Open ${t.label}`}
+                                    onClick={(e) => { e.stopPropagation(); openTask(t.id); }}>Open</button></td>
+                      </tr>
+                    )),
+                    ...(g === "addon" ? [<tr key="planned">
+                      <td><b>kLa from scalar dissolution</b></td><td title={hint}>{title}</td>
+                      <td className="muted">planned</td><td />
+                    </tr>] : []),
+                  ];
+                })}
+              </tbody>
+            </table>
+          </div>}
+        </>
+      ) : (
+        <>
+          <button onClick={() => { setShowList(true); setError(null); }}>← All calculations</button>
         {task && (
           <>
             <h2>{task.label} <span className="tag">{(task.group ?? "addon") === "base" ? "base" : "add-on"}</span></h2>
@@ -158,7 +176,8 @@ export default function RunView({ project, onSubmitted }: {
             </button>
           </>
         )}
-      </div>
+        </>
+      )}
     </div>
   );
 }

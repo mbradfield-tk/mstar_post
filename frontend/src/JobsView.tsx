@@ -17,7 +17,7 @@ const NEAR_BOTTOM = 40;  // px: the log follows new output only while it is scro
 export default memo(function JobsView({ project, selected, onSelect, onOpenResults, owner, active = true }: {
   project: string;
   selected: string | null;
-  onSelect: (id: string) => void;
+  onSelect: (id: string | null) => void;
   onOpenResults: () => void;
   owner?: string | null;  // project owner: may manage every job of the project
   active?: boolean;       // the tab is on screen: the duration tick and the log tail pause otherwise
@@ -73,6 +73,7 @@ export default memo(function JobsView({ project, selected, onSelect, onOpenResul
     try {
       await api.deleteJob(j.id);
       dropJob(project, j.id);
+      onSelect(null);
     } catch (e) { setError((e as Error).message); }
   };
 
@@ -113,23 +114,37 @@ export default memo(function JobsView({ project, selected, onSelect, onOpenResul
   }, [log, shown]);
 
   return (
-    <div className="split">
+    <div className="panel">
       {ui.dialog}
-      <div className="side">
-        <h3>Jobs</h3>
-        {loaded && !connected && <div className="small muted" title="the live connection to the server was lost; it is retried automatically and the list is read again when it is back">
-          reconnecting to the server...</div>}
-        {listError && <div className="error small">{listError}</div>}
-        {jobs.map((j) => (
-          <div key={j.id} className={`taskcard${j.id === selected ? " active" : ""}`} onClick={() => onSelect(j.id)}>
-            <span className={`status ${j.status}`}>{j.status}</span> <b>{j.label}</b>
-            <div className="small muted">{when(j.created_at)} {dur(j) && `| ${dur(j)}`}{j.user && ` | ${j.user}`}</div>
-          </div>
-        ))}
-        {!jobs.length && <div className="muted">{loaded ? "No jobs yet: start one on the Run tab." : listError ? "" : "Loading..."}</div>}
-      </div>
-      <div className="main panel">
-        {job ? (
+      {loaded && !connected && <div className="small muted" title="the live connection to the server was lost; it is retried automatically and the list is read again when it is back">
+        reconnecting to the server...</div>}
+      {listError && <div className="error small">{listError}</div>}
+      {selected === null ? (
+        <>
+          <h2>Jobs</h2>
+          {jobs.length > 0 ? (
+            <div className="tablewrap">
+              <table className="grid project-table">
+                <thead><tr><th>Job</th><th>Status</th><th>Task</th><th>Started by</th><th>Created</th><th>Duration</th><th /></tr></thead>
+                <tbody>{jobs.map((j) => (
+                  <tr key={j.id} className="clickable" onClick={() => onSelect(j.id)}>
+                    <td><b>{j.label}</b></td>
+                    <td><span className={`status ${j.status}`}>{j.status}</span></td>
+                    <td>{j.task}</td>
+                    <td>{j.user || "—"}</td>
+                    <td className="nowrap">{when(j.created_at)}</td>
+                    <td className="nowrap">{dur(j) || "—"}</td>
+                    <td><button className="small" aria-label={`Open ${j.label}`} onClick={(e) => { e.stopPropagation(); onSelect(j.id); }}>Open</button></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          ) : <div className="muted">{loaded ? "No jobs yet: start one on the Run tab." : listError ? "" : "Loading..."}</div>}
+        </>
+      ) : (
+        <>
+          <button onClick={() => onSelect(null)}>← All jobs</button>
+          {job ? (
           <>
             <div className="row">
               <h2 className="grow plain">{job.label} <span className={`status ${job.status}`}>{job.status}</span></h2>
@@ -158,8 +173,9 @@ export default memo(function JobsView({ project, selected, onSelect, onOpenResul
             </details>
             <pre ref={pre} className="log">{log || (running ? "Waiting for output..." : "(no output)")}</pre>
           </>
-        ) : <div className="muted">{jobs.length ? "Select a job to see its log." : "Jobs started on the Run tab appear here with their live log."}</div>}
-      </div>
+          ) : <div className="muted">{loaded ? "This job is no longer available." : "Loading job..."}</div>}
+        </>
+      )}
     </div>
   );
 });
